@@ -37,21 +37,16 @@ import posixpath
 import re
 import threading
 import time
-from typing import Any, Dict, Optional, Set, Tuple, Union
 import uuid
+from typing import Any, Dict, Optional, Set, Tuple, Union
 
+import yaml
 from absl import flags
 from packaging import version as packaging_version
-from perfkitbenchmarker import background_tasks
-from perfkitbenchmarker import disk
-from perfkitbenchmarker import errors
-from perfkitbenchmarker import linux_packages
-from perfkitbenchmarker import os_types
-from perfkitbenchmarker import regex_util
-from perfkitbenchmarker import sample
-from perfkitbenchmarker import virtual_machine
-from perfkitbenchmarker import vm_util
-import yaml
+
+from perfkitbenchmarker import (background_tasks, context, disk, errors,
+                                linux_packages, os_types, regex_util, sample,
+                                virtual_machine, vm_util)
 
 FLAGS = flags.FLAGS
 
@@ -665,16 +660,23 @@ class BaseLinuxMixin(virtual_machine.BaseOsMixin):
     commands = []
 
     if FLAGS.http_proxy:
-      commands.append(
-          "echo 'http_proxy=%s' | sudo tee -a %s" % (FLAGS.http_proxy, env_file)
-      )
-
+      commands.append("echo 'http_proxy=%s' | sudo tee -a %s" % (
+          FLAGS.http_proxy, env_file))
+      commands.append("echo 'HTTP_PROXY=%s' | sudo tee -a %s" % (
+          FLAGS.http_proxy, env_file))
+      
     if FLAGS.https_proxy:
-      commands.append(
-          "echo 'https_proxy=%s' | sudo tee -a %s"
-          % (FLAGS.https_proxy, env_file)
-      )
-
+      commands.append("echo 'https_proxy=%s' | sudo tee -a %s" % (
+          FLAGS.https_proxy, env_file))
+      commands.append("echo 'HTTPS_PROXY=%s' | sudo tee -a %s" % (
+          FLAGS.https_proxy, env_file))
+      
+    if FLAGS.no_proxy:
+      commands.append("echo 'no_proxy=%s' | sudo tee -a %s" % (
+          FLAGS.no_proxy, env_file))
+      commands.append("echo 'NO_PROXY=%s' | sudo tee -a %s" % (
+          FLAGS.no_proxy, env_file))
+      
     if FLAGS.ftp_proxy:
       commands.append(
           "echo 'ftp_proxy=%s' | sudo tee -a %s" % (FLAGS.ftp_proxy, env_file)
@@ -2201,17 +2203,17 @@ class ClearMixin(BaseLinuxMixin):
     commands = []
 
     if FLAGS.http_proxy:
-      commands.append(
-          "echo 'export http_proxy=%s' | sudo tee -a %s"
-          % (FLAGS.http_proxy, profile_file)
-      )
-
+      commands.append("echo 'export http_proxy=%s' | sudo tee -a %s" % (
+          FLAGS.http_proxy, profile_file))
+      commands.append("echo 'HTTP_PROXY=%s' | sudo tee -a %s" % (
+          FLAGS.http_proxy, profile_file))
+    
     if FLAGS.https_proxy:
-      commands.append(
-          "echo 'https_proxy=%s' | sudo tee -a %s"
-          % (FLAGS.https_proxy, profile_file)
-      )
-
+      commands.append("echo 'https_proxy=%s' | sudo tee -a %s" % (
+          FLAGS.https_proxy, profile_file))
+      commands.append("echo 'HTTPS_PROXY=%s' | sudo tee -a %s" % (
+          FLAGS.https_proxy, profile_file))
+      
     if FLAGS.ftp_proxy:
       commands.append(
           "echo 'ftp_proxy=%s' | sudo tee -a %s"
@@ -2219,10 +2221,11 @@ class ClearMixin(BaseLinuxMixin):
       )
 
     if FLAGS.no_proxy:
-      commands.append(
-          "echo 'export no_proxy=%s' | sudo tee -a %s"
-          % (FLAGS.no_proxy, profile_file)
-      )
+      commands.append("echo 'no_proxy=%s' | sudo tee -a %s" % (
+          FLAGS.no_proxy, profile_file))
+      commands.append("echo 'NO_PROXY=%s' | sudo tee -a %s" % (
+          FLAGS.no_proxy, profile_file))
+    
     if commands:
       self.RemoteCommand(';'.join(commands))
 
@@ -3583,4 +3586,9 @@ class JujuMixin(BaseDebianMixin):
 class BaseLinuxVirtualMachine(
     BaseLinuxMixin, virtual_machine.BaseVirtualMachine
 ):
+  """Linux VM for use with pytyping."""
+
+
+class BaseLinuxVirtualMachine(BaseLinuxMixin,
+                              virtual_machine.BaseVirtualMachine):
   """Linux VM for use with pytyping."""
