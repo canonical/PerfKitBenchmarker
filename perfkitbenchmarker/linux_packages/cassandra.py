@@ -24,22 +24,20 @@ import logging
 import os
 import posixpath
 import time
+
 from absl import flags
-from perfkitbenchmarker import background_tasks
-from perfkitbenchmarker import data
-from perfkitbenchmarker import errors
-from perfkitbenchmarker import linux_packages
-from perfkitbenchmarker import os_types
-from perfkitbenchmarker.linux_packages.ant import ANT_HOME_DIR
 from six.moves import range
 
+from perfkitbenchmarker import (background_tasks, data, errors, linux_packages,
+                                os_types)
+from perfkitbenchmarker.linux_packages.ant import ANT_HOME_DIR
 
 JNA_JAR_URL = (
     'https://maven.java.net/content/repositories/releases/'
     'net/java/dev/jna/jna/4.1.0/jna-4.1.0.jar'
 )
 CASSANDRA_GIT_REPRO = 'https://github.com/apache/cassandra.git'
-CASSANDRA_VERSION = 'cassandra-2.1'
+CASSANDRA_VERSION = 'cassandra-4.1'
 CASSANDRA_YAML_TEMPLATE = 'cassandra/cassandra.yaml.j2'
 CASSANDRA_ENV_TEMPLATE = 'cassandra/cassandra-env.sh.j2'
 CASSANDRA_DIR = posixpath.join(linux_packages.INSTALL_DIR, 'cassandra')
@@ -103,9 +101,9 @@ def _Install(vm):
   if FLAGS.cassandra_maven_repo_url:
     # sets maven repo properties in the build.properties
     file_contents = _MAVEN_REPO_PARAMS.format(FLAGS.cassandra_maven_repo_url)
-    vm.RemoteCommand(
-        'echo "{}" > {}/build.properties'.format(file_contents, CASSANDRA_DIR)
-    )
+    vm.RemoteCommand('echo "{}" > {}/build.properties'.format(
+        file_contents, CASSANDRA_DIR))
+  
   vm.RemoteCommand('cd {}; {}/bin/ant'.format(CASSANDRA_DIR, ANT_HOME_DIR))
   # Add JNA
   vm.RemoteCommand(
@@ -122,7 +120,14 @@ def YumInstall(vm):
 
 def AptInstall(vm):
   """Installs Cassandra on the VM."""
-  _Install(vm)
+  vm.Install('openjdk')
+  vm.Install('curl')
+  vm.RemoteCommand(f'mkdir -p {CASSANDRA_DIR}/conf')
+  vm.RemoteCommand('echo "deb https://debian.cassandra.apache.org 41x main" | sudo tee -a /etc/apt/sources.list.d/cassandra.sources.list')
+  vm.RemoteCommand('curl https://downloads.apache.org/cassandra/KEYS | sudo apt-key add -')
+  vm.RemoteCommand('sudo apt-get update')
+  vm.InstallPackages('cassandra')
+
 
 
 def JujuInstall(vm, vm_group_name):
@@ -193,8 +198,12 @@ def Start(vm):
   Args:
     vm: The target vm. Should already be configured via 'Configure'.
   """
+  # if vm.BASE_OS_TYPE==os_types.DEBIAN
   if vm.OS_TYPE == os_types.JUJU:
     return
+  elif "ubuntu" in vm.OS_TYPE or "debian" in vm.OS_TYPE:
+    return
+
 
   vm.RemoteCommand(
       'nohup {0}/bin/cassandra -p "{1}" 1> {2} 2> {3} &'.format(
@@ -213,9 +222,16 @@ def Stop(vm):
 
 def IsRunning(vm):
   """Returns a boolean indicating whether Cassandra is running on 'vm'."""
-  cassandra_pid = vm.RemoteCommand('cat {0} || true'.format(CASSANDRA_PID))[
-      0
-  ].strip()
+
+  if "ubuntu" in vm.OS_TYPE or "debian" in vm.OS_TYPE:
+    state = vm.RemoteCommand("systemctl is-active cassandra")
+    if state == "active":
+      return True
+    else :
+      return False
+  
+  cassandra_pid = vm.RemoteCommand(
+      'cat {0} || true'.format(CASSANDRA_PID))[0].strip()
   if not cassandra_pid:
     return False
 
@@ -257,6 +273,8 @@ def GetCassandraCliPath(vm):
     # Replace the stock CASSANDRA_CLI so that it uses the binary
     # installed by the cassandra charm.
     return '/usr/bin/cassandra-cli'
+  elif "ubuntu" in vm.OS_TYPE or "debian" in vm.OS_TYPE:
+    return '/usr/bin/cassandra-cli'
 
   return posixpath.join(CASSANDRA_DIR, 'bin', 'cassandra-cli')
 
@@ -265,6 +283,8 @@ def GetCassandraStressPath(vm):
   if vm.OS_TYPE == os_types.JUJU:
     # Replace the stock CASSANDRA_STRESS so that it uses the binary
     # installed by the cassandra-stress charm.
+    return '/usr/bin/cassandra-stress'
+  elif "ubuntu" in vm.OS_TYPE or "debian" in vm.OS_TYPE:
     return '/usr/bin/cassandra-stress'
 
   return posixpath.join(CASSANDRA_DIR, 'tools', 'bin', 'cassandra-stress')
@@ -298,7 +318,8 @@ def StartCluster(seed_vm, vms):
   if seed_vm.OS_TYPE == os_types.JUJU:
     # Juju automatically configures and starts the Cassandra cluster.
     return
-
+  elif "ubuntu" in seed_vm.OS_TYPE or "debian" in seed_vm.OS_TYPE:
+    return
   vm_count = len(vms) + 1
 
   # Cassandra setup
