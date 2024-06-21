@@ -26,20 +26,14 @@ import re
 import time
 from typing import Any, Optional
 
-from absl import flags
 import jinja2
-from perfkitbenchmarker import background_tasks
-from perfkitbenchmarker import configs
-from perfkitbenchmarker import data
-from perfkitbenchmarker import errors
-from perfkitbenchmarker import flag_util
-from perfkitbenchmarker import os_types
-from perfkitbenchmarker import sample
-from perfkitbenchmarker import units
-from perfkitbenchmarker import vm_util
-from perfkitbenchmarker.linux_packages import fio
-from perfkitbenchmarker.linux_packages import numactl
+from absl import flags
 
+from perfkitbenchmarker import (background_tasks, configs, data, errors,
+                                flag_util, os_types, sample, units, vm_util)
+from perfkitbenchmarker.linux_packages import fio, numactl
+from perfkitbenchmarker.providers.openstack.utils import \
+    wait_for_sync_manager_green_light
 
 PKB_FIO_LOG_FILE_NAME = 'pkb_fio_avg'
 LOCAL_JOB_FILE_SUFFIX = '_fio.job'  # used with vm_util.PrependTempDir()
@@ -956,6 +950,8 @@ def PrepareWithExec(vm, exec_path):
 
 def Run(benchmark_spec):
   """Spawn fio on vm(s) and gather results."""
+  if FLAGS.pkbw_sync_manager_url:
+    wait_for_sync_manager_green_light(FLAGS.pkbw_sync_manager_url, "ready")
   vms = benchmark_spec.vms
   return RunFioOnVMs(vms)
 

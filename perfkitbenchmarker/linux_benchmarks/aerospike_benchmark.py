@@ -25,15 +25,13 @@ by the "aerospike_storage_type" and "data_disk_type" flags.
 import functools
 
 from absl import flags
-from perfkitbenchmarker import background_tasks
-from perfkitbenchmarker import configs
-from perfkitbenchmarker import disk
-from perfkitbenchmarker import errors
-from perfkitbenchmarker import vm_util
-from perfkitbenchmarker.linux_packages import aerospike_client
-from perfkitbenchmarker.linux_packages import aerospike_server
 from six.moves import range
 
+from perfkitbenchmarker import background_tasks, configs, disk, errors, vm_util
+from perfkitbenchmarker.linux_packages import (aerospike_client,
+                                               aerospike_server)
+from perfkitbenchmarker.providers.openstack.utils import \
+    wait_for_sync_manager_green_light
 
 FLAGS = flags.FLAGS
 
@@ -256,6 +254,8 @@ def Run(benchmark_spec):
   Returns:
     A list of sample.Sample objects.
   """
+  if FLAGS.pkbw_sync_manager_url:
+    wait_for_sync_manager_green_light(FLAGS.pkbw_sync_manager_url, "ready")
   clients = benchmark_spec.vm_groups['clients']
   num_client_vms = len(clients)
   servers = benchmark_spec.vm_groups['workers']

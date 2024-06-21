@@ -28,17 +28,16 @@ import logging
 import os
 import re
 import time
-from absl import flags
-from perfkitbenchmarker import background_tasks
-from perfkitbenchmarker import configs
-from perfkitbenchmarker import data
-from perfkitbenchmarker import errors
-from perfkitbenchmarker import flag_util
-from perfkitbenchmarker import sample
-from perfkitbenchmarker import vm_util
-from perfkitbenchmarker.linux_packages import netperf
+
 import six
+from absl import flags
 from six.moves import zip
+
+from perfkitbenchmarker import (background_tasks, configs, data, errors,
+                                flag_util, sample, vm_util)
+from perfkitbenchmarker.linux_packages import netperf
+from perfkitbenchmarker.providers.openstack.utils import \
+    wait_for_sync_manager_green_light
 
 flags.DEFINE_integer(
     'netperf_max_iter',
@@ -120,6 +119,10 @@ flags.register_validator(
     'netperf_benchmarks',
     lambda benchmarks: benchmarks and set(benchmarks).issubset(ALL_BENCHMARKS),
 )
+
+flags.DEFINE_list(
+    'netperf_latency_percentiles', [50, 90, 99], 'Latency percentiles to calculate/report')
+
 _HISTOGRAM_PERCENTILES = flags.DEFINE_multi_float(
     'netperf_histogram_percentiles',
     [10, 50, 90, 99, 99.9],
@@ -643,7 +646,7 @@ def RunNetperf(vm, benchmark_name, server_ips, num_streams, client_ips):
           )
       )
       # Calculate stats on aggregate latency histogram
-      latency_stats = _HistogramStatsCalculator(latency_histogram)
+      latency_stats = _HistogramStatsCalculator(latency_histogram, FLAGS.netperf_latency_percentiles)
       # Create samples for the latency stats
       for stat, value in latency_stats.items():
         samples.append(
@@ -664,6 +667,8 @@ def Run(benchmark_spec):
   Returns:
     A list of sample.Sample objects.
   """
+  if FLAGS.pkbw_sync_manager_url:
+    wait_for_sync_manager_green_light(FLAGS.pkbw_sync_manager_url, 'ready')
   client_vm, server_vm = benchmark_spec.vms[:2]
   return RunClientServerVMs(client_vm, server_vm)
 

@@ -15,12 +15,14 @@
 """Runs HTTP load generators against an Nginx server."""
 
 import ipaddress
+import logging
 
 from absl import flags
-from perfkitbenchmarker import background_tasks
-from perfkitbenchmarker import configs
-from perfkitbenchmarker import sample
+
+from perfkitbenchmarker import background_tasks, configs, sample
 from perfkitbenchmarker.linux_packages import wrk2
+from perfkitbenchmarker.providers.openstack.utils import \
+    wait_for_sync_manager_green_light
 
 FLAGS = flags.FLAGS
 
@@ -346,6 +348,10 @@ def Run(benchmark_spec):
   Returns:
     A list of sample.Sample objects.
   """
+  if FLAGS.pkbw_sync_manager_url:
+    wait_for_sync_manager_green_light(FLAGS.pkbw_sync_manager_url, 'ready')
+    logging.info('Wait for sync ended, starting now')
+    
   clients = benchmark_spec.vm_groups['clients']
   results = []
   scheme = 'https' if FLAGS.nginx_use_ssl else 'http'

@@ -20,10 +20,13 @@ vms in the same zone.
 
 import logging
 import re
+import time
+
 from absl import flags
-from perfkitbenchmarker import configs
-from perfkitbenchmarker import sample
-from perfkitbenchmarker import vm_util
+
+from perfkitbenchmarker import configs, sample, vm_util
+from perfkitbenchmarker.providers.openstack.utils import \
+    wait_for_sync_manager_green_light
 
 FLAGS = flags.FLAGS
 
@@ -77,6 +80,9 @@ def Run(benchmark_spec):
   """
   vms = benchmark_spec.vms
   results = []
+  if FLAGS.pkbw_sync_manager_url:
+    wait_for_sync_manager_green_light(FLAGS.pkbw_sync_manager_url, 'ready')
+    
   for sending_vm, receiving_vm in vms, reversed(vms):
     if vm_util.ShouldRunOnExternalIpAddress():
       ip_type = vm_util.IpAddressMetadata.EXTERNAL

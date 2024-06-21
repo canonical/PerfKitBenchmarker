@@ -20,15 +20,16 @@ only a processor's core features.
 Coremark homepage: http://www.eembc.org/coremark/
 """
 
+import logging
 import posixpath
+
 from absl import flags
-from perfkitbenchmarker import configs
-from perfkitbenchmarker import errors
-from perfkitbenchmarker import flag_util
-from perfkitbenchmarker import linux_packages
-from perfkitbenchmarker import regex_util
-from perfkitbenchmarker import sample
+
+from perfkitbenchmarker import (configs, errors, flag_util, linux_packages,
+                                regex_util, sample)
 from perfkitbenchmarker.linux_packages import coremark
+from perfkitbenchmarker.providers.openstack.utils import \
+    wait_for_sync_manager_green_light
 
 BENCHMARK_NAME = 'coremark'
 BENCHMARK_CONFIG = """
@@ -45,7 +46,12 @@ COREMARK_BUILDFILE = 'linux64/core_portme.mak'
 # The number of iterations per CPU was chosen such that the runtime will always
 # be greater than 10 seconds as specified in the run rules at
 # https://www.eembc.org/coremark/CoreMarkRunRules.pdf.
-ITERATIONS_PER_CPU = 1000000
+flags.DEFINE_integer('coremark_iterations_per_cpu', 1000000,
+                     'Number of iterations per CPU, default 1000000,  '
+                     'chosen such that the runtime will always be '
+                     'greater than 10 seconds'
+                     )
+
 
 # Methods of parallelism supported by Coremark.
 PARALLELISM_PTHREAD = 'PTHREAD'
@@ -110,17 +116,12 @@ def RunCoremark(remote_command, thread_count):
   Returns:
     A list of sample.Sample objects with the performance results.
   """
+
   remote_command(
-      'cd %s;make PORT_DIR=linux64 clean; '
-      'make PORT_DIR=linux64 ITERATIONS=%s '
-      'XCFLAGS="-DMULTITHREAD=%d -DUSE_%s -DPERFORMANCE_RUN=1"'
-      % (
-          COREMARK_DIR,
-          ITERATIONS_PER_CPU,
-          thread_count,
-          _COREMARK_PARALLELISM_METHOD.value,
-      )
-  )
+      'cd %s;make PORT_DIR=linux64 clean; make PORT_DIR=linux64 ITERATIONS=%s XCFLAGS="-g -O2 '
+      '-DMULTITHREAD=%d -DUSE_%s -DPERFORMANCE_RUN=1"' %
+      (COREMARK_DIR, FLAGS.coremark_iterations_per_cpu, thread_count,
+       _COREMARK_PARALLELISM_METHOD.value))
   output, _ = remote_command('cat %s/run1.log' % COREMARK_DIR)
 
   return _ParseOutputForSamples(output, thread_count)
@@ -143,18 +144,23 @@ def _ParseOutputForSamples(output, thread_count):
     raise errors.Benchmarks.RunError('Correct operation not validated.')
   value = regex_util.ExtractFloat(r'CoreMark 1.0 : ([0-9]*\.[0-9]*)', output)
   metadata = {
-      'summary': output.splitlines()[-1],  # Last line of output is a summary.
-      'size': regex_util.ExtractInt(r'CoreMark Size\s*:\s*([0-9]*)', output),
-      'total_ticks': regex_util.ExtractInt(
-          r'Total ticks\s*:\s*([0-9]*)', output
-      ),
-      'total_time_sec': regex_util.ExtractFloat(
-          r'Total time \(secs\)\s*:\s*([0-9]*\.[0-9]*)', output
-      ),
-      'iterations': regex_util.ExtractInt(r'Iterations\s*:\s*([0-9]*)', output),
-      'iterations_per_cpu': ITERATIONS_PER_CPU,
-      'parallelism_method': _COREMARK_PARALLELISM_METHOD.value,
-      'thread_count': thread_count,
+      'summary':
+          output.splitlines()[-1],  # Last line of output is a summary.
+      'size':
+          regex_util.ExtractInt(r'CoreMark Size\s*:\s*([0-9]*)', output),
+      'total_ticks':
+          regex_util.ExtractInt(r'Total ticks\s*:\s*([0-9]*)', output),
+      'total_time_sec':
+          regex_util.ExtractFloat(r'Total time \(secs\)\s*:\s*([0-9]*\.[0-9]*)',
+                                  output),
+      'iterations':
+          regex_util.ExtractInt(r'Iterations\s*:\s*([0-9]*)', output),
+      'iterations_per_cpu':
+          FLAGS.coremark_iterations_per_cpu,
+      'parallelism_method':
+          _COREMARK_PARALLELISM_METHOD.value,
+      'thread_count':
+          thread_count,
   }
   return [sample.Sample('Coremark Score', value, '', metadata)]
 
@@ -171,6 +177,9 @@ def Run(benchmark_spec):
   Raises:
     Benchmarks.RunError: If correct operation is not validated.
   """
+  if FLAGS.pkbw_sync_manager_url:
+    wait_for_sync_manager_green_light(FLAGS.pkbw_sync_manager_url, 'ready')
+    logging.info('Wait for sync ended, starting now')
   vm = benchmark_spec.vms[0]
   output_samples = []
   for thread_count in FLAGS.coremark_thread_counts:
