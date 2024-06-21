@@ -14,11 +14,17 @@
 """Utilities for working with OpenStack Cloud resources."""
 
 
+import json
+import logging
+import socket
+import time
 from collections import OrderedDict
 
-from absl import flags
-from perfkitbenchmarker import vm_util
+import requests
 import six
+from absl import flags
+
+from perfkitbenchmarker import vm_util
 
 FLAGS = flags.FLAGS
 
@@ -115,3 +121,38 @@ class OpenStackCLICommand(object):
     """
     self.flags['format'] = 'json'
     self.additional_flags.extend(FLAGS.openstack_additional_flags or ())
+
+def update_sync_manager(url, status):
+  """Queries canonical-pkb-wrapper sync manager and gets a required action
+
+
+  Args:
+    url: canonical-pkb-wrapper sync manager's url, e.g.: http://192.168.1.53:6547/
+    status: the current process status to provide to as an update
+  """  
+  
+
+  tid=FLAGS.pkbw_thread_id
+  logging.info(f'this hostname is {tid}')
+  r=requests.put(url, json={'hostname':str(tid), 'status': status})
+  res=json.loads(r.text)
+  return res
+
+
+def wait_for_sync_manager_green_light(url, status, sleep_time=50):
+  """Repeatidly queries canonical-pkb-wrapper sync manager and waits for a 'start' action
+
+
+  Args:
+    url: canonical-pkb-wrapper sync manager's url, e.g.: http://192.168.1.53:6547/
+    status: the current process status to provide to as an update
+  """    
+  res=update_sync_manager(url, status)
+  while res.get('action','') != 'start':
+    logging.info(f"Waiting for sync_manager\'s greenlight (currently {res.get('action','unset')})")
+    time.sleep(sleep_time)
+    res=update_sync_manager(url, status)
+  logging.info(f"Sync_manager\'s greenlit start in {int(res['timedelta'])} secs")
+  time.sleep(int(res['timedelta']))
+  return True
+

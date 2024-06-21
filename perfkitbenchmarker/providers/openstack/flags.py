@@ -104,3 +104,11 @@ flags.DEFINE_string(
     None,
     'post provisioning script file path',
 )
+
+flags.DEFINE_string('pkbw_sync_manager_url', None,
+                    'canonical-pkb-wrapper sync manager\'s url '
+                    'e.g.: http://192.168.1.53:6547/')
+
+flags.DEFINE_string('pkbw_thread_id', None,
+                    'canonical-pkb-wrapper thread id used for '
+                    'local management of syncing')
