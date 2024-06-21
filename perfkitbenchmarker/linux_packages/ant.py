@@ -16,8 +16,13 @@
 """Module containing Ant installation and cleanup functions."""
 
 import posixpath
+import re
+
+from absl import flags
 
 from perfkitbenchmarker import linux_packages
+
+FLAGS = flags.FLAGS
 
 ANT_TAR = 'apache-ant-1.9.6-bin.tar.gz'
 ANT_TAR_URL = 'https://archive.apache.org/dist/ant/binaries/' + ANT_TAR
@@ -29,19 +34,34 @@ PREPROVISIONED_DATA = {
 PACKAGE_DATA_URL = {ANT_TAR: ANT_TAR_URL}
 ANT_HOME_DIR = posixpath.join(linux_packages.INSTALL_DIR, PACKAGE_NAME)
 
+def SetProxy(vm):
+  """Sets proxy for Ant"""
+  proxy_opts=""
+
+  if FLAGS.http_proxy:
+    host,port = FLAGS.http_proxy.rsplit(':', 1)
+    host=re.sub('http[s]?://', '', host, re.IGNORECASE)
+    proxy_opts = f"{proxy_opts}-Dhttp.proxyHost={host} -Dhttp.proxyPort={port} "
+
+  if FLAGS.https_proxy:
+    host,port = FLAGS.https_proxy.rsplit(':', 1)
+    host=re.sub('http[s]?://', '', host, re.IGNORECASE)
+    proxy_opts = f"{proxy_opts}-Dhttps.proxyHost={host} -Dhttps.proxyPort={port} "
+
+  if FLAGS.http_proxy or FLAGS.https_proxy :
+    proxy_opts=f'ANT_OPTS="{proxy_opts}"'
+    vm.RemoteCommand(f"echo '{proxy_opts}' | sudo tee -a /etc/profile")
+    vm.RemoteCommand(f"echo '{proxy_opts}' | sudo tee -a /etc/environment")
 
 def _Install(vm):
   """Installs the Ant package on the VM."""
   vm.Install('wget')
-  vm.InstallPreprovisionedPackageData(
-      PACKAGE_NAME, PREPROVISIONED_DATA.keys(), linux_packages.INSTALL_DIR
-  )
-  vm.RemoteCommand(
-      'cd {0}  && tar -zxf apache-ant-1.9.6-bin.tar.gz && '
-      'ln -s {0}/apache-ant-1.9.6/ {1}'.format(
-          linux_packages.INSTALL_DIR, ANT_HOME_DIR
-      )
-  )
+  vm.InstallPreprovisionedPackageData(PACKAGE_NAME, PREPROVISIONED_DATA.keys(),
+                                      linux_packages.INSTALL_DIR)
+  vm.RemoteCommand('cd {0}  && tar -zxf apache-ant-1.9.6-bin.tar.gz && '
+                   'ln -s {0}/apache-ant-1.9.6/ {1}'.format(
+                       linux_packages.INSTALL_DIR, ANT_HOME_DIR))
+  SetProxy(vm)
 
 
 def YumInstall(vm):
