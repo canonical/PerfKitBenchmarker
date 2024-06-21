@@ -26,17 +26,14 @@ Images:
 import json
 import logging
 import threading
+
 from absl import flags
-from perfkitbenchmarker import disk_strategies
-from perfkitbenchmarker import errors
-from perfkitbenchmarker import linux_virtual_machine
-from perfkitbenchmarker import provider_info
-from perfkitbenchmarker import virtual_machine
-from perfkitbenchmarker import vm_util
-from perfkitbenchmarker.providers.openstack import os_disk
-from perfkitbenchmarker.providers.openstack import os_network
-from perfkitbenchmarker.providers.openstack import utils as os_utils
 from six.moves import range
+
+from perfkitbenchmarker import (disk_strategies, errors, linux_virtual_machine,
+                                provider_info, virtual_machine, vm_util)
+from perfkitbenchmarker.providers.openstack import os_disk, os_network
+from perfkitbenchmarker.providers.openstack import utils as os_utils
 
 NONE = 'None'
 
@@ -382,12 +379,14 @@ class OpenStackVirtualMachine(virtual_machine.BaseVirtualMachine):
       self.ip_address = self.floating_ip.floating_ip_address
 
   def _GetNetworkIPAddress(self, server_dict, network_name):
-    addresses = server_dict['addresses'].split(',')
-    for address in addresses:
-      if network_name in address:
-        _, ip = address.split('=')
+    for net_name, addresses in server_dict['addresses'].items():
+      if network_name == net_name:
+        try :
+            ip = addresses[0]  
+        except Exception as e:
+            raise Exception(f"Instance IP could not be found, here is what we have {addresses}, {e}")
         return ip
-
+      
   def _GetInternalNetworkCIDR(self):
     """Returns IP addresses source range of internal network."""
     net_cmd = os_utils.OpenStackCLICommand(
@@ -454,7 +453,21 @@ class CentOs7BasedOpenStackVirtualMachine(
   DEFAULT_IMAGE = 'centos7'
 
 
-class ClearBasedOpenStackVirtualMachine(
-    OpenStackVirtualMachine, linux_virtual_machine.ClearMixin
-):
+class Ubuntu1804BasedOpenStackVirtualMachine(OpenStackVirtualMachine,
+                                          linux_virtual_machine.Ubuntu1804Mixin):
+  DEFAULT_IMAGE = 'ubuntu1804'
+
+
+class Ubuntu2004BasedOpenStackVirtualMachine(OpenStackVirtualMachine,
+                                          linux_virtual_machine.Ubuntu2004Mixin):
+  DEFAULT_IMAGE = 'ubuntu2004'
+
+
+class Ubuntu2204BasedOpenStackVirtualMachine(OpenStackVirtualMachine,
+                                          linux_virtual_machine.Ubuntu2204Mixin):
+  DEFAULT_IMAGE = 'ubuntu2204'
+
+
+class ClearBasedOpenStackVirtualMachine(OpenStackVirtualMachine,
+                                        linux_virtual_machine.ClearMixin):
   DEFAULT_IMAGE = 'upstream-clear'

@@ -13,15 +13,14 @@
 # limitations under the License.
 """ "Module containing classes related to OpenStack Networking."""
 
-from collections import namedtuple
 import json
 import threading
-from absl import flags
-from perfkitbenchmarker import errors
-from perfkitbenchmarker import network
-from perfkitbenchmarker import provider_info
-from perfkitbenchmarker.providers.openstack import utils
+from collections import namedtuple
 
+from absl import flags
+
+from perfkitbenchmarker import errors, network, provider_info
+from perfkitbenchmarker.providers.openstack import utils
 
 OSC_FLOATING_IP_CMD = 'floating ip'
 OSC_SEC_GROUP_CMD = 'security group'
@@ -95,9 +94,9 @@ class OpenStackFirewall(network.BaseFirewall):
           vm, OSC_SEC_GROUP_RULE_CMD, 'create', vm.group_id
       )
       if source_range:
-        cmd.flags['src-ip'] = source_range
+        cmd.flags['remote-ip'] = source_range
       cmd.flags['dst-port'] = str(icmp_type)
-      cmd.flags['proto'] = ICMP
+      cmd.flags['protocol'] = ICMP
       cmd.Issue()
       self.sec_group_rules_set.add(sec_group_rule)
 
@@ -128,13 +127,10 @@ class OpenStackFirewall(network.BaseFirewall):
           vm, OSC_SEC_GROUP_RULE_CMD, 'create', vm.group_id
       )
       if source_range:
-        cmd.flags['src-ip'] = source_range
+        cmd.flags['remote-ip'] = source_range
       cmd.flags['dst-port'] = '%d:%d' % (start_port, end_port)
-      for prot in (
-          TCP,
-          UDP,
-      ):
-        cmd.flags['proto'] = prot
+      for prot in (TCP, UDP,):
+        cmd.flags['protocol'] = prot
         cmd.Issue()
       self.sec_group_rules_set.add(sec_group_rule)
 
