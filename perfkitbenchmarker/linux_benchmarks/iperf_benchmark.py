@@ -22,11 +22,12 @@ Runs Iperf to collect network throughput.
 import logging
 import re
 import time
+
 from absl import flags
-from perfkitbenchmarker import configs
-from perfkitbenchmarker import flag_util
-from perfkitbenchmarker import sample
-from perfkitbenchmarker import vm_util
+
+from perfkitbenchmarker import configs, flag_util, sample, vm_util
+from perfkitbenchmarker.providers.openstack.utils import \
+    wait_for_sync_manager_green_light
 
 flag_util.DEFINE_integerlist(
     'iperf_sending_thread_count',
@@ -560,6 +561,9 @@ def Run(benchmark_spec):
   Returns:
     A list of sample.Sample objects.
   """
+  if FLAGS.pkbw_sync_manager_url:
+    wait_for_sync_manager_green_light(FLAGS.pkbw_sync_manager_url, 'ready')
+  
   vms = benchmark_spec.vms
   results = []
 
