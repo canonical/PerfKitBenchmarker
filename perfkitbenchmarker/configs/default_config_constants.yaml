@@ -83,7 +83,10 @@ default_dual_core: &default_dual_core
     image: null
   Kubernetes:
     image: null
-
+  OpenStack:
+    machine_type: m1.large
+    zone: nova
+    image: null
 # TODO(user): update the disk types below as more providers are
 # updated for the disk types refactor.
 default_500_gb: &default_500_gb
