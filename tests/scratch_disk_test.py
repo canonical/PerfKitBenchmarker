@@ -45,7 +45,7 @@ _BENCHMARK_UID = 'uid'
 _COMPONENT = 'test_component'
 
 
-class ScratchDiskTestMixin(object):
+class ScratchDiskTestMixin:
   """Sets up and tears down some of the mocks needed to test scratch disks."""
 
   @abc.abstractmethod
@@ -196,7 +196,9 @@ class GceScratchDiskTest(ScratchDiskTestMixin, unittest.TestCase):
 
   def _CreateVm(self):
     vm_spec = gce_virtual_machine.GceVmSpec(
-        'test_vm_spec.GCP', machine_type='test_machine_type'
+        'test_vm_spec.GCP',
+        machine_type='test_machine_type',
+        zone='us-central1-a',
     )
     vm = gce_virtual_machine.Ubuntu2004BasedGceVirtualMachine(vm_spec)
     vm.GetNVMEDeviceInfo = mock.Mock()
@@ -224,6 +226,85 @@ class GceScratchDiskTest(ScratchDiskTestMixin, unittest.TestCase):
         create_with_vm=False,
         disk_type=gce_disk.PD_STANDARD,
     )
+
+
+class GceMultiWriterDiskTest(GceScratchDiskTest, unittest.TestCase):
+  def _PatchCloudSpecific(self):
+    # Mock GceDisk Create and Attach methods
+    self.patches.append(mock.patch(gce_disk.__name__ + '.GceDisk.Create'))
+    self.patches.append(mock.patch(gce_disk.__name__ + '.GceDisk.Attach'))
+
+  def testScratchDisks(self):
+    # Unit test method from ScratchDiskTestMixin (not applicable)
+    pass
+
+  def _GetScratchDiskName(
+      self, vm_group_name: str, multi_writer_group_name: str
+  ) -> str:
+    """Get the name of the scratch disk.
+
+    Args:
+      vm_group_name: name of the vm_group
+      multi_writer_group_name: name of the multiwriter group name (optional)
+
+    Returns:
+      scratch disk name
+
+    """
+    # In this test case, GceDisk will not be mocked. Instead, only the methods
+    # Create and Attach for GceDisk need to be mocked.
+    self._GetDiskClass().side_effect = None
+    vm = self._CreateVm()
+    # initialize vm (vm_group and zone)
+    vm.vm_group = vm_group_name
+    vm.zone = 'test-zone-1'
+
+    # Create disk_spec
+    disk_spec = self.GetDiskSpec(mount_point='/mountpoint')
+    disk_spec.multi_writer_mode = True
+    if multi_writer_group_name:
+      disk_spec.multi_writer_group_name = multi_writer_group_name
+
+    # Create scratch disks
+    vm.SetDiskSpec(disk_spec, 1)
+    vm.create_disk_strategy.GetSetupDiskStrategy().WaitForDisksToVisibleFromVm = mock.MagicMock(
+        return_value=12
+    )
+    vm.SetupAllScratchDisks()
+
+    scratch_disk_name = vm.scratch_disks[0].name if vm.scratch_disks else None
+    return scratch_disk_name
+
+  def testMultiWriterDiskName(self):
+    """Test Case: Multiwriter Disk Name.
+
+    Scenario:
+      Verify that the multiwriter disk name adheres to the following convention:
+      'pkb-xxxx-multiwriter-{groupName}-{xx}'.
+      If 'disk_spec.multi_writer_group_name' is provided, ensure 'groupName' in
+      the disk name is set to this specified value.
+      If 'disk_spec.multi_writer_group_name' is not provided (or is None/empty),
+      the 'groupName' in the disk name is set to 'vm.vm_group'.
+    """
+    # Test multiwriter disk name without setting multi_writer_group_name
+    disk_name = self._GetScratchDiskName(
+        vm_group_name='testSrvGroup',
+        multi_writer_group_name=None,
+    )
+    validate_result = (
+        True if disk_name and 'multiwriter-testSrvGroup' in disk_name else False
+    )
+    self.assertEqual(validate_result, True)
+
+    # Test multiwriter disk name with setting multi_writer_group_name
+    disk_name = self._GetScratchDiskName(
+        vm_group_name='testSrvGroup',
+        multi_writer_group_name='sqlSrvGroup',
+    )
+    validate_result = (
+        True if disk_name and 'multiwriter-sqlSrvGroup' in disk_name else False
+    )
+    self.assertEqual(validate_result, True)
 
 
 class AwsScratchDiskTest(ScratchDiskTestMixin, unittest.TestCase):

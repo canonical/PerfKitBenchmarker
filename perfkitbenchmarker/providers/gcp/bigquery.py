@@ -31,7 +31,7 @@ from perfkitbenchmarker.providers.gcp import util as gcp_util
 
 FLAGS = flags.FLAGS
 
-BQ_CLIENT_FILE = 'bq-java-client-2.16.jar'
+BQ_CLIENT_FILE = 'bq-jdbc-simba-client-1.2.jar'
 DEFAULT_TABLE_EXPIRATION = 3600 * 24 * 365  # seconds
 
 BQ_JDBC_INTERFACES = [
@@ -303,7 +303,7 @@ class JavaClientInterface(GenericClientInterface):
       key_file_name = FLAGS.gcp_service_account_key_file.split('/')[-1]
 
     query_command = (
-        'java -cp {} '
+        'java -Xmx6g -cp {} '
         'com.google.cloud.performance.edw.Single --project {} '
         '--credentials_file {} --dataset {} '
         '--query_file {}'
@@ -338,7 +338,7 @@ class JavaClientInterface(GenericClientInterface):
     if '/' in FLAGS.gcp_service_account_key_file:
       key_file_name = os.path.basename(FLAGS.gcp_service_account_key_file)
     cmd = (
-        'java -cp {} '
+        'java -Xmx6g -cp {} '
         'com.google.cloud.performance.edw.Simultaneous --project {} '
         '--credentials_file {} --dataset {} --submission_interval {} '
         '--query_files {}'.format(
@@ -367,7 +367,7 @@ class JavaClientInterface(GenericClientInterface):
     if '/' in FLAGS.gcp_service_account_key_file:
       key_file_name = os.path.basename(FLAGS.gcp_service_account_key_file)
     cmd = (
-        'java -cp {} '
+        'java -Xmx6g -cp {} '
         'com.google.cloud.performance.edw.Throughput --project {} '
         '--credentials_file {} --dataset {} --query_streams {}'.format(
             BQ_CLIENT_FILE,
@@ -693,19 +693,54 @@ class Bqfederated(Bigquery):
     """Returns a dictionary with underlying data details.
 
     cluster_identifier = <project_id>.<dataset_id>
-    Data details are extracted from the dataset_id that follows the format:
+    Data details are extracted from the dataset_id which follows one of these
+    three formats:
+
     <dataset>_<format>_<compression>_<partitioning>_<location>
-    eg.
-    tpch10000_parquet_compressed_partitoned_gcs
+    or
+    <dataset>_<format>_<compression>_<partitioning>_<storage>_<location>
+    or
+    <dataset>_<format>_<table_format>_<compression>_<partitioning>_<storage>_<location>
+
+    E.g:
+
+    tpcds1000_parquet_compressed_partitioned_gcs
+    tpcds1000_parquet_snappy_part_gcs_uscentral1
+    tpcds1000_parquet_iceberg_snappy_part_gcs_us
 
     Returns:
       A dictionary set to underlying data's details (format, etc.)
     """
     data_details = {}
-    dataset_id = re.split(r'\.', self.cluster_identifier)[1]
+    project_id, dataset_id = re.split(r'\.', self.cluster_identifier)
+    data_details['metadata_caching'] = str('metadata-caching' in project_id)
     parsed_id = re.split(r'_', dataset_id)
-    data_details['format'] = parsed_id[1]
-    data_details['compression'] = parsed_id[2]
-    data_details['partitioning'] = parsed_id[3]
-    data_details['location'] = parsed_id[4]
+    if len(parsed_id) == 5:
+      data_details['format'] = parsed_id[1]
+      data_details['table_format'] = 'None'
+      data_details['compression'] = parsed_id[2]
+      data_details['partitioning'] = parsed_id[3]
+      data_details['storage'] = parsed_id[4]
+      data_details['location'] = 'us'
+    elif len(parsed_id) == 6:
+      data_details['format'] = parsed_id[1]
+      data_details['table_format'] = 'None'
+      data_details['compression'] = parsed_id[2]
+      data_details['partitioning'] = parsed_id[3]
+      data_details['storage'] = parsed_id[4]
+      data_details['location'] = parsed_id[5]
+    elif len(parsed_id) == 7:
+      data_details['format'] = parsed_id[1]
+      data_details['table_format'] = parsed_id[2]
+      data_details['compression'] = parsed_id[3]
+      data_details['partitioning'] = parsed_id[4]
+      data_details['storage'] = parsed_id[5]
+      data_details['location'] = parsed_id[6]
+    else:
+      data_details['format'] = 'unknown'
+      data_details['table_format'] = 'unknown'
+      data_details['compression'] = 'unknown'
+      data_details['partitioning'] = 'unknown'
+      data_details['storage'] = 'unknown'
+      data_details['location'] = 'unknown'
     return data_details

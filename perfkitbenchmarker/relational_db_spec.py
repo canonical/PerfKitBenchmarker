@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Module containing the spec for relational database services."""
+
+import copy
+
 from absl import logging
 from perfkitbenchmarker import db_util
 from perfkitbenchmarker import disk
@@ -24,6 +27,7 @@ from perfkitbenchmarker.configs import freeze_restore_spec
 from perfkitbenchmarker.configs import option_decoders
 from perfkitbenchmarker.configs import spec
 from perfkitbenchmarker.configs import vm_group_decoders
+
 
 _NONE_OK = {'default': None, 'none_ok': True}
 
@@ -71,7 +75,7 @@ class RelationalDbSpec(freeze_restore_spec.FreezeRestoreSpec):
   load_machine_type: str
 
   def __init__(self, component_full_name, flag_values=None, **kwargs):
-    super(RelationalDbSpec, self).__init__(
+    super().__init__(
         component_full_name, flag_values=flag_values, **kwargs
     )
     # TODO(user): This is a lot of boilerplate, and is repeated
@@ -95,7 +99,7 @@ class RelationalDbSpec(freeze_restore_spec.FreezeRestoreSpec):
           self.cloud, disk_config.get('disk_type', None)
       )
       self.db_disk_spec = disk_spec_class(
-          '{0}.db_disk_spec.{1}'.format(component_full_name, self.cloud),
+          '{}.db_disk_spec.{}'.format(component_full_name, self.cloud),
           flag_values=flag_values,
           **disk_config
       )
@@ -109,7 +113,7 @@ class RelationalDbSpec(freeze_restore_spec.FreezeRestoreSpec):
         )
       db_vm_spec_class = virtual_machine.GetVmSpecClass(self.cloud)
       self.db_spec = db_vm_spec_class(
-          '{0}.db_spec.{1}'.format(component_full_name, self.cloud),
+          '{}.db_spec.{}'.format(component_full_name, self.cloud),
           flag_values=flag_values,
           **db_vm_config
       )
@@ -132,7 +136,7 @@ class RelationalDbSpec(freeze_restore_spec.FreezeRestoreSpec):
       The pair specifies a decoder class and its __init__() keyword arguments
       to construct in order to decode the named option.
     """
-    result = super(RelationalDbSpec, cls)._GetOptionDecoderConstructions()
+    result = super()._GetOptionDecoderConstructions()
     result.update({
         'cloud': (
             option_decoders.EnumDecoder,
@@ -194,7 +198,7 @@ class RelationalDbSpec(freeze_restore_spec.FreezeRestoreSpec):
     # Currently the only way to modify the disk spec of the
     # db is to change the benchmark spec in the benchmark source code
     # itself.
-    super(RelationalDbSpec, cls)._ApplyFlags(config_values, flag_values)
+    super()._ApplyFlags(config_values, flag_values)
 
     # TODO(user): Rename flags 'managed_db_' -> 'db_'.
     has_db_machine_type = flag_values['db_machine_type'].present
@@ -262,10 +266,13 @@ class RelationalDbSpec(freeze_restore_spec.FreezeRestoreSpec):
     if flag_values['db_flags'].present:
       config_values['db_flags'] = flag_values.db_flags
     cloud = config_values['cloud']
-    has_unmanaged_dbs = (
-        'vm_groups' in config_values and 'servers' in config_values['vm_groups']
+    has_unmanaged_dbs = 'vm_groups' in config_values and (
+        'servers' in config_values['vm_groups']
+        or 'servers_replicas' in config_values['vm_groups']
     )
 
+    # Set zone for db server
+    # flag value order: db_zone (if specified) -> zone (if specified)
     if flag_values['db_zone'].present:
       config_values['db_spec'][cloud]['zone'] = flag_values.db_zone[0]
       config_values['zones'] = flag_values.db_zone
@@ -273,16 +280,48 @@ class RelationalDbSpec(freeze_restore_spec.FreezeRestoreSpec):
         config_values['vm_groups']['servers']['vm_spec'][cloud]['zone'] = (
             flag_values.db_zone[0]
         )
+    elif (
+        flag_values['zone'].present
+        and 'db_spec' in config_values
+        and 'zones' in config_values
+    ):
+      config_values['db_spec'][cloud]['zone'] = flag_values.zone[0]
+      config_values['zones'] = flag_values.zone
+      if has_unmanaged_dbs:
+        config_values['vm_groups']['servers']['vm_spec'][cloud]['zone'] = (
+            flag_values.zone[0]
+        )
 
     if flag_values['client_vm_count'].present:
       config_values['vm_groups']['clients'][
           'vm_count'
       ] = flag_values.client_vm_count
 
+    # Set zone for client vm
+    # flag value order: client_vm_zone (if specified) -> zone (if specified)
     if flag_values['client_vm_zone'].present:
       config_values['vm_groups']['clients']['vm_spec'][cloud][
           'zone'
       ] = flag_values.client_vm_zone
+    elif (
+        flag_values['zone'].present
+        and 'vm_groups' in config_values
+        and 'clients' in config_values['vm_groups']
+    ):
+      config_values['vm_groups']['clients']['vm_spec'][cloud]['zone'] = (
+          flag_values.zone[0]
+      )
+
+    # Set zone for controller vm
+    if (
+        flag_values['zone'].present
+        and 'vm_groups' in config_values
+        and 'controller' in config_values['vm_groups']
+    ):
+      config_values['vm_groups']['controller']['vm_spec'][cloud]['zone'] = (
+          flag_values.zone[0]
+      )
+
     if has_db_machine_type:
       config_values['db_spec'][cloud][
           'machine_type'
@@ -398,4 +437,26 @@ class RelationalDbSpec(freeze_restore_spec.FreezeRestoreSpec):
       config_values['vm_groups']['clients']['disk_spec'][cloud][
           'provisioned_iops'
       ] = flag_values.client_vm_disk_iops
+
+    # Copy the servers vm group to the server replicas vm group if unmanaged
+    # dbs are present.
+    if (
+        has_unmanaged_dbs
+        and 'servers_replicas' in config_values['vm_groups']
+    ):
+      config_values['vm_groups']['servers_replicas'] = copy.deepcopy(
+          config_values['vm_groups']['servers']
+      )
+      # Set the zone for replica server (if specified)
+      if flag_values['db_replica_zones'].present:
+        config_values['vm_groups']['servers_replicas']['vm_spec'][cloud][
+            'zone'
+        ] = flag_values.db_replica_zones[0]
+
+      # Clear all the zones if the zone flag is present. This will prevent zone
+      # values to be overwritten by the benchmark
+      # spec.ConstructVirtualMachineGroup() method.
+      if flag_values['zone'].present:
+        flag_values.zone.clear()
+
     logging.warning('Relational db config values: %s', config_values)

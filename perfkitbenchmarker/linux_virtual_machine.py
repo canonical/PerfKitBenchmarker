@@ -44,8 +44,8 @@ import yaml
 from absl import flags
 from packaging import version as packaging_version
 
-from perfkitbenchmarker import (background_tasks, context, disk, errors,
-                                linux_packages, os_types, regex_util, sample,
+from perfkitbenchmarker import (background_tasks, disk, errors, linux_packages,
+                                os_mixin, os_types, regex_util, sample,
                                 virtual_machine, vm_util)
 
 FLAGS = flags.FLAGS
@@ -241,6 +241,10 @@ flags.DEFINE_boolean(
     'to extract the total available memory capacity in the container.',
 )
 
+flags.DEFINE_integer(
+    'visible_core_count', None, 'To customize the number of visible CPU cores.'
+)
+
 _DISABLE_YUM_CRON = flags.DEFINE_boolean(
     'disable_yum_cron', True, 'Whether to disable the cron-run yum service.'
 )
@@ -357,7 +361,7 @@ class CpuVulnerabilities:
     return ret
 
 
-class KernelRelease(object):
+class KernelRelease:
   """Holds the contents of the linux kernel version returned from uname -r."""
 
   def __init__(self, uname: str):
@@ -400,16 +404,13 @@ class KernelRelease(object):
     return self.name
 
 
-class BaseLinuxMixin(virtual_machine.BaseOsMixin):
+class BaseLinuxMixin(os_mixin.BaseOsMixin):
   """Class that holds Linux related VM methods and attributes."""
 
   # If multiple ssh calls are made in parallel using -t it will mess
   # the stty settings up and the terminal will become very hard to use.
   # Serializing calls to ssh with the -t option fixes the problem.
   _pseudo_tty_lock = threading.Lock()
-
-  # TODO(user): Remove all uses of Python 2.
-  PYTHON_2_PACKAGE = 'python2'
 
   # this command might change depending on the OS, but most linux distributions
   # can use the following command
@@ -424,7 +425,7 @@ class BaseLinuxMixin(virtual_machine.BaseOsMixin):
   _IGNORE_NETWORK_DEVICE_PREFIXES = ('lo', 'docker', 'ib')
 
   def __init__(self, *args, **kwargs):
-    super(BaseLinuxMixin, self).__init__(*args, **kwargs)
+    super().__init__(*args, **kwargs)
     # N.B. If you override ssh_port you must override remote_access_ports and
     # primary_remote_access_port.
     self.ssh_port = DEFAULT_SSH_PORT
@@ -442,10 +443,10 @@ class BaseLinuxMixin(virtual_machine.BaseOsMixin):
     self._proccpu_cache = None
     self._smp_affinity_script = None
     self.name: str
-    self._os_info: Optional[str] = None
-    self._kernel_release: Optional[KernelRelease] = None
-    self._cpu_arch: Optional[str] = None
-    self._kernel_command_line: Optional[str] = None
+    self._os_info: str | None = None
+    self._kernel_release: KernelRelease | None = None
+    self._cpu_arch: str | None = None
+    self._kernel_command_line: str | None = None
     self._network_device_mtus = None
 
   def _Suspend(self):
@@ -501,7 +502,7 @@ class BaseLinuxMixin(virtual_machine.BaseOsMixin):
       disabled_cstates.append(cstates[index])
     self.os_metadata['disabled_cstates'] = ','.join(disabled_cstates)
 
-  def _GetOrderedCstates(self) -> Optional[list[str]]:
+  def _GetOrderedCstates(self) -> list[str] | None:
     """Returns the ordered cstates by querying the sysfs cpuidle path.
 
     The ordering is obtained by the alphabetical wildcard expansion.
@@ -521,8 +522,8 @@ class BaseLinuxMixin(virtual_machine.BaseOsMixin):
     """
     with self._remote_command_script_upload_lock:
       if not self._has_remote_command_script:
-        # Python3 is needed for RobustRemoteCommands
-        self.Install('python3')
+        # Python is needed for RobustRemoteCommands
+        self.Install('python')
 
         for f in (EXECUTE_COMMAND, WAIT_FOR_COMMAND):
           remote_path = os.path.join(vm_util.VM_TMP_DIR, os.path.basename(f))
@@ -534,7 +535,7 @@ class BaseLinuxMixin(virtual_machine.BaseOsMixin):
   def RobustRemoteCommand(
       self,
       command: str,
-      timeout: Optional[float] = None,
+      timeout: float | None = None,
       ignore_failure: bool = False,
   ) -> Tuple[str, str]:
     """Runs a command on the VM in a more robust way than RemoteCommand.
@@ -690,7 +691,8 @@ class BaseLinuxMixin(virtual_machine.BaseOsMixin):
     pass
 
   def PrepareVMEnvironment(self):
-    super(BaseLinuxMixin, self).PrepareVMEnvironment()
+    super().PrepareVMEnvironment()
+    self._SetNumCpus()
     self.SetupProxy()
     self._CreateVmTmpDir()
     self._SetTransparentHugepages()
@@ -1242,14 +1244,14 @@ class BaseLinuxMixin(virtual_machine.BaseOsMixin):
     # TODO(user): Allow custom disk formatting options.
     if FLAGS.disk_fs_type == 'xfs':
       block_size = FLAGS.disk_block_size or 512
-      fmt_cmd = 'sudo mkfs.xfs -f -i size={0} {1}'.format(
+      fmt_cmd = 'sudo mkfs.xfs -f -i size={} {}'.format(
           block_size, device_path
       )
     else:
       block_size = FLAGS.disk_block_size or 4096
       fmt_cmd = (
           'sudo mke2fs -F -E lazy_itable_init=0,discard -O '
-          '^has_journal -t ext4 -b {0} {1}'.format(block_size, device_path)
+          '^has_journal -t ext4 -b {} {}'.format(block_size, device_path)
       )
     self.os_metadata['disk_filesystem_type'] = FLAGS.disk_fs_type
     self.os_metadata['disk_filesystem_blocksize'] = block_size
@@ -1400,11 +1402,11 @@ class BaseLinuxMixin(virtual_machine.BaseOsMixin):
   def RemoteHostCommandWithReturnCode(
       self,
       command: str,
-      retries: Optional[int] = None,
+      retries: int | None = None,
       ignore_failure: bool = False,
       login_shell: bool = False,
-      timeout: Optional[float] = None,
-      ip_address: Optional[str] = None,
+      timeout: float | None = None,
+      ip_address: str | None = None,
       should_pre_log: bool = True,
       stack_level: int = 1,
   ) -> Tuple[str, str, int]:
@@ -1753,10 +1755,10 @@ class BaseLinuxMixin(virtual_machine.BaseOsMixin):
         /MemFree:/ {total += $2}
         /Cached:/  {total += $2}
         /Buffers:/ {total += $2}
-        END        {printf "%d",total}
+        END        {printf "%d",total/1024}
         ' /proc/meminfo
         """)
-    return int(stdout)
+    return int(stdout) * 1024
 
   def _GetTotalMemoryKbFromCgroup(self):
     """Extracts the memory space in kibibyte (KiB) for containers.
@@ -1846,7 +1848,8 @@ class BaseLinuxMixin(virtual_machine.BaseOsMixin):
     for d in local_disks:
       path = d.GetDevicePath()
       self.RemoteCommand(
-          f'sudo nvme --set-feature --feature-id=8 --value=0x101 {path}')
+          f'sudo nvme --set-feature --feature-id=8 --value=0x101 {path}'
+      )
 
   def StripeDisks(self, devices, striped_device):
     """Raids disks together using mdadm.
@@ -1888,7 +1891,8 @@ class BaseLinuxMixin(virtual_machine.BaseOsMixin):
       dev_path: The device path that should be partitioned.
       num_partitions: The number of new partitions to create.
       partition_size: The size of each partition. The last partition will use
-                      the rest of the device space.
+        the rest of the device space.
+
     Returns:
       A list of partition parths.
     """
@@ -1898,11 +1902,11 @@ class BaseLinuxMixin(virtual_machine.BaseOsMixin):
     self.InstallPackages('parted')
 
     # Set the disk label to gpt.
-    self.RemoteHostCommand(f'echo \'label: gpt\' | sudo sfdisk {dev_path}')
+    self.RemoteHostCommand(f"echo 'label: gpt' | sudo sfdisk {dev_path}")
 
     disks = []
     # Create and append new partitions (except the last oen) to the disk
-    for part_id in range(num_partitions-1):
+    for part_id in range(num_partitions - 1):
       self.RemoteHostCommand(
           'echo ",%s,L" | sudo sfdisk %s -f --append'
           % (partition_size, dev_path)
@@ -2103,15 +2107,14 @@ class ClearMixin(BaseLinuxMixin):
 
   OS_TYPE = os_types.CLEAR
   BASE_OS_TYPE = os_types.CLEAR
-  PYTHON_2_PACKAGE = 'python-basic'
 
   def OnStartup(self):
     """Eliminates the need to have a tty to run sudo commands."""
-    super(ClearMixin, self).OnStartup()
+    super().OnStartup()
     self.RemoteHostCommand('sudo swupd autoupdate --disable')
     self.RemoteHostCommand('sudo mkdir -p /etc/sudoers.d')
     self.RemoteHostCommand(
-        "echo 'Defaults:{0} !requiretty' | sudo tee /etc/sudoers.d/pkb".format(
+        "echo 'Defaults:{} !requiretty' | sudo tee /etc/sudoers.d/pkb".format(
             self.user_name
         ),
         login_shell=True,
@@ -2123,13 +2126,13 @@ class ClearMixin(BaseLinuxMixin):
     Performs the normal package cleanup, then deletes the file
     added to the /etc/sudoers.d directory during startup.
     """
-    super(ClearMixin, self).PackageCleanup()
+    super().PackageCleanup()
     self.RemoteCommand('sudo rm /etc/sudoers.d/pkb')
 
   def SnapshotPackages(self):
     """See base class."""
     self.RemoteCommand(
-        'sudo swupd bundle-list > {0}/bundle_list'.format(
+        'sudo swupd bundle-list > {}/bundle_list'.format(
             linux_packages.INSTALL_DIR
         )
     )
@@ -2138,7 +2141,7 @@ class ClearMixin(BaseLinuxMixin):
     """See base class."""
     self.RemoteCommand(
         'sudo swupd bundle-list | grep --fixed-strings --line-regexp'
-        ' --invert-match --file {0}/bundle_list | xargs --no-run-if-empty sudo'
+        ' --invert-match --file {}/bundle_list | xargs --no-run-if-empty sudo'
         ' swupd bundle-remove'.format(linux_packages.INSTALL_DIR),
         ignore_failure=True,
     )
@@ -2146,12 +2149,12 @@ class ClearMixin(BaseLinuxMixin):
   def HasPackage(self, package):
     """Returns True iff the package is available for installation."""
     return self.TryRemoteCommand(
-        'sudo swupd bundle-list --all | grep {0}'.format(package)
+        'sudo swupd bundle-list --all | grep {}'.format(package)
     )
 
   def InstallPackages(self, packages: str) -> None:
     """Installs packages using the swupd bundle manager."""
-    self.RemoteCommand('sudo swupd bundle-add {0}'.format(packages))
+    self.RemoteCommand('sudo swupd bundle-add {}'.format(packages))
 
   def Install(self, package_name):
     """Installs a PerfKit package on the VM."""
@@ -2165,7 +2168,7 @@ class ClearMixin(BaseLinuxMixin):
         package.Install(self)
       else:
         raise KeyError(
-            'Package {0} has no install method for Clear Linux.'.format(
+            'Package {} has no install method for Clear Linux.'.format(
                 package_name
             )
         )
@@ -2192,13 +2195,13 @@ class ClearMixin(BaseLinuxMixin):
   def GetOsInfo(self):
     """See base class."""
     stdout, _ = self.RemoteCommand('swupd info | grep Installed')
-    return 'Clear Linux build: {0}'.format(
+    return 'Clear Linux build: {}'.format(
         regex_util.ExtractGroup(CLEAR_BUILD_REGEXP, stdout)
     )
 
   def SetupProxy(self):
     """Sets up proxy configuration variables for the cloud environment."""
-    super(ClearMixin, self).SetupProxy()
+    super().SetupProxy()
     profile_file = '/etc/profile'
     commands = []
 
@@ -2285,7 +2288,7 @@ class BaseRhelMixin(BaseLinuxMixin):
   # dnf is backwards compatible with yum, but has some additional capabilities
   # For CentOS and RHEL 7 we override this to yum and do not pass dnf-only flags
   # The commands are similar enough that forking whole methods seemed necessary.
-  # This can be removed when CentOS and RHEL 7 are no longer supported by PKB.
+  # This can be removed when Amazon Linux 2 is no longer supported by PKB.
   PACKAGE_MANAGER = DNF
 
   # OS_TYPE = os_types.RHEL
@@ -2296,7 +2299,7 @@ class BaseRhelMixin(BaseLinuxMixin):
 
   def OnStartup(self):
     """Eliminates the need to have a tty to run sudo commands."""
-    super(BaseRhelMixin, self).OnStartup()
+    super().OnStartup()
     self.RemoteHostCommand(
         "echo 'Defaults:%s !requiretty' | sudo tee /etc/sudoers.d/pkb"
         % self.user_name,
@@ -2325,7 +2328,7 @@ class BaseRhelMixin(BaseLinuxMixin):
     Performs the normal package cleanup, then deletes the file
     added to the /etc/sudoers.d directory during startup.
     """
-    super(BaseRhelMixin, self).PackageCleanup()
+    super().PackageCleanup()
     self.RemoteCommand('sudo rm /etc/sudoers.d/pkb')
 
   def SnapshotPackages(self):
@@ -2411,7 +2414,7 @@ class BaseRhelMixin(BaseLinuxMixin):
 
   def SetupProxy(self):
     """Sets up proxy configuration variables for the cloud environment."""
-    super(BaseRhelMixin, self).SetupProxy()
+    super().SetupProxy()
     if self.PACKAGE_MANAGER == YUM:
       yum_proxy_file = '/etc/yum.conf'
     elif self.PACKAGE_MANAGER == DNF:
@@ -2461,21 +2464,6 @@ class AmazonLinux2023Mixin(BaseRhelMixin):
   # https://docs.aws.amazon.com/linux/al2023/ug/compare-with-al2.html#epel
 
 
-class Rhel7Mixin(BaseRhelMixin):
-  """Class holding RHEL 7 specific VM methods and attributes."""
-
-  OS_TYPE = os_types.RHEL7
-  PACKAGE_MANAGER = YUM
-
-  def SetupPackageManager(self):
-    """Install EPEL."""
-    # https://docs.fedoraproject.org/en-US/epel/#_rhel_7
-    # yum exits 1 if the program is installed so check first
-    self.RemoteCommand(
-        f'rpm -q epel-release || sudo yum install -y {_EPEL_URL.format(7)}'
-    )
-
-
 class Rhel8Mixin(BaseRhelMixin):
   """Class holding RHEL 8 specific VM methods and attributes."""
 
@@ -2491,7 +2479,6 @@ class Rhel9Mixin(BaseRhelMixin):
   """Class holding RHEL 9 specific VM methods and attributes."""
 
   OS_TYPE = os_types.RHEL9
-  PYTHON_2_PACKAGE = None
 
   def SetupPackageManager(self):
     """Install EPEL."""
@@ -2503,7 +2490,6 @@ class Fedora36Mixin(BaseRhelMixin):
   """Class holding Fedora36 specific methods and attributes."""
 
   OS_TYPE = os_types.FEDORA36
-  PYTHON_2_PACKAGE = None
 
   def SetupPackageManager(self):
     """Fedora does not need epel."""
@@ -2513,62 +2499,15 @@ class Fedora37Mixin(BaseRhelMixin):
   """Class holding Fedora37 specific methods and attributes."""
 
   OS_TYPE = os_types.FEDORA37
-  PYTHON_2_PACKAGE = None
 
   def SetupPackageManager(self):
     """Fedora does not need epel."""
-
-
-class CentOs7Mixin(BaseRhelMixin):
-  """Class holding CentOS 7 specific VM methods and attributes."""
-
-  OS_TYPE = os_types.CENTOS7
-  PACKAGE_MANAGER = YUM
-
-  def SetupPackageManager(self):
-    """Install EPEL."""
-    # https://docs.fedoraproject.org/en-US/epel/#_centos_7
-    # yum exits 1 if the program is installed so check first
-    self.RemoteCommand(
-        'rpm -q epel-release || sudo yum install -y epel-release'
-    )
-
-
-class CentOs8Mixin(BaseRhelMixin, virtual_machine.DeprecatedOsMixin):
-  """Class holding CentOS 8 specific VM methods and attributes."""
-
-  OS_TYPE = os_types.CENTOS8
-  END_OF_LIFE = '2021-12-31'
-  ALTERNATIVE_OS = f'{os_types.ROCKY_LINUX8} or {os_types.CENTOS_STREAM8}'
-
-  def SetupPackageManager(self):
-    """Install EPEL."""
-    # https://docs.fedoraproject.org/en-US/epel/#almalinux_8_rocky_linux_8
-    self.RemoteCommand(
-        'sudo dnf config-manager --set-enabled powertools && '
-        'sudo dnf install -y epel-release'
-    )
-
-
-class CentOsStream8Mixin(BaseRhelMixin):
-  """Class holding CentOS Stream 8 specific VM methods and attributes."""
-
-  OS_TYPE = os_types.CENTOS_STREAM8
-
-  def SetupPackageManager(self):
-    """Install EPEL."""
-    # https://docs.fedoraproject.org/en-US/epel/#_centos_stream_8
-    self.RemoteCommand(
-        'sudo dnf config-manager --set-enabled powertools && '
-        'sudo dnf install -y epel-release epel-next-release'
-    )
 
 
 class CentOsStream9Mixin(BaseRhelMixin):
   """Class holding CentOS Stream 9 specific VM methods and attributes."""
 
   OS_TYPE = os_types.CENTOS_STREAM9
-  PYTHON_2_PACKAGE = None
 
   def SetupPackageManager(self):
     """Install EPEL."""
@@ -2621,7 +2560,7 @@ class BaseDebianMixin(BaseLinuxMixin):
   BASE_OS_TYPE = os_types.DEBIAN
 
   def __init__(self, *args, **kwargs):
-    super(BaseDebianMixin, self).__init__(*args, **kwargs)
+    super().__init__(*args, **kwargs)
 
     # Whether or not apt-get update has been called.
     # We defer running apt-get update until the first request to install a
@@ -2763,7 +2702,7 @@ class BaseDebianMixin(BaseLinuxMixin):
 
   def SetupProxy(self):
     """Sets up proxy configuration variables for the cloud environment."""
-    super(BaseDebianMixin, self).SetupProxy()
+    super().SetupProxy()
     apt_proxy_file = '/etc/apt/apt.conf'
     commands = []
 
@@ -2789,7 +2728,7 @@ class BaseDebianMixin(BaseLinuxMixin):
       target: int. The max number of ssh connection.
     """
     self.RemoteCommand(
-        r'sudo sed -i -e "s/.*MaxStartups.*/MaxStartups {0}/" '
+        r'sudo sed -i -e "s/.*MaxStartups.*/MaxStartups {}/" '
         '/etc/ssh/sshd_config'.format(target)
     )
     self.RemoteCommand('sudo service ssh restart')
@@ -2805,41 +2744,12 @@ class BaseDebianMixin(BaseLinuxMixin):
       self.Reboot()
 
 
-class Debian9Mixin(BaseDebianMixin):
-  """Class holding Debian9 specific VM methods and attributes."""
-
-  OS_TYPE = os_types.DEBIAN9
-  # https://packages.debian.org/stretch/python
-  PYTHON_2_PACKAGE = 'python'
-
-
-class Debian10Mixin(BaseDebianMixin, virtual_machine.DeprecatedOsMixin):
-  """Class holding Debian 10 specific VM methods and attributes."""
-
-  OS_TYPE = os_types.DEBIAN10
-  END_OF_LIFE = '2024-06-30'
-
-  def SetupPackageManager(self):
-    # buster-backports has moved to the archive domain
-    self.RemoteCommand(
-        'sudo find /etc/apt/sources.list* -type f -exec sed -Ei '
-        "'s@(https?://)\\S+(/debian buster-backports main)"
-        "@\\1archive.debian.org\\2@' "
-        '{} \\;'
-    )
-    super().SetupPackageManager()
-
-
-class Debian10BackportsMixin(Debian10Mixin):
-  """Debian 10 with backported kernel."""
-
-  OS_TYPE = os_types.DEBIAN10_BACKPORTS
-
-
-class Debian11Mixin(BaseDebianMixin):
+class Debian11Mixin(BaseDebianMixin, os_mixin.DeprecatedOsMixin):
   """Class holding Debian 11 specific VM methods and attributes."""
 
   OS_TYPE = os_types.DEBIAN11
+  ALTERNATIVE_OS = os_types.DEBIAN12
+  END_OF_LIFE = '2026-08-31'
 
   def PrepareVMEnvironment(self):
     # Missing in some images. Required by PrepareVMEnvironment to determine
@@ -2881,50 +2791,10 @@ class BaseUbuntuMixin(BaseDebianMixin):
       self.Reboot()
 
 
-class Ubuntu1604Mixin(BaseUbuntuMixin, virtual_machine.DeprecatedOsMixin):
-  """Class holding Ubuntu1604 specific VM methods and attributes."""
-
-  OS_TYPE = os_types.UBUNTU1604
-  PYTHON_2_PACKAGE = 'python'
-  END_OF_LIFE = '2021-05-01'
-  ALTERNATIVE_OS = os_types.UBUNTU1804
-
-
-class Ubuntu1804Mixin(BaseUbuntuMixin, virtual_machine.DeprecatedOsMixin):
-  """Class holding Ubuntu1804 specific VM methods and attributes."""
-
-  OS_TYPE = os_types.UBUNTU1804
-  # https://packages.ubuntu.com/bionic/python
-  PYTHON_2_PACKAGE = 'python'
-  END_OF_LIFE = '2023-05-31'
-  ALTERNATIVE_OS = os_types.UBUNTU2004
-
-  def UpdateEnvironmentPath(self):
-    """Add /snap/bin to default search path for Ubuntu1804.
-
-    See https://bugs.launchpad.net/snappy/+bug/1659719.
-    """
-    # Ensure ~/.bashrc exists.
-    self.RemoteCommand(
-        r'touch ~/.bashrc && sed -i "1 i\export PATH=$PATH:/snap/bin" ~/.bashrc'
-    )
-    self.RemoteCommand(
-        r'sudo sed -i "1 i\export PATH=$PATH:/snap/bin" /etc/bash.bashrc'
-    )
-
-
-class Ubuntu1804EfaMixin(Ubuntu1804Mixin):
-  """Class holding EFA specific VM methods and attributes."""
-
-  OS_TYPE = os_types.UBUNTU1804_EFA
-
-
 class Ubuntu2004Mixin(BaseUbuntuMixin):
   """Class holding Ubuntu2004 specific VM methods and attributes."""
 
   OS_TYPE = os_types.UBUNTU2004
-  # https://packages.ubuntu.com/focal/python2
-  PYTHON_2_PACKAGE = 'python2'
 
   def UpdateEnvironmentPath(self):
     """Add /snap/bin to default search path for Ubuntu2004.
@@ -2978,26 +2848,16 @@ class Ubuntu2204Mixin(BaseUbuntuMixin):
   OS_TYPE = os_types.UBUNTU2204
 
 
-class Ubuntu2310Mixin(BaseUbuntuMixin):
-  """Class holding Ubuntu 23.10 specific VM methods and attributes."""
-
-  OS_TYPE = os_types.UBUNTU2310
-
-
 class Ubuntu2404Mixin(BaseUbuntuMixin):
   """Class holding Ubuntu 24.04 specific VM methods and attributes."""
 
   OS_TYPE = os_types.UBUNTU2404
 
 
-class Ubuntu1604Cuda9Mixin(Ubuntu1604Mixin):
-  """Class holding NVIDIA CUDA specific VM methods and attributes."""
-
-  OS_TYPE = os_types.UBUNTU1604_CUDA9
-
-
 class ContainerizedDebianMixin(BaseDebianMixin):
-  """Class representing a Containerized Virtual Machine.
+  """DEPRECATED mixin with no current implementations.
+
+  Class representing a Containerized Virtual Machine.
 
   A Containerized Virtual Machine is a VM that runs remote commands
   within a Docker Container.
@@ -3005,11 +2865,10 @@ class ContainerizedDebianMixin(BaseDebianMixin):
   whereas any call to RemoteHostCommand() will be run in the VM itself.
   """
 
-  OS_TYPE = os_types.UBUNTU_CONTAINER
   BASE_DOCKER_IMAGE = 'ubuntu:xenial'
 
   def __init__(self, *args, **kwargs):
-    super(ContainerizedDebianMixin, self).__init__(*args, **kwargs)
+    super().__init__(*args, **kwargs)
     self.docker_id = None
 
   def _CheckDockerExists(self):
@@ -3033,7 +2892,7 @@ class ContainerizedDebianMixin(BaseDebianMixin):
     # Has to be done after InitDocker() because it needs docker_id.
     self._CreateVmTmpDir()
 
-    super(ContainerizedDebianMixin, self).PrepareVMEnvironment()
+    super().PrepareVMEnvironment()
 
   def InitDocker(self):
     """Initializes the docker container daemon."""
@@ -3197,7 +3056,7 @@ def CreateLscpuSamples(vms):
   return samples
 
 
-class LsCpuResults(object):
+class LsCpuResults:
   """Holds the contents of the command lscpu."""
 
   def __init__(self, lscpu):
@@ -3270,7 +3129,7 @@ def CreateProcCpuSamples(vms):
   return samples
 
 
-class ProcCpuResults(object):
+class ProcCpuResults:
   """Parses /proc/cpuinfo text into grouped values.
 
   Most of the cpuinfo is repeated per processor.  Known ones that change per
@@ -3349,7 +3208,9 @@ class ProcCpuResults(object):
 
 
 class JujuMixin(BaseDebianMixin):
-  """Class to allow running Juju-deployed workloads.
+  """DEPRECATED mixin with no current implementations.
+
+  Class to allow running Juju-deployed workloads.
 
   Bootstraps a Juju environment using the manual provider:
   https://jujucharms.com/docs/stable/config-manual
@@ -3357,8 +3218,6 @@ class JujuMixin(BaseDebianMixin):
 
   # TODO: Add functionality to tear down and uninstall Juju
   # (for pre-provisioned) machines + JujuUninstall for packages using charms.
-
-  OS_TYPE = os_types.JUJU
 
   is_controller = False
 
@@ -3563,11 +3422,11 @@ class JujuMixin(BaseDebianMixin):
       resp, _ = self.RemoteHostCommand(
           'sudo add-apt-repository ppa:juju/stable'
       )
-    super(JujuMixin, self).SetupPackageManager()
+    super().SetupPackageManager()
 
   def PrepareVMEnvironment(self):
     """Install and configure a Juju environment."""
-    super(JujuMixin, self).PrepareVMEnvironment()
+    super().PrepareVMEnvironment()
     if self.is_controller:
       self.InstallPackages('juju')
 

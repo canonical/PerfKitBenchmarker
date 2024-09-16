@@ -22,6 +22,7 @@ import os
 import posixpath
 import re
 import time
+from typing import Any
 
 from absl import flags
 import bs4
@@ -45,6 +46,12 @@ _BLOCKSIZE_OVERRIDE = flags.DEFINE_integer(
     128,
     'Blocksize in MiB to be used by the HDFS filesystem. '
     'This is the chunksize in which the HDFS file will be divided into.',
+)
+
+_HADOOP_NAMENODE_OPTS = flags.DEFINE_string(
+    'hadoop_namenode_opts',
+    None,
+    'Additional options to be passed to the HDFS NameNode.',
 )
 
 DATA_FILES = [
@@ -152,11 +159,7 @@ def YumInstall(vm):
 
 def AptInstall(vm):
   """Installs Hadoop on the VM."""
-  libsnappy = 'libsnappy1'
-  if not vm.HasPackage(libsnappy):
-    # libsnappy's name on ubuntu16.04 is libsnappy1v5. Let's try that instead.
-    libsnappy = 'libsnappy1v5'
-  vm.InstallPackages(libsnappy)
+  vm.InstallPackages('libsnappy1v5')
   _Install(vm)
 
 
@@ -166,7 +169,7 @@ def InstallGcsConnector(vm, install_dir=HADOOP_LIB_DIR):
       'https://storage.googleapis.com/hadoop-lib/gcs/'
       'gcs-connector-hadoop{}-latest.jar'.format(HadoopVersion().major)
   )
-  vm.RemoteCommand('cd {0} && curl -O {1}'.format(install_dir, connector_url))
+  vm.RemoteCommand('cd {} && curl -O {}'.format(install_dir, connector_url))
 
 
 # Scheduling constants.
@@ -222,10 +225,25 @@ def _RenderConfig(
   num_reduce_tasks = reduces_per_node * num_workers
   block_size = _BLOCKSIZE_OVERRIDE.value * 1024 * 1024
 
+  dfs_data_paths = None
+  mapreduce_cluster_local_paths = None
+
   if vm.scratch_disks:
-    # TODO(pclay): support multiple scratch disks. A current suboptimal
-    # workaround is RAID0 local_ssds with --num_striped_disks.
     scratch_dir = posixpath.join(vm.GetScratchDir(), 'hadoop')
+    dfs_data_paths = ','.join([
+        'file://' + posixpath.join(vm.GetScratchDir(i), 'hadoop', 'dfs', 'data')
+        for i in range(len(vm.scratch_disks))
+    ])
+    mapreduce_cluster_local_paths = ','.join([
+        posixpath.join(vm.GetScratchDir(i), 'hadoop', 'mapred', 'local')
+        for i in range(len(vm.scratch_disks))
+    ])
+    # according to mapred-default.xml, the paths for mapreduce.cluster.local.dir
+    # need to be existing, otherwise they will be ignored.
+    _MakeFolders(
+        mapreduce_cluster_local_paths,
+        vm,
+    )
   else:
     scratch_dir = posixpath.join('/tmp/pkb/local_scratch', 'hadoop')
 
@@ -250,6 +268,9 @@ def _RenderConfig(
       'configure_s3': configure_s3,
       'optional_tools': optional_tools,
       'block_size': block_size,
+      'dfs_data_paths': dfs_data_paths,
+      'mapreduce_cluster_local_paths': mapreduce_cluster_local_paths,
+      'hadoop_namenode_opts': _HADOOP_NAMENODE_OPTS.value,
   }
 
   for file_name in DATA_FILES:
@@ -263,6 +284,12 @@ def _RenderConfig(
       vm.RenderTemplate(file_path, os.path.splitext(remote_path)[0], context)
     else:
       vm.RemoteCopy(file_path, remote_path)
+
+
+def _MakeFolders(paths_split_by_comma, vm):
+  vm.RemoteCommand(
+      ('mkdir -p {}').format(' '.join(paths_split_by_comma.split(',')))
+  )
 
 
 def _GetHDFSOnlineNodeCount(master):
@@ -303,12 +330,22 @@ def ConfigureAndStart(master, workers, start_yarn=True, configure_s3=False):
       )
   )
 
-  public_key = master.RemoteCommand('cat {0}.pub'.format(HADOOP_PRIVATE_KEY))[0]
+  public_key = master.RemoteCommand('cat {}.pub'.format(HADOOP_PRIVATE_KEY))[0]
 
   def AddKey(vm):
-    vm.RemoteCommand('echo "{0}" >> ~/.ssh/authorized_keys'.format(public_key))
+    vm.RemoteCommand('echo "{}" >> ~/.ssh/authorized_keys'.format(public_key))
+
+  # Add unmanaged Hadoop bin path to the environment PATH so that
+  # hadoop/yarn/hdfs commands can be ran without specifying the full path.
+  def ExportHadoopBinPath(vm):
+    vm.RemoteCommand(
+        'echo "export PATH=$PATH:{}" >> ~/.bashrc && source ~/.bashrc'.format(
+            HADOOP_BIN
+        )
+    )
 
   background_tasks.RunThreaded(AddKey, vms)
+  background_tasks.RunThreaded(ExportHadoopBinPath, vms)
 
   context = {
       'hadoop_dir': HADOOP_DIR,
@@ -321,7 +358,7 @@ def ConfigureAndStart(master, workers, start_yarn=True, configure_s3=False):
   master.RenderTemplate(
       data.ResourcePath(START_HADOOP_SCRIPT), script_path, context=context
   )
-  master.RemoteCommand('bash {0}'.format(script_path))
+  master.RemoteCommand('bash {}'.format(script_path))
 
   logging.info('Sleeping 10s for Hadoop nodes to join.')
   time.sleep(10)
@@ -330,7 +367,7 @@ def ConfigureAndStart(master, workers, start_yarn=True, configure_s3=False):
   hdfs_online_count = _GetHDFSOnlineNodeCount(master)
   if hdfs_online_count != len(workers):
     raise ValueError(
-        'Not all nodes running HDFS: {0} < {1}'.format(
+        'Not all nodes running HDFS: {} < {}'.format(
             hdfs_online_count, len(workers)
         )
     )
@@ -342,9 +379,16 @@ def ConfigureAndStart(master, workers, start_yarn=True, configure_s3=False):
     yarn_online_count = _GetYARNOnlineNodeCount(master)
     if yarn_online_count != len(workers):
       raise ValueError(
-          'Not all nodes running YARN: {0} < {1}'.format(
+          'Not all nodes running YARN: {} < {}'.format(
               yarn_online_count, len(workers)
           )
       )
     else:
       logging.info('YARN running on all %d workers', len(workers))
+
+
+def GetHadoopData() -> dict[str, Any]:
+  metadata = {}
+  if _HADOOP_NAMENODE_OPTS.value:
+    metadata['hadoop_namenode_opts'] = _HADOOP_NAMENODE_OPTS.value
+  return metadata

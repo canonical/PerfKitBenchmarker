@@ -13,7 +13,6 @@
 # limitations under the License.
 """Container for all data required for a benchmark to run."""
 
-
 import contextlib
 import copy
 import datetime
@@ -42,6 +41,7 @@ from perfkitbenchmarker import errors
 from perfkitbenchmarker import flag_util
 from perfkitbenchmarker import flags as pkb_flags
 from perfkitbenchmarker import key as cloud_key
+from perfkitbenchmarker import managed_memory_store
 from perfkitbenchmarker import messaging_service
 from perfkitbenchmarker import nfs_service
 from perfkitbenchmarker import non_relational_db
@@ -51,6 +51,7 @@ from perfkitbenchmarker import provider_info
 from perfkitbenchmarker import providers
 from perfkitbenchmarker import relational_db
 from perfkitbenchmarker import resource as resource_type
+from perfkitbenchmarker import resources  # pylint:disable=unused-import  # Load the __init__.py
 from perfkitbenchmarker import smb_service
 from perfkitbenchmarker import stages
 from perfkitbenchmarker import static_virtual_machine as static_vm
@@ -59,8 +60,10 @@ from perfkitbenchmarker import vm_util
 from perfkitbenchmarker import vpn_service
 from perfkitbenchmarker.configs import benchmark_config_spec
 from perfkitbenchmarker.configs import freeze_restore_spec
+from perfkitbenchmarker.resources import base_job
+from perfkitbenchmarker.resources import example_resource
+from perfkitbenchmarker.resources import managed_ai_model
 import six
-from six.moves import range
 import six.moves._thread
 import six.moves.copyreg
 
@@ -83,10 +86,6 @@ six.moves.copyreg.pickle(six.moves._thread.LockType, PickleLock)
 SUPPORTED = 'strict'
 NOT_EXCLUDED = 'permissive'
 SKIP_CHECK = 'none'
-# GCP labels only allow hyphens (-), underscores (_), lowercase characters, and
-# numbers and International characters.
-# metadata allow all characters and numbers.
-METADATA_TIME_FORMAT = '%Y%m%dt%H%M%Sz'
 FLAGS = flags.FLAGS
 
 flags.DEFINE_enum(
@@ -179,11 +178,15 @@ class BenchmarkSpec:
     self.non_relational_db = None
     self.tpus = []
     self.tpu_groups = {}
+    self.base_job = None
     self.edw_service = None
     self.edw_compute_resource = None
+    self.example_resource = None
     self.nfs_service = None
     self.smb_service = None
     self.messaging_service = None
+    self.ai_model = None
+    self.memory_store = None
     self.data_discovery_service = None
     self.app_groups = {}
     self._zone_index = 0
@@ -236,9 +239,7 @@ class BenchmarkSpec:
     return '%s(%r)' % (self.__class__, self.__dict__)
 
   def __str__(self):
-    return 'Benchmark name: {0}\nFlags: {1}'.format(
-        self.name, self.config.flags
-    )
+    return 'Benchmark name: {}\nFlags: {}'.format(self.name, self.config.flags)
 
   @contextlib.contextmanager
   def RedirectGlobalFlags(self):
@@ -276,6 +277,34 @@ class BenchmarkSpec:
     frozen_resource = copy.copy(getattr(self.restore_spec, attribute_name))
     setattr(self, attribute_name, frozen_resource)
     return True
+
+  def ConstructResources(self):
+    """Constructs the resources for the benchmark."""
+    self.ConstructContainerCluster()
+    self.ConstructContainerRegistry()
+    # dpb service needs to go first, because it adds some vms.
+    self.ConstructDpbService()
+    self.ConstructVirtualMachines()
+    self.ConstructRelationalDb()
+    self.ConstructNonRelationalDb()
+    self.ConstructKey()
+    self.ConstructMessagingService()
+    self.ConstructManagedAiModel()
+    # CapacityReservations need to be constructed after VirtualMachines because
+    # it needs information about the VMs (machine type, count, zone, etc). The
+    # CapacityReservations will be provisioned before VMs.
+    self.ConstructCapacityReservations()
+    self.ConstructTpu()
+    self.ConstructEdwService()
+    self.ConstructEdwComputeResource()
+    self.ConstructExampleResource()
+    self.ConstructBaseJob()
+    self.ConstructVPNService()
+    self.ConstructNfsService()
+    self.ConstructSmbService()
+    self.ConstructDataDiscoveryService()
+    self.ConstructBaseJob()
+    self.ConstructMemoryStore()
 
   def ConstructContainerCluster(self):
     """Create the container cluster."""
@@ -330,7 +359,7 @@ class BenchmarkSpec:
       # Ensure non cluster vms are not present in the spec.
       if self.vms_to_boot:
         raise errors.Benchmarks.UnsupportedConfigError(
-            'Invalid Non cluster vm group {0} when benchmarking '
+            'Invalid Non cluster vm group {} when benchmarking '
             'unmanaged dpb service'.format(self.vms_to_boot)
         )
 
@@ -408,7 +437,7 @@ class BenchmarkSpec:
     """Constructs the BenchmarkSpec's cloud TPU objects."""
     tpu_group_specs = self.config.tpu_groups
 
-    for group_name, group_spec in sorted(six.iteritems(tpu_group_specs)):
+    for group_name, group_spec in sorted(tpu_group_specs.items()):
       tpu = self.ConstructTpuGroup(group_spec)
 
       self.tpu_groups[group_name] = tpu
@@ -457,6 +486,56 @@ class BenchmarkSpec:
         self.config.edw_compute_resource
     )  # pytype: disable=not-instantiable
     self.resources.append(self.edw_compute_resource)
+
+  def ConstructExampleResource(self):
+    """Create an example_resource object. Also call this from pkb.py."""
+    if self.config.example_resource is None:
+      return
+    example_resource_type = self.config.example_resource.example_type
+    example_resource_class = example_resource.GetExampleResourceClass(
+        example_resource_type
+    )
+    self.example_resource = example_resource_class(self.config.example_resource)  # pytype: disable=not-instantiable
+    self.resources.append(self.example_resource)
+
+  def ConstructBaseJob(self):
+    """Create an instance of the base job.It is also called from pkb.py."""
+    if self.config.base_job is None:
+      return
+    job_type = self.config.base_job.job_type
+    cloud = self.config.base_job.CLOUD
+    providers.LoadProvider(cloud)
+    job_class = base_job.GetJobClass(job_type)
+
+    self.base_job = job_class(self.config.base_job, self.container_registry)  # pytype: disable=not-instantiable
+    self.resources.append(self.base_job)
+
+  def ConstructManagedAiModel(self):
+    """Create an example_resource object. Also call this from pkb.py."""
+    if self.config.ai_model is None:
+      return
+    cloud = self.config.ai_model.cloud
+    providers.LoadProvider(cloud)
+    model_class = managed_ai_model.GetManagedAiModelClass(cloud)
+    self.ai_model = model_class(self.config.ai_model)  # pytype: disable=not-instantiable
+    self.resources.append(self.ai_model)
+
+  def ConstructMemoryStore(self):
+    """Create the memory store instance."""
+    if self.config.memory_store is None:
+      return
+    cloud = self.config.memory_store.cloud
+    providers.LoadProvider(cloud)
+    managed_memory_store_class = (
+        managed_memory_store.GetManagedMemoryStoreClass(
+            cloud,
+            self.config.memory_store.service_type,
+            self.config.memory_store.memory_store_type,
+        )
+    )
+    self.memory_store = managed_memory_store_class(self.config.memory_store)  # pytype: disable=not-instantiable
+    self.memory_store.SetVms(self.vm_groups)
+    self.resources.append(self.memory_store)
 
   def ConstructNfsService(self):
     """Construct the NFS service object.
@@ -569,7 +648,7 @@ class BenchmarkSpec:
     """Construct capacity reservations for each VM group."""
     if not FLAGS.use_capacity_reservations:
       return
-    for vm_group in six.itervalues(self.vm_groups):
+    for vm_group in self.vm_groups.values():
       cloud = vm_group[0].CLOUD
       providers.LoadProvider(cloud)
       capacity_reservation_class = capacity_reservation.GetResourceClass(cloud)
@@ -589,7 +668,7 @@ class BenchmarkSpec:
 
     if not benchmark_ok:
       raise ValueError(
-          'Provider {0} does not support {1}.  Use '
+          'Provider {} does not support {}.  Use '
           '--benchmark_compatibility_checking=none '
           'to override this check.'.format(provider_info_class.CLOUD, self.name)
       )
@@ -617,10 +696,10 @@ class BenchmarkSpec:
     vm_group_specs = self.vms_to_boot
 
     clouds = {}
-    for group_name, group_spec in sorted(six.iteritems(vm_group_specs)):
+    for group_name, group_spec in sorted(vm_group_specs.items()):
       vms = self.ConstructVirtualMachineGroup(group_name, group_spec)
 
-      if group_spec.os_type == os_types.JUJU:
+      if group_spec.os_type.startswith('juju'):
         # The Juju VM needs to be created first, so that subsequent units can
         # be properly added under its control.
         if group_spec.cloud in clouds:
@@ -654,9 +733,9 @@ class BenchmarkSpec:
         self.dpb_service.vms['worker_group'] = []
 
   def ConstructPlacementGroups(self):
-    for placement_group_name, placement_group_spec in six.iteritems(
+    for placement_group_name, placement_group_spec in (
         self.placement_group_specs
-    ):
+    ).items():
       self.placement_groups[placement_group_name] = self._CreatePlacementGroup(
           placement_group_spec, placement_group_spec.CLOUD
       )
@@ -727,9 +806,7 @@ class BenchmarkSpec:
     # order based on dependencies, this key ordering can be used to avoid
     # deadlock by placing dependent networks later and their dependencies
     # earlier.
-    networks = [
-        self.networks[key] for key in sorted(six.iterkeys(self.networks))
-    ]
+    networks = [self.networks[key] for key in sorted(self.networks.keys())]
 
     background_tasks.RunThreaded(lambda net: net.Create(), networks)
 
@@ -745,7 +822,7 @@ class BenchmarkSpec:
 
     if self.container_registry:
       self.container_registry.Create()
-      for container_spec in six.itervalues(self.container_specs):
+      for container_spec in self.container_specs.values():
         if container_spec.static_image:
           continue
         container_spec.image = self.container_registry.GetOrBuild(
@@ -781,7 +858,7 @@ class BenchmarkSpec:
           vm for vm in self.vms if vm.OS_TYPE not in os_types.WINDOWS_OS_TYPES
       ]
       sshable_vm_groups = {}
-      for group_name, group_vms in six.iteritems(self.vm_groups):
+      for group_name, group_vms in self.vm_groups.items():
         sshable_vm_groups[group_name] = [
             vm
             for vm in group_vms
@@ -799,6 +876,8 @@ class BenchmarkSpec:
       self.key.Create()
     if self.tpus:
       background_tasks.RunThreaded(lambda tpu: tpu.Create(), self.tpus)
+    if self.ai_model:
+      self.ai_model.Create()
     if self.edw_service:
       if (
           not self.edw_service.user_managed
@@ -812,6 +891,13 @@ class BenchmarkSpec:
       self.edw_service.Create()
     if self.edw_compute_resource:
       self.edw_compute_resource.Create()
+    if hasattr(self, 'memory_store') and self.memory_store:
+      self.memory_store.Create()
+    if self.example_resource:
+      self.example_resource.Create()
+
+    if self.base_job:
+      self.base_job.Create()
     if self.vpn_service:
       self.vpn_service.Create()
     if hasattr(self, 'messaging_service') and self.messaging_service:
@@ -845,12 +931,20 @@ class BenchmarkSpec:
       self.edw_service.Delete()
     if hasattr(self, 'edw_compute_resource') and self.edw_compute_resource:
       self.edw_compute_resource.Delete()
+    if self.example_resource:
+      self.example_resource.Delete()
+    if self.base_job:
+      self.base_job.Delete()
     if self.nfs_service:
       self.nfs_service.Delete()
     if self.smb_service:
       self.smb_service.Delete()
     if hasattr(self, 'messaging_service') and self.messaging_service:
       self.messaging_service.Delete()
+    if hasattr(self, 'memory_store') and self.memory_store:
+      self.memory_store.Delete()
+    if hasattr(self, 'ai_model') and self.ai_model:
+      self.ai_model.Delete()
     if hasattr(self, 'data_discovery_service') and self.data_discovery_service:
       self.data_discovery_service.Delete()
 
@@ -879,7 +973,7 @@ class BenchmarkSpec:
       for placement_group_object in self.placement_groups.values():
         placement_group_object.Delete()
 
-    for firewall in six.itervalues(self.firewalls):
+    for firewall in self.firewalls.values():
       try:
         firewall.DisallowAllPorts()
       except Exception:
@@ -893,7 +987,7 @@ class BenchmarkSpec:
       self.container_cluster.DeleteContainers()
       self.container_cluster.Delete()
 
-    for net in six.itervalues(self.networks):
+    for net in self.networks.values():
       try:
         net.Delete()
       except Exception:
@@ -930,7 +1024,7 @@ class BenchmarkSpec:
         c if self._IsSafeKeyOrValueCharacter(c) else '_' for c in key.lower()
     )
 
-    # max length contraints on keys and values
+    # max length constraints on keys and values
     # https://cloud.google.com/resource-manager/docs/creating-managing-labels
     max_safe_length = 63
     # GCP labels are not allowed to start or end with '_'
@@ -946,7 +1040,7 @@ class BenchmarkSpec:
     timeout_utc = now_utc + datetime.timedelta(minutes=timeout_minutes)
 
     tags = {
-        'timeout_utc': timeout_utc.strftime(time_format),
+        resource_type.TIMEOUT_METADATA_KEY: timeout_utc.strftime(time_format),
         'create_time_utc': now_utc.strftime(time_format),
         'benchmark': self.name,
         'perfkit_uuid': self.uuid,
@@ -967,7 +1061,9 @@ class BenchmarkSpec:
 
   def GetResourceTags(self, timeout_minutes=None):
     """Gets a list of tags to be used to tag resources."""
-    return self._GetResourceDict(METADATA_TIME_FORMAT, timeout_minutes)
+    return self._GetResourceDict(
+        resource_type.METADATA_TIME_FORMAT, timeout_minutes
+    )
 
   def _CreatePlacementGroup(self, placement_group_spec, cloud):
     """Create a placement group in zone.
@@ -1092,3 +1188,5 @@ class BenchmarkSpec:
       self.dpb_service.CheckPrerequisites()
     if self.messaging_service:
       self.messaging_service.CheckPrerequisites()
+    if hasattr(self, 'memory_store') and self.memory_store:
+      self.memory_store.CheckPrerequisites()

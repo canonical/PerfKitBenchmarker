@@ -31,7 +31,6 @@ from perfkitbenchmarker.configs import vm_group_decoders
 from perfkitbenchmarker.providers.aws import aws_disk
 from perfkitbenchmarker.providers.gcp import gce_virtual_machine
 from tests import pkb_common_test_case
-from six.moves import range
 
 FLAGS = flags.FLAGS
 
@@ -52,7 +51,7 @@ def _GetFlagDict(flag_values):
 class PerCloudConfigSpecTestCase(pkb_common_test_case.PkbCommonTestCase):
 
   def setUp(self):
-    super(PerCloudConfigSpecTestCase, self).setUp()
+    super().setUp()
     self._spec_class = spec.PerCloudConfigSpec
 
   def testDefaults(self):
@@ -91,7 +90,7 @@ class PerCloudConfigSpecTestCase(pkb_common_test_case.PkbCommonTestCase):
 class PerCloudConfigDecoderTestCase(pkb_common_test_case.PkbCommonTestCase):
 
   def setUp(self):
-    super(PerCloudConfigDecoderTestCase, self).setUp()
+    super().setUp()
     self._decoder = spec.PerCloudConfigDecoder(option=_OPTION)
 
   def testRejectNone(self):
@@ -120,7 +119,7 @@ class PerCloudConfigDecoderTestCase(pkb_common_test_case.PkbCommonTestCase):
 class StaticVmDecoderTestCase(pkb_common_test_case.PkbCommonTestCase):
 
   def setUp(self):
-    super(StaticVmDecoderTestCase, self).setUp()
+    super().setUp()
     self._decoder = static_vm_decoders.StaticVmDecoder()
 
   def testNone(self):
@@ -150,7 +149,7 @@ class StaticVmDecoderTestCase(pkb_common_test_case.PkbCommonTestCase):
 class StaticVmListDecoderTestCase(pkb_common_test_case.PkbCommonTestCase):
 
   def setUp(self):
-    super(StaticVmListDecoderTestCase, self).setUp()
+    super().setUp()
     self._decoder = static_vm_decoders.StaticVmListDecoder()
 
   def testNone(self):
@@ -176,7 +175,7 @@ class StaticVmListDecoderTestCase(pkb_common_test_case.PkbCommonTestCase):
 class VmGroupSpecTestCase(pkb_common_test_case.PkbCommonTestCase):
 
   def setUp(self):
-    super(VmGroupSpecTestCase, self).setUp()
+    super().setUp()
     self._spec_class = vm_group_decoders.VmGroupSpec
     self._kwargs = {
         'cloud': provider_info.GCP,
@@ -213,7 +212,7 @@ class VmGroupSpecTestCase(pkb_common_test_case.PkbCommonTestCase):
     self.assertEqual(
         str(cm.exception),
         'Invalid test_component.cloud value: "fake_provider". Value must be '
-        'one of the following: {0}.'.format(
+        'one of the following: {}.'.format(
             ', '.join(provider_info.VALID_CLOUDS)
         ),
     )
@@ -250,7 +249,7 @@ class VmGroupSpecTestCase(pkb_common_test_case.PkbCommonTestCase):
         str(cm.exception),
         (
             'Invalid test_component.os_type value: "fake_os_type". Value must'
-            ' be one of the following: {0}.'.format(', '.join(os_types.ALL))
+            ' be one of the following: {}.'.format(', '.join(os_types.ALL))
         ),
     )
 
@@ -423,7 +422,7 @@ class VmGroupSpecTestCase(pkb_common_test_case.PkbCommonTestCase):
 class VmGroupsDecoderTestCase(pkb_common_test_case.PkbCommonTestCase):
 
   def setUp(self):
-    super(VmGroupsDecoderTestCase, self).setUp()
+    super().setUp()
     self._decoder = vm_group_decoders.VmGroupsDecoder()
 
   def testNone(self):
@@ -474,11 +473,11 @@ class VmGroupsDecoderTestCase(pkb_common_test_case.PkbCommonTestCase):
     )
 
 
-class CloudRedisDecoderTestCase(pkb_common_test_case.PkbCommonTestCase):
+class MemoryStoreDecoderTestCase(pkb_common_test_case.PkbCommonTestCase):
 
   def setUp(self):
-    super(CloudRedisDecoderTestCase, self).setUp()
-    self._decoder = benchmark_config_spec._CloudRedisDecoder()
+    super().setUp()
+    self._decoder = benchmark_config_spec._MemoryStoreDecoder()
     FLAGS.cloud = provider_info.GCP
     FLAGS.run_uri = 'test'
 
@@ -488,10 +487,10 @@ class CloudRedisDecoderTestCase(pkb_common_test_case.PkbCommonTestCase):
 
   def testValidInput(self):
     result = self._decoder.Decode(
-        {'redis_version': 'redis_3_2'}, _COMPONENT, FLAGS
+        {'version': 'redis_3_2'}, _COMPONENT, FLAGS
     )
-    self.assertIsInstance(result, benchmark_config_spec._CloudRedisSpec)
-    self.assertEqual(result.redis_version, 'redis_3_2')
+    self.assertIsInstance(result, benchmark_config_spec._MemoryStoreSpec)
+    self.assertEqual(result.version, 'redis_3_2')
 
   def testInvalidInput(self):
     with self.assertRaises(errors.Config.UnrecognizedOption) as cm:
@@ -502,11 +501,11 @@ class CloudRedisDecoderTestCase(pkb_common_test_case.PkbCommonTestCase):
     )
 
 
-class CloudRedisSpecTestCase(pkb_common_test_case.PkbCommonTestCase):
+class MemoryStoreSpecTestCase(pkb_common_test_case.PkbCommonTestCase):
 
   def setUp(self):
-    super(CloudRedisSpecTestCase, self).setUp()
-    self._spec_class = benchmark_config_spec._CloudRedisSpec
+    super().setUp()
+    self._spec_class = benchmark_config_spec._MemoryStoreSpec
 
   def testMissingValues(self):
     with self.assertRaises(errors.Config.MissingOption) as cm:
@@ -516,16 +515,11 @@ class CloudRedisSpecTestCase(pkb_common_test_case.PkbCommonTestCase):
         'Required options were missing from test_component: cloud.',
     )
 
-  def testDefaults(self):
-    result = self._spec_class(_COMPONENT, flag_values=FLAGS)
-    self.assertIsInstance(result, benchmark_config_spec._CloudRedisSpec)
-    self.assertEqual(result.redis_version, 'redis_3_2')
-
 
 class BenchmarkConfigSpecTestCase(pkb_common_test_case.PkbCommonTestCase):
 
   def setUp(self):
-    super(BenchmarkConfigSpecTestCase, self).setUp()
+    super().setUp()
 
     self._spec_class = benchmark_config_spec.BenchmarkConfigSpec
     self._description = 'Test description.'
@@ -582,23 +576,22 @@ class BenchmarkConfigSpecTestCase(pkb_common_test_case.PkbCommonTestCase):
             os_types.WINDOWS2019_CORE,
         )
     }
-    expected_os_types = os_types.JUJU, os_types.WINDOWS2019_CORE
+    valid_os_types = os_types.DEBIAN12, os_types.WINDOWS2019_CORE
     with self.assertRaises(errors.Config.InvalidValue) as cm:
       self._spec_class(
           _COMPONENT,
-          expected_os_types=expected_os_types,
+          expected_os_types=valid_os_types,
           flag_values=FLAGS,
           **self._kwargs
       )
     self.assertEqual(
         str(cm.exception),
         (
-            'VM groups in test_component may only have the following OS types: '
-            "'juju', 'windows2019_core'. The following VM group options are "
-            'invalid:{sep}'
-            "test_component.vm_groups['rhel8_group'].os_type: 'rhel8'{sep}"
-            "test_component.vm_groups['ubuntu2004_group'].os_type: 'ubuntu2004'"
-            .format(sep=os.linesep)
+            'VM groups in test_component may only have the following OS types:'
+            " 'debian12', 'windows2019_core'. The following VM group options"
+            " are invalid:{sep}test_component.vm_groups['rhel8_group'].os_type:"
+            " 'rhel8'{sep}test_component.vm_groups['ubuntu2004_group'].os_type:"
+            " 'ubuntu2004'".format(sep=os.linesep)
         ),
     )
 

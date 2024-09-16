@@ -31,11 +31,13 @@ from perfkitbenchmarker.linux_packages import memtier
 FLAGS = flags.FLAGS
 BENCHMARK_NAME = 'cloud_redis_memtier'
 
-BENCHMARK_CONFIG = """
+BENCHMARK_CONFIG = f"""
 cloud_redis_memtier:
   description: Run memtier against cloud redis
-  cloud_redis:
-    redis_version: redis_6_x
+  memory_store:
+    service_type: memorystore
+    memory_store_type: {managed_memory_store.REDIS}
+    version: redis_6_x
   vm_groups:
     clients:
       vm_spec: *default_single_core
@@ -48,37 +50,9 @@ _ManagedRedis = managed_memory_store.BaseManagedMemoryStore
 
 def GetConfig(user_config):
   config = configs.LoadConfig(BENCHMARK_CONFIG, user_config, BENCHMARK_NAME)
-  # TODO(user) Remove version from config and make it a flag only
-  if FLAGS['managed_memory_store_version'].present:
-    config['cloud_redis']['redis_version'] = FLAGS.managed_memory_store_version
   if memtier.MEMTIER_RUN_MODE.value == memtier.MemtierMode.MEASURE_CPU_LATENCY:
     config['vm_groups']['clients']['vm_count'] += 1
   return config
-
-
-def CheckPrerequisites(benchmark_config):
-  """Verifies that the required resources are present.
-
-  Args:
-    benchmark_config: benchmark_config
-  """
-  _GetManagedMemoryStoreClass().CheckPrerequisites(benchmark_config)  # pytype: disable=attribute-error
-
-
-def _GetManagedMemoryStoreClass() -> (
-    type[managed_memory_store.BaseManagedMemoryStore]
-):
-  """Gets the cloud-specific redis memory store class."""
-  return managed_memory_store.GetManagedMemoryStoreClass(
-      FLAGS.cloud, managed_memory_store.REDIS
-  )
-
-
-def _GetManagedMemoryStore(
-    benchmark_spec,
-) -> managed_memory_store.BaseManagedMemoryStore:
-  """Get redis instance from the shared class."""
-  return _GetManagedMemoryStoreClass()(benchmark_spec)  # pytype: disable=not-instantiable
 
 
 def Prepare(benchmark_spec):
@@ -92,12 +66,10 @@ def Prepare(benchmark_spec):
 
   memtier_vms = benchmark_spec.vm_groups['clients']
   background_tasks.RunThreaded(_Install, memtier_vms)
-
-  benchmark_spec.cloud_redis_instance = _GetManagedMemoryStore(benchmark_spec)
-  benchmark_spec.cloud_redis_instance.Create()
-  memory_store_ip = benchmark_spec.cloud_redis_instance.GetMemoryStoreIp()
-  memory_store_port = benchmark_spec.cloud_redis_instance.GetMemoryStorePort()
-  password = benchmark_spec.cloud_redis_instance.GetMemoryStorePassword()
+  cloud_redis_instance = benchmark_spec.memory_store
+  memory_store_ip = cloud_redis_instance.GetMemoryStoreIp()
+  memory_store_port = cloud_redis_instance.GetMemoryStorePort()
+  password = cloud_redis_instance.GetMemoryStorePassword()
 
   memtier.Load(memtier_vms, memory_store_ip, memory_store_port, password)
 
@@ -150,7 +122,7 @@ def _MeasureMemtierDistribution(
       redis_instance.GetMemoryStoreIp(),
       redis_instance.GetMemoryStorePort(),
       vms,
-      redis_instance.node_count,
+      redis_instance.shard_count,
       redis_instance.GetMemoryStorePassword(),
   )
 
@@ -164,7 +136,7 @@ def _Run(vms: list[_LinuxVm], redis_instance: _ManagedRedis):
       return _MeasureMemtierDistribution(redis_instance, vms)
     return memtier.MeasureLatencyCappedThroughput(
         vms[0],
-        redis_instance.node_count,
+        redis_instance.shard_count,
         redis_instance.GetMemoryStoreIp(),
         redis_instance.GetMemoryStorePort(),
         redis_instance.GetMemoryStorePassword(),
@@ -188,12 +160,8 @@ def Run(benchmark_spec):
     A list of sample.Sample instances.
   """
   memtier_vms = benchmark_spec.vm_groups['clients']
-  redis_instance: _ManagedRedis = benchmark_spec.cloud_redis_instance
-  samples = _Run(memtier_vms, redis_instance)
-  for s in samples:
-    s.metadata.update(benchmark_spec.cloud_redis_instance.GetResourceMetadata())
-
-  return samples
+  redis_instance: _ManagedRedis = benchmark_spec.memory_store
+  return _Run(memtier_vms, redis_instance)
 
 
 def Cleanup(benchmark_spec):
@@ -203,7 +171,7 @@ def Cleanup(benchmark_spec):
     benchmark_spec: The benchmark specification. Contains all data that is
       required to run the benchmark.
   """
-  benchmark_spec.cloud_redis_instance.Delete()
+  del benchmark_spec
 
 
 @vm_util.Retry(poll_interval=1)

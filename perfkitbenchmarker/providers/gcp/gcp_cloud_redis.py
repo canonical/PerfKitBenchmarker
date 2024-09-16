@@ -19,7 +19,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Optional
+from typing import Any
 
 from absl import flags
 from google.cloud import monitoring_v3
@@ -39,22 +39,29 @@ DEFAULT_PORT = 6379
 
 _SHARD_SIZE_GB = 13
 
+_DEFAULT_VERSION = managed_memory_store.REDIS_7_2
+
 
 class CloudRedis(managed_memory_store.BaseManagedMemoryStore):
   """Object representing a GCP cloud redis instance."""
 
   CLOUD = provider_info.GCP
+  SERVICE_TYPE = 'memorystore'
   MEMORY_STORE = managed_memory_store.REDIS
 
   def __init__(self, spec):
-    super(CloudRedis, self).__init__(spec)
+    super().__init__(spec)
     self.project = FLAGS.project
     self.size = gcp_flags.REDIS_GB.value
+    self.node_type = ''
+    self.redis_region = FLAGS.cloud_redis_region
+    self.zone_distribution = gcp_flags.REDIS_ZONE_DISTRIBUTION.value
     if self._clustered:
       self.size = self.node_count * _SHARD_SIZE_GB
-    self.redis_region = FLAGS.cloud_redis_region
-    self.redis_version = spec.config.cloud_redis.redis_version
-    self.failover_style = FLAGS.redis_failover_style
+      self.node_type = gcp_flags.REDIS_NODE_TYPE.value
+      if self.zone_distribution == 'single-zone':
+        self.zones = [FLAGS.zone[0]]
+    self.redis_version = spec.version or _DEFAULT_VERSION
     self.tier = self._GetTier()
     self.network = (
         'default'
@@ -71,7 +78,7 @@ class CloudRedis(managed_memory_store.BaseManagedMemoryStore):
         gcp_flags.CLOUD_REDIS_API_OVERRIDE.value
     )
 
-  def _GetTier(self) -> Optional[str]:
+  def _GetTier(self) -> str | None:
     """Returns the tier of the instance."""
     # See https://cloud.google.com/memorystore/docs/redis/redis-tiers."""
     if self._clustered:
@@ -107,6 +114,11 @@ class CloudRedis(managed_memory_store.BaseManagedMemoryStore):
         'cloud_redis_region': self.redis_region,
         'cloud_redis_version': self.ParseReadableVersion(self.redis_version),
     })
+    if self._clustered:
+      self.metadata['cloud_redis_node_type'] = self.node_type
+      self.metadata['cloud_redis_zone_distribution'] = self.zone_distribution
+    else:
+      self.metadata['cloud_redis_size'] = self.size
     if self.tier is not None:
       self.metadata['cloud_redis_tier'] = self.tier
     return self.metadata
@@ -147,12 +159,16 @@ class CloudRedis(managed_memory_store.BaseManagedMemoryStore):
   def _GetClusterCreateCommand(self) -> util.GcloudCommand:
     """Returns the command used to create the cluster."""
     cmd = util.GcloudCommand(self, 'redis', 'clusters', 'create', self.name)
-    cmd.use_alpha_gcloud = True
     # Add labels when supported
-    cmd.flags['shard-count'] = self.node_count
+    cmd.flags['shard-count'] = self.shard_count
+    cmd.flags['replica-count'] = self.replicas_per_shard
+    cmd.flags['node-type'] = self.node_type
+    cmd.flags['zone-distribution-mode'] = self.zone_distribution
     cmd.flags['network'] = (
         f'projects/{self.project}/global/networks/{self.network}'
     )
+    if self.zone_distribution == 'single-zone':
+      cmd.flags['zone'] = self.zones[0]
     if self.enable_tls:
       cmd.flags['transit-encryption-mode'] = 'server-authentication'
     return cmd
@@ -189,7 +205,6 @@ class CloudRedis(managed_memory_store.BaseManagedMemoryStore):
     cmd = util.GcloudCommand(self, 'redis', 'instances', 'delete', self.name)
     if self._clustered:
       cmd = util.GcloudCommand(self, 'redis', 'clusters', 'delete', self.name)
-      cmd.use_alpha_gcloud = True
     cmd.flags['region'] = self.redis_region
     cmd.Issue(timeout=COMMAND_TIMEOUT, raise_on_failure=False)
 
@@ -207,7 +222,6 @@ class CloudRedis(managed_memory_store.BaseManagedMemoryStore):
     cmd = util.GcloudCommand(self, 'redis', 'instances', 'describe', self.name)
     if self._clustered:
       cmd = util.GcloudCommand(self, 'redis', 'clusters', 'describe', self.name)
-      cmd.use_alpha_gcloud = True
     cmd.flags['region'] = self.redis_region
     stdout, stderr, retcode = cmd.Issue(raise_on_failure=False)
     if retcode != 0:

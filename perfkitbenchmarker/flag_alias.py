@@ -15,7 +15,7 @@
 
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 # Added 7th Nov 2022
 DISK_FLAGS_TO_TRANSLATE = {
@@ -95,7 +95,7 @@ def AliasFlagsFromArgs(
       if original in LIST_TO_MULTISTRING_TRANSLATIONS:
         result = _GetMultiStringFromList(translation, m.group(2))
       else:
-        result[0] = re.sub(regex, r'\1{0}\2'.format(translation), arg)
+        result[0] = re.sub(regex, r'\1{}\2'.format(translation), arg)
       logging.warning(
           (
               'The flag %s is deprecated and will be removed in the future.'
@@ -110,9 +110,9 @@ def AliasFlagsFromArgs(
 
 # pylint: disable=dangerous-default-value
 def AliasFlagsFromYaml(
-    config: Optional[Dict[str, Any]],
+    config: Dict[str, Any] | None,
     alias_dict: List[Dict[str, str]] = ALL_TRANSLATIONS,
-) -> Optional[Dict[str, Any]]:
+) -> Dict[str, Any] | None:
   """Alias flags to support backwards compatibility."""
   if not config:
     return config

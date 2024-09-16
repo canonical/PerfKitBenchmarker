@@ -120,6 +120,7 @@ cloud_bigtable_ycsb:
     enable_freeze_restore: True
   vm_groups:
     default:
+      os_type: ubuntu2204  # Python 2
       vm_spec: *default_single_core
       vm_count: null
   flags:
@@ -191,7 +192,7 @@ def CheckPrerequisites(benchmark_config: Dict[str, Any]) -> None:
       ):
         # Client side metrics are only required with the Veneer client.
         continue
-      raise ValueError('Scope {0} required.'.format(scope))
+      raise ValueError('Scope {} required.'.format(scope))
 
   if ycsb.CPU_OPTIMIZATION.value and (
       ycsb.CPU_OPTIMIZATION_MEASUREMENT_MINS.value
@@ -205,7 +206,7 @@ def CheckPrerequisites(benchmark_config: Dict[str, Any]) -> None:
 
 
 def _GetTableName() -> str:
-  return _STATIC_TABLE_NAME.value or 'ycsb{0}'.format(FLAGS.run_uri)
+  return _STATIC_TABLE_NAME.value or 'ycsb{}'.format(FLAGS.run_uri)
 
 
 def _GetDefaultProject() -> str:

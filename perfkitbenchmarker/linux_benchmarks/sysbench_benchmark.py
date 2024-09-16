@@ -16,6 +16,7 @@
 
 This is a set of benchmarks that measures performance of Sysbench Databases on
   managed MySQL or Postgres.
+For unmanaged databases, consider using unmanaged_mysql_sysbench_benchmark.py.
 
 As other cloud providers deliver a managed MySQL service, we will add it here.
 """
@@ -169,12 +170,12 @@ SPANNER_TPCC = 'spanner-tpcc'
 # Parameters are defined in oltp_common.lua file
 # https://github.com/akopytov/sysbench
 _MAP_WORKLOAD_TO_VALID_UNIQUE_PARAMETERS = {
-    'tpcc': set(['scale']),
-    SPANNER_TPCC: set(['scale']),
-    'oltp_write_only': set(['table_size', 'auto-inc']),
-    'oltp_read_only': set(['table_size', 'auto-inc']),
-    'oltp_read_write': set(['table_size', 'auto-inc']),
-    'oltp_insert': set(['table_size', 'auto-inc']),
+    'tpcc': {'scale'},
+    SPANNER_TPCC: {'scale'},
+    'oltp_write_only': {'table_size', 'auto-inc'},
+    'oltp_read_only': {'table_size', 'auto-inc'},
+    'oltp_read_write': {'table_size', 'auto-inc'},
+    'oltp_insert': {'table_size', 'auto-inc'},
 }
 
 
@@ -373,6 +374,7 @@ def _GetSysbenchPrepareCommand(
     db: relational_db.BaseRelationalDb, num_vms: int, vm_index: int
 ) -> str:
   """Returns the sysbench command used to load the database."""
+  # TODO(ruwa): Migrate to use sysbench.BuildLoadCommand()
   data_load_cmd_tokens = [
       'cd ~/sysbench/ && nice',  # run with a niceness of lower priority
       '-15',  # to encourage cpu time for ssh commands

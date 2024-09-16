@@ -44,6 +44,7 @@ cassandra_ycsb:
       vm_spec: *default_single_core
       disk_spec: *default_500_gb
     clients:
+      os_type: ubuntu2204  # Python 2
       vm_spec: *default_single_core
 """
 
@@ -107,7 +108,7 @@ def _CreateYCSBTable(
   )
 
   cassandra_cli = cassandra.GetCassandraCliPath(vm)
-  command = '{0} -f {1} -h {2}'.format(
+  command = '{} -f {} -h {}'.format(
       cassandra_cli, remote_path, vm.internal_ip
   )
   vm.RemoteCommand(command)
@@ -144,9 +145,9 @@ def Prepare(benchmark_spec):
 
   # Cassandra cluster
   cassandra_vms = by_role['cassandra_vms']
-  assert cassandra_vms, 'No Cassandra VMs: {0}'.format(by_role)
+  assert cassandra_vms, 'No Cassandra VMs: {}'.format(by_role)
   seed_vm = by_role['seed_vm']
-  assert seed_vm, 'No seed VM: {0}'.format(by_role)
+  assert seed_vm, 'No seed VM: {}'.format(by_role)
 
   cassandra_install_fns = [
       functools.partial(_InstallCassandra, vm, seed_vms=[seed_vm])

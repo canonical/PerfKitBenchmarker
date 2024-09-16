@@ -18,7 +18,7 @@ directory as a subclass of BaseEdwService.
 """
 import logging
 import os
-from typing import Any, Dict, List, Text, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 
 from absl import flags
 from perfkitbenchmarker import resource
@@ -135,6 +135,8 @@ TYPE_2_PROVIDER = dict([
     ('snowflake_aws', 'aws'),
     ('snowflake_azure', 'azure'),
     ('snowflakeexternal_aws', 'aws'),
+    ('snowflakeicebergexternal_aws', 'aws'),
+    ('snowflakeicebergmanaged_aws', 'aws'),
     ('snowflakeexternal_azure', 'azure'),
     ('bigquery', 'gcp'),
     ('endor', 'gcp'),
@@ -153,6 +155,14 @@ TYPE_2_MODULE = dict([
     ),
     (
         'snowflakeexternal_aws',
+        'perfkitbenchmarker.providers.aws.snowflake_aws',
+    ),
+    (
+        'snowflakeicebergexternal_aws',
+        'perfkitbenchmarker.providers.aws.snowflake_aws',
+    ),
+    (
+        'snowflakeicebergmanaged_aws',
         'perfkitbenchmarker.providers.aws.snowflake_aws',
     ),
     (
@@ -179,7 +189,7 @@ class EdwExecutionError(Exception):
   """Encapsulates errors encountered during execution of a query."""
 
 
-class EdwClientInterface(object):
+class EdwClientInterface:
   """Defines the interface for EDW service clients.
 
   Attributes:
@@ -201,7 +211,7 @@ class EdwClientInterface(object):
         'echo "\nMaxSessions 100" | sudo tee -a /etc/ssh/sshd_config'
     )
 
-  def Prepare(self, package_name: Text) -> None:
+  def Prepare(self, package_name: str) -> None:
     """Prepares the client vm to execute query.
 
     The default implementation raises an Error, to ensure client specific
@@ -213,7 +223,7 @@ class EdwClientInterface(object):
     """
     raise NotImplementedError
 
-  def ExecuteQuery(self, query_name: Text) -> Tuple[float, Dict[str, str]]:
+  def ExecuteQuery(self, query_name: str) -> Tuple[float, Dict[str, str]]:
     """Executes a query and returns performance details.
 
     Args:
@@ -338,7 +348,7 @@ class EdwService(resource.BaseResource):
     is_user_managed = self.IsUserManaged(edw_service_spec)
     # edw_service attribute
     self.cluster_identifier = self.GetClusterIdentifier(edw_service_spec)
-    super(EdwService, self).__init__(user_managed=is_user_managed)
+    super().__init__(user_managed=is_user_managed)
 
     # Provision related attributes
     if edw_service_spec.snapshot:

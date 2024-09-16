@@ -24,7 +24,7 @@ more information about GCE VM networking.
 import json
 import logging
 import threading
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Set, Tuple, Union
 
 from absl import flags
 from perfkitbenchmarker import background_tasks
@@ -38,14 +38,13 @@ from perfkitbenchmarker import vpn_service
 from perfkitbenchmarker.providers.gcp import flags as gcp_flags
 from perfkitbenchmarker.providers.gcp import gce_placement_group
 from perfkitbenchmarker.providers.gcp import util
-import six
 
 FLAGS = flags.FLAGS
 NETWORK_RANGE = '10.0.0.0/8'
 ALLOW_ALL = 'tcp:1-65535,udp:1-65535,icmp'
 
 _PLACEMENT_GROUP_PREFIXES = frozenset(
-    ['c2', 'c3', 'n2', 'n2d', 'c2d', 'c3a', 'c3d', 'a2', 'a3', 'g2', 'h3']
+    ['c2', 'c3', 'n2', 'n2d', 'c2d', 'c3a', 'c3d', 'a2', 'a3', 'g2', 'h3', 'c4']
 )
 
 
@@ -57,7 +56,7 @@ class GceVpnGateway(network.BaseVpnGateway):
   def __init__(
       self, name: str, network_name: str, region: str, cidr: str, project: str
   ):
-    super(GceVpnGateway, self).__init__()
+    super().__init__()
 
     self.forwarding_rules: Dict[str, GceForwardingRule] = {}
     self.forwarding_rules_lock = threading.Lock()
@@ -166,11 +165,9 @@ class GceVpnGateway(network.BaseVpnGateway):
 
     # configure routing
     # requires: next_hop_tunnel_id, target_cidr,
-    # TODO(dlott) Should be Optional[str], but that requires making endpoints a
+    # TODO(dlott) Should be str | None, but that requires making endpoints a
     # proper class rather than a dictionary of string and bool. See TunnelConfig
-    dest_cidr: Optional[Any] = tunnel_config.endpoints[target_endpoint].get(
-        'cidr'
-    )
+    dest_cidr: Any = tunnel_config.endpoints[target_endpoint].get('cidr')
     if not dest_cidr or not dest_cidr.strip():
       logging.debug(
           'tunnel_config: destination CIDR needed... '
@@ -311,7 +308,7 @@ class GceVpnGatewayResource(resource.BaseResource):
   def __init__(
       self, name: str, network_name: str, region: str, cidr: str, project: str
   ):
-    super(GceVpnGatewayResource, self).__init__()
+    super().__init__()
     self.name = name
     self.network_name = network_name
     self.region = region
@@ -346,9 +343,9 @@ class GceIPAddress(resource.BaseResource):
   """Object representing a GCE IP address."""
 
   def __init__(
-      self, project: str, region: str, name: str, subnet: Optional[str] = None
+      self, project: str, region: str, name: str, subnet: str | None = None
   ):
-    super(GceIPAddress, self).__init__()
+    super().__init__()
     self.project = project
     self.region = region
     self.name = name
@@ -411,7 +408,7 @@ class GceStaticTunnel(resource.BaseResource):
       ike_version: str,
       psk: str,
   ):
-    super(GceStaticTunnel, self).__init__()
+    super().__init__()
     self.project = project
     self.region = region
     self.name = name
@@ -472,7 +469,7 @@ class GceRoute(resource.BaseResource):
       next_hop_region: str,
       project: str,
   ):
-    super(GceRoute, self).__init__()
+    super().__init__()
     self.name = route_name
     self.dest_cidr = dest_cidr
     self.next_hop_region = next_hop_region
@@ -509,9 +506,9 @@ class GceForwardingRule(resource.BaseResource):
       name: str,
       protocol: str,
       src_vpn_gateway: GceVpnGateway,
-      port: Optional[int] = None,
+      port: int | None = None,
   ):
-    super(GceForwardingRule, self).__init__()
+    super().__init__()
     self.name = name
     self.protocol = protocol
     self.port = port
@@ -571,9 +568,9 @@ class GceFirewallRule(resource.BaseResource):
       project: str,
       allow: str,
       network_name: str,
-      source_range: Optional[str] = None,
+      source_range: str | None = None,
   ):
-    super(GceFirewallRule, self).__init__()
+    super().__init__()
     self.name = name
     self.project = project
     self.allow = allow
@@ -645,8 +642,8 @@ class GceFirewall(network.BaseFirewall):
       self,
       vm,  # gce_virtual_machine.GceVirtualMachine
       start_port: int,
-      end_port: Optional[int] = None,
-      source_range: Optional[List[str]] = None,
+      end_port: int | None = None,
+      source_range: List[str] | None = None,
   ):
     """Opens a port on the firewall.
 
@@ -684,7 +681,7 @@ class GceFirewall(network.BaseFirewall):
       if key in self.firewall_rules:
         return
       allow = ','.join(
-          '{0}:{1}-{2}'.format(protocol, start_port, end_port)
+          '{}:{}-{}'.format(protocol, start_port, end_port)
           for protocol in ('tcp', 'udp')
       )
       firewall_rule = GceFirewallRule(
@@ -699,9 +696,9 @@ class GceFirewall(network.BaseFirewall):
 
   def DisallowAllPorts(self):
     """Closes all ports on the firewall."""
-    for firewall_rule in six.itervalues(self.firewall_rules):
+    for firewall_rule in self.firewall_rules.values():
       firewall_rule.Delete()
-    for firewall_rule in six.itervalues(self.firewall_icmp_rules):
+    for firewall_rule in self.firewall_icmp_rules.values():
       firewall_rule.Delete()
 
   def AllowIcmp(self, vm):
@@ -740,35 +737,41 @@ class GceNetworkSpec(network.BaseNetworkSpec):
 
   def __init__(
       self,
-      project: Optional[str] = None,
-      mtu: Optional[int] = None,
-      machine_type: Optional[str] = None,
-      subnet_name: Optional[str] = None,
+      project: str | None = None,
+      zone: str | None = None,
+      cidr: str | None = None,
+      mtu: int | None = None,
+      machine_type: str | None = None,
+      subnet_names: List[str] | None = None,
       **kwargs,
   ):
     """Initializes the GceNetworkSpec.
 
     Args:
       project: The project for which the Network should be created.
+      zone: The zone for which the subnet and/or network should be created.
+      cidr: The CIDR to use for the network.
       mtu: The MTU (max transmission unit) to use, if any.
       machine_type: The machine type of VM's in the network.
-      subnet_name: Name of the existing subnet.
+      subnet_names: List of existing subnets.
       **kwargs: Additional key word arguments passed to BaseNetworkSpec.
     """
-    super(GceNetworkSpec, self).__init__(**kwargs)
+    super().__init__(**kwargs)
     self.project = project
+    self.zone = zone
+    self.cidr = cidr
     self.mtu = mtu
     self.machine_type = machine_type
-    self.subnet_name = subnet_name
+    self.subnet_names = subnet_names
 
 
 class GceNetworkResource(resource.BaseResource):
   """Object representing a GCE Network resource."""
 
   def __init__(
-      self, name: str, mode: str, project: str, mtu: Optional[int] = None
+      self, name: str, mode: str, project: str, mtu: int | None = None
   ):
-    super(GceNetworkResource, self).__init__()
+    super().__init__()
     self.name = name
     self.mode = mode
     self.project = project
@@ -823,7 +826,7 @@ class GceSubnetResource(resource.BaseResource):
       addr_range: str,
       project: str,
   ):
-    super(GceSubnetResource, self).__init__()
+    super().__init__()
     self.name = name
     self.network_name = network_name
     self.region = region
@@ -880,8 +883,8 @@ class GceNetwork(network.BaseNetwork):
   CLOUD = provider_info.GCP
 
   def __init__(self, network_spec: GceNetworkSpec):
-    super(GceNetwork, self).__init__(network_spec)
-    self.project: Optional[str] = network_spec.project
+    super().__init__(network_spec)
+    self.project: str | None = network_spec.project
     self.vpn_gateway: Dict[str, GceVpnGateway] = {}
 
     #  Figuring out the type of network here.
@@ -900,10 +903,8 @@ class GceNetwork(network.BaseNetwork):
     self.is_existing_network = True
     self.subnet_names = []
     self.primary_subnet_name = None
-    if network_spec.subnet_name:
-      self.subnet_names = network_spec.subnet_name.split(',')
-    elif gcp_flags.GCE_SUBNET_NAMES.value:
-      self.subnet_names = gcp_flags.GCE_SUBNET_NAMES.value
+    if network_spec.subnet_names:
+      self.subnet_names = network_spec.subnet_names
     elif gcp_flags.GCE_NETWORK_NAMES.value:
       self.subnet_names = gcp_flags.GCE_NETWORK_NAMES.value
     else:
@@ -917,9 +918,9 @@ class GceNetwork(network.BaseNetwork):
     self.subnet_resources = []
     mode = gcp_flags.GCE_NETWORK_TYPE.value
     self.subnet_resource = None
-    if mode != 'custom':
-      mode = 'auto'
+    if not self.is_existing_network or mode == 'legacy':
       for name in self.subnet_names:
+        mode = 'auto'
         self.network_resources.append(
             GceNetworkResource(name, mode, self.project, self.mtu)
         )
@@ -1063,9 +1064,9 @@ class GceNetwork(network.BaseNetwork):
 
   def _MakeGceNetworkName(
       self,
-      net_type: Optional[str] = None,
-      cidr: Optional[str] = None,
-      uri: Optional[str] = None,
+      net_type: str | None = None,
+      cidr: str | None = None,
+      uri: str | None = None,
   ) -> str:
     """Build the current network's name string.
 
@@ -1097,12 +1098,12 @@ class GceNetwork(network.BaseNetwork):
 
   def _MakeGceFWRuleName(
       self,
-      net_type: Optional[str] = None,
-      src_cidr: Optional[str] = None,
-      dst_cidr: Optional[str] = None,
-      port_range_lo: Optional[str] = None,
-      port_range_hi: Optional[str] = None,
-      uri: Optional[str] = None,
+      net_type: str | None = None,
+      src_cidr: str | None = None,
+      dst_cidr: str | None = None,
+      port_range_lo: str | None = None,
+      port_range_hi: str | None = None,
+      uri: str | None = None,
   ) -> str:
     """Build a firewall name string.
 
@@ -1150,7 +1151,7 @@ class GceNetwork(network.BaseNetwork):
         cidr=vm.cidr,
         mtu=vm.mtu,
         machine_type=vm.machine_type,
-        subnet_name=vm.subnet_name,
+        subnet_names=vm.subnet_names,
     )
 
   @classmethod
@@ -1161,8 +1162,11 @@ class GceNetwork(network.BaseNetwork):
     network_key = (cls.CLOUD, spec.project)
     if spec.cidr:
       network_key += (spec.cidr,)
-    if spec.subnet_name:
-      network_key += (spec.subnet_name,)
+    if spec.subnet_names:
+      if isinstance(spec.subnet_names, list):
+        network_key += (','.join(spec.subnet_names),)
+      else:
+        network_key += (spec.subnet_names,)
     return network_key
 
   def _GetNumberVms(self) -> int:

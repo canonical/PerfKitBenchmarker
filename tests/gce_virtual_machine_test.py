@@ -166,7 +166,7 @@ class GceVmSpecTestCase(pkb_common_test_case.PkbCommonTestCase):
 class GceVirtualMachineTestCase(pkb_common_test_case.PkbCommonTestCase):
 
   def setUp(self):
-    super(GceVirtualMachineTestCase, self).setUp()
+    super().setUp()
     p = mock.patch(
         gce_virtual_machine.__name__ + '.gce_network.GceNetwork.GetNetwork'
     )
@@ -393,7 +393,7 @@ def _CreateFakeDiskMetadata(image, fake_disk):
 class GceVirtualMachineOsTypesTestCase(pkb_common_test_case.PkbCommonTestCase):
 
   def setUp(self):
-    super(GceVirtualMachineOsTypesTestCase, self).setUp()
+    super().setUp()
     FLAGS.gcp_instance_metadata_from_file = ''
     FLAGS.gcp_instance_metadata = ''
     FLAGS.gcloud_path = 'gcloud'
@@ -560,8 +560,8 @@ class GceVirtualMachineOsTypesTestCase(pkb_common_test_case.PkbCommonTestCase):
       )
       self.assertNotIn('image_family', vm_metadata)
 
-  def testCreateRhel7CustomImage(self):
-    vm_class = virtual_machine.GetVmClass(provider_info.GCP, os_types.RHEL7)
+  def testCreateRhel9CustomImage(self):
+    vm_class = virtual_machine.GetVmClass(provider_info.GCP, os_types.RHEL9)
     fake_image = 'fake-custom-rhel-image'
     spec = gce_virtual_machine.GceVmSpec(
         _COMPONENT, machine_type='fake-machine-type', image=fake_image
@@ -584,33 +584,6 @@ class GceVirtualMachineOsTypesTestCase(pkb_common_test_case.PkbCommonTestCase):
       vm_metadata = vm.GetResourceMetadata()
       self.assertDictContainsSubset(
           {'image': fake_image, 'image_project': 'rhel-cloud'}, vm_metadata
-      )
-      self.assertNotIn('image_family', vm_metadata)
-
-  def testCreateCentOs7CustomImage(self):
-    vm_class = virtual_machine.GetVmClass(provider_info.GCP, os_types.CENTOS7)
-    fake_image = 'fake-custom-centos7-image'
-    spec = gce_virtual_machine.GceVmSpec(
-        _COMPONENT, machine_type='fake-machine-type', image=fake_image
-    )
-    with PatchCriticalObjects(
-        self._CreateFakeReturnValues(fake_image)
-    ) as issue_command:
-      vm = vm_class(spec)
-      vm._CreateDependencies()
-      vm._Create()
-      vm.created = True
-      command_string = ' '.join(issue_command.call_args[0][0])
-
-      self.assertEqual(issue_command.call_count, 1)
-      self.assertIn('gcloud compute instances create', command_string)
-      self.assertIn('--image ' + fake_image, command_string)
-      self.assertIn('--image-project centos-cloud', command_string)
-      vm._PostCreate()
-      self.assertEqual(issue_command.call_count, 3)
-      vm_metadata = vm.GetResourceMetadata()
-      self.assertDictContainsSubset(
-          {'image': fake_image, 'image_project': 'centos-cloud'}, vm_metadata
       )
       self.assertNotIn('image_family', vm_metadata)
 
@@ -649,7 +622,7 @@ class GceVirtualMachineOsTypesTestCase(pkb_common_test_case.PkbCommonTestCase):
 class GCEVMFlagsTestCase(pkb_common_test_case.PkbCommonTestCase):
 
   def setUp(self):
-    super(GCEVMFlagsTestCase, self).setUp()
+    super().setUp()
     FLAGS.cloud = provider_info.GCP
     FLAGS.gcloud_path = 'test_gcloud'
     FLAGS.run_uri = 'aaaaaa'
@@ -680,6 +653,7 @@ class GCEVMFlagsTestCase(pkb_common_test_case.PkbCommonTestCase):
           FLAGS,
           image='image',
           machine_type='test_machine_type',
+          zone='us-central1-a',
       )
       vm = pkb_common_test_case.TestGceVirtualMachine(vm_spec)
       vm._CreateDependencies()
@@ -744,9 +718,30 @@ class GCEVMFlagsTestCase(pkb_common_test_case.PkbCommonTestCase):
 
   def testNetworkInterfaceVIRTIO(self):
     """Tests that VirtIO can be set as the virtual NIC."""
-    cmd, call_count = self._CreateVmCommand(gce_nic_type='VIRTIO_NET')
+    cmd, call_count = self._CreateVmCommand(gce_nic_types=['VIRTIO_NET'])
     self.assertEqual(call_count, 1)
     self.assertIn('nic-type=VIRTIO_NET', cmd)
+
+  def testNetworkInterfaceIDPF(self):
+    """Tests that when IDPF is set the NIC type is ignored when calling the command."""
+    cmd, call_count = self._CreateVmCommand(gce_nic_types=['IDPF'])
+    self.assertEqual(call_count, 1)
+    self.assertIn('nic-type=IDPF', cmd)
+
+  def testMultipleNetworkInterfaces(self):
+    """Tests that multiple network interfaces can be set."""
+    cmd, call_count = self._CreateVmCommand(
+        gce_network_type='custom',
+        gce_subnet_name=['subnet1', 'subnet2'],
+        gce_nic_types=['GVNIC', 'VIRTIO_NET'],
+        gce_nic_queue_counts=['default', '16'],
+    )
+    self.assertEqual(call_count, 1)
+    self.assertIn('subnet=subnet1', cmd)
+    self.assertIn('nic-type=GVNIC', cmd)
+    self.assertIn('subnet=subnet2', cmd)
+    self.assertIn('nic-type=VIRTIO_NET', cmd)
+    self.assertIn('queue-count=16', cmd)
 
   def testEgressBandwidthTier(self):
     """Tests that egress bandwidth can be set as tier 1."""
@@ -812,7 +807,7 @@ class GCEVMFlagsTestCase(pkb_common_test_case.PkbCommonTestCase):
 class GCEVMCreateTestCase(pkb_common_test_case.PkbCommonTestCase):
 
   def setUp(self):
-    super(GCEVMCreateTestCase, self).setUp()
+    super().setUp()
     p = mock.patch(
         gce_virtual_machine.__name__ + '.gce_network.GceNetwork.GetNetwork'
     )
@@ -1161,7 +1156,7 @@ class GceFirewallRuleTest(pkb_common_test_case.PkbCommonTestCase):
 class GceNetworkTest(pkb_common_test_case.PkbCommonTestCase):
 
   def setUp(self):
-    super(GceNetworkTest, self).setUp()
+    super().setUp()
     # need a benchmarkspec in the context to run
     config_spec = benchmark_config_spec.BenchmarkConfigSpec(
         'cluster_boot', flag_values=FLAGS
@@ -1171,7 +1166,7 @@ class GceNetworkTest(pkb_common_test_case.PkbCommonTestCase):
   def testGetNetwork(self):
     project = 'myproject'
     zone = 'us-east1-a'
-    vm = mock.Mock(zone=zone, project=project, cidr=None)
+    vm = mock.Mock(zone=zone, project=project, cidr=None, subnet_names=None)
     net = gce_network.GceNetwork.GetNetwork(vm)
     self.assertEqual(project, net.project)
     self.assertEqual(zone, net.zone)
@@ -1203,7 +1198,7 @@ class GvnicTest(GceVirtualMachineTestCase):
   """Tests specific to detecting gVNIC version."""
 
   def setUp(self):
-    super(GvnicTest, self).setUp()
+    super().setUp()
     vm_spec = gce_virtual_machine.GceVmSpec('test_component', project='test')
     self.vm = gce_virtual_machine.Ubuntu2004BasedGceVirtualMachine(vm_spec)
     self.vm.HasPackage = mock.Mock(return_value=False)

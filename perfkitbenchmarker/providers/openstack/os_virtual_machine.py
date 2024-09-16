@@ -28,7 +28,6 @@ import logging
 import threading
 
 from absl import flags
-from six.moves import range
 
 from perfkitbenchmarker import (disk_strategies, errors, linux_virtual_machine,
                                 provider_info, virtual_machine, vm_util)
@@ -63,7 +62,7 @@ class OpenStackVirtualMachine(virtual_machine.BaseVirtualMachine):
     Args:
       vm_spec: virtual_machine.BaseVirtualMachineSpec object of the vm.
     """
-    super(OpenStackVirtualMachine, self).__init__(vm_spec)
+    super().__init__(vm_spec)
     self.key_name = 'perfkit_key_%s' % FLAGS.run_uri
     self.user_name = FLAGS.openstack_image_username
     self.image = self.image or self.DEFAULT_IMAGE
@@ -435,7 +434,7 @@ class OpenStackVirtualMachine(virtual_machine.BaseVirtualMachine):
     Returns:
       dict mapping string property key to value.
     """
-    result = super(OpenStackVirtualMachine, self).GetResourceMetadata()
+    result = super().GetResourceMetadata()
     if self.post_provisioning_script:
       result['post_provisioning_script'] = self.post_provisioning_script
     return result
@@ -467,7 +466,11 @@ class Ubuntu2204BasedOpenStackVirtualMachine(OpenStackVirtualMachine,
                                           linux_virtual_machine.Ubuntu2204Mixin):
   DEFAULT_IMAGE = 'ubuntu2204'
 
+class Ubuntu2404BasedOpenStackVirtualMachine(OpenStackVirtualMachine,
+                                          linux_virtual_machine.Ubuntu2204Mixin):
+  DEFAULT_IMAGE = 'ubuntu2404'
 
-class ClearBasedOpenStackVirtualMachine(OpenStackVirtualMachine,
-                                        linux_virtual_machine.ClearMixin):
+class ClearBasedOpenStackVirtualMachine(
+    OpenStackVirtualMachine, linux_virtual_machine.ClearMixin
+):
   DEFAULT_IMAGE = 'upstream-clear'

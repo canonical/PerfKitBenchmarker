@@ -29,7 +29,6 @@ from perfkitbenchmarker import background_tasks
 from perfkitbenchmarker import configs
 from perfkitbenchmarker.linux_packages import redis_server
 from perfkitbenchmarker.linux_packages import ycsb
-from six.moves import range
 
 flags.DEFINE_integer(
     'redis_ycsb_processes',
@@ -48,6 +47,7 @@ redis_ycsb:
     workers:
       vm_spec: *default_single_core
     clients:
+      os_type: ubuntu2204  # Python 2
       vm_spec: *default_single_core
 """
 

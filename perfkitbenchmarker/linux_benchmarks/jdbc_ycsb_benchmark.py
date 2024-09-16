@@ -40,6 +40,7 @@ jdbc_ycsb:
       Configure the number of VMs via --num-vms.
   vm_groups:
     default:
+      os_type: ubuntu2204  # Python 2
       vm_spec: *default_single_core
       vm_count: 1"""
 
@@ -116,7 +117,7 @@ def Prepare(benchmark_spec):
 
 def ExecuteSql(vm, sql):
   db_args = (
-      ' -p db.driver={0} -p db.url="{1}" -p db.user={2} -p db.passwd={3}'
+      ' -p db.driver={} -p db.url="{}" -p db.user={} -p db.passwd={}'
   ).format(
       FLAGS.jdbc_ycsb_db_driver,
       FLAGS.jdbc_ycsb_db_url,
@@ -124,7 +125,7 @@ def ExecuteSql(vm, sql):
       FLAGS.jdbc_ycsb_db_passwd,
   )
 
-  exec_cmd = 'java -cp "{0}/*" com.yahoo.ycsb.db.JdbcDBCli -c "{1}" '.format(
+  exec_cmd = 'java -cp "{}/*" com.yahoo.ycsb.db.JdbcDBCli -c "{}" '.format(
       YCSB_BINDING_LIB_DIR, sql
   )
   stdout, stderr = vm.RobustRemoteCommand(exec_cmd + db_args)

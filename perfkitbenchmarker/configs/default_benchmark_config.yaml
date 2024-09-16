@@ -83,6 +83,7 @@ mysql_tpcc:
     hammerdbcli_tpcc_time_profile: True
     use_managed_db: False
     db_high_availability: False
+    iostat: True
     innodb_buffer_pool_ratio: 0.8
     timeout_minutes: 360
   relational_db:
@@ -98,19 +99,15 @@ mysql_tpcc:
             boot_disk_type: pd-ssd
         disk_spec:
           GCP:
-            disk_size: 2000
-            disk_type: pd-ssd
-          # These aim to match a 2 TB PD-SSD in performance and price. AWS can get better performance.
+            disk_size: 4000
+            disk_type: pd-balanced
+          # Aim for 40k iops, 1200 MB/s throughput, at least 2 TB capacity, not costing more than $400/month.
           AWS:
             disk_size: 500
             disk_type: gp3
             provisioned_iops: 10000
             provisioned_throughput: 300
             num_striped_disks: 4
-          # copybara:strip_begin(internal)
-          # TODO(user) - Add Azure iops/throughput/striping.
-          # copybara:strip_end
-          # Azure provisioned IOPS/Throughput and striping must be configured via run-time flags.
           Azure: # Premiumv2 disks matching 4TB pd-ssd
             disk_size: 2000
             disk_type: PremiumV2_LRS
@@ -129,6 +126,7 @@ postgres_tpcc:
     hammerdbcli_build_timeout: 19000
     use_managed_db: False
     db_high_availability: False
+    iostat: True
     postgres_shared_buffer_ratio: 0.25
     timeout_minutes: 360
   relational_db:
@@ -225,3 +223,33 @@ sparksql_tpcds_1t:
           disk_type: gp3
           provisioned_iops: 5000
           provisioned_throughput: 480
+
+mysql_sysbench_oltp_base: &mysql_sysbench_oltp_base
+  sysbench_table_size: 50000000
+  sysbench_tables: 8
+
+mysql_sysbench_oltp_read_write:
+  name: unmanaged_mysql_sysbench
+  flags:
+    sysbench_testname: oltp_read_write
+    <<: *mysql_sysbench_oltp_base
+
+mysql_sysbench_oltp_read_only:
+  name: unmanaged_mysql_sysbench
+  flags:
+    sysbench_testname: oltp_read_only
+    <<: *mysql_sysbench_oltp_base
+
+mysql_sysbench_oltp_write_only:
+  name: unmanaged_mysql_sysbench
+  flags:
+    sysbench_testname: oltp_write_only
+    <<: *mysql_sysbench_oltp_base
+
+mysql_sysbench_tpcc:
+  name: unmanaged_mysql_sysbench
+  flags:
+    sysbench_testname: percona_tpcc
+    sysbench_tables: 10
+    sysbench_use_fk: False
+    sysbench_txn_isolation_level: RC

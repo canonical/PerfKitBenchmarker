@@ -24,7 +24,7 @@ import logging
 import posixpath
 import re
 import time
-from typing import Any, Optional
+from typing import Any
 
 import jinja2
 from absl import flags
@@ -352,7 +352,7 @@ group_reporting=1
 
 {%- for pair in disk_numa_pair %}
 
-[{{scenario['name']}}-io-depth-{{scenario['iodepth']}}-num-jobs-{{scenario['numjobs']}}{%- if scenario['disk_numa_pinning'] == True %}.{{pair['index']}}{%- endif%}]
+[{{scenario['name']}}-io-depth-{{scenario['iodepth']}}-num-jobs-{{scenario['numjobs']}}{%- if scenario['target_raw_device'] == True %}.{{pair['index']}}{%- endif%}]
 {%- if pair['index'] == 0 %}
 stonewall
 {%- endif%}
@@ -540,7 +540,7 @@ def GetScenarioFromScenarioString(scenario_string):
     value = key_value[1]
     if key not in FIO_KNOWN_FIELDS_IN_JINJA:
       raise errors.Setup.InvalidFlagConfigurationError(
-          'Unrecognized FIO parameter {0} out of scenario {1}'.format(
+          'Unrecognized FIO parameter {} out of scenario {}'.format(
               key, scenario_string
           )
       )
@@ -552,9 +552,9 @@ def GetScenarioFromScenarioString(scenario_string):
 def GenerateJobFileString(
     filename: str,
     scenario_strings: list[str],
-    io_depths: Optional[list[int]],
-    num_jobs: Optional[list[int]],
-    working_set_size: Optional[int],
+    io_depths: list[int] | None,
+    num_jobs: list[int] | None,
+    working_set_size: int | None,
     block_size: Any,
     runtime: int,
     ramptime: int,
@@ -562,6 +562,7 @@ def GenerateJobFileString(
     parameters: list[str],
     numa_nodes: list[int],
     raw_files: list[str],
+    require_merge: bool,
 ) -> str:
   """Make a string with our fio job file.
 
@@ -579,6 +580,7 @@ def GenerateJobFileString(
     parameters: list. Other fio parameters to be applied to all jobs.
     numa_nodes: list. List of NUMA nodes.
     raw_files: A list of raw device paths.
+    require_merge: Whether the jobs will be merged to be reported later.
 
   Returns:
     The contents of a fio job file, as a string.
@@ -656,19 +658,16 @@ def GenerateJobFileString(
       scenario['rate'] = _FIO_RATE_BANDWIDTH_LIMIT.value
     scenario['iodepth_batch_submit'] = scenario['iodepth']
     scenario['iodepth_batch_complete_max'] = scenario['iodepth']
-    scenario['disk_numa_pinning'] = FLAGS.fio_pinning
+    scenario['target_raw_device'] = require_merge
 
     # There are two ways to really work a disk:
     # 1. you can create many jobs, each of which is pinned to a different numa
-    #    and a different raw disk. These jobs are not stonewalled so they
+    #    and/or a different raw disk. These jobs are not stonewalled so they
     #    all run simultaneously.
     # 2. you can create 1 job, which is set to use all numa nodes and targets
     #    all (striped or no) disks.
-    # The former is preferred for extremely high iops,
-    # and the latter is preferred for extremely high throughput.
-    # So offering both paths here via the fio_pinning flag.
-    if numa_nodes != [0]:
-      if FLAGS.fio_pinning:
+    if require_merge and FLAGS.fio_pinning:
+      if numa_nodes != [0]:
         # spread raw disks across numas
         raw_disk_numa_pairs = (
             zip(numa_nodes, raw_files)
@@ -683,10 +682,14 @@ def GenerateJobFileString(
             }
             for index, pair in enumerate(raw_disk_numa_pairs)
         ]
-      else:
-        scenario['numa_cpu_nodes'] = ','.join(
-            [str(numa_node) for numa_node in numa_nodes]
-        )
+    elif require_merge and raw_files:
+      disk_numa_pair = [
+          {
+              'index': index,
+              'disk_filename': raw_file,
+          }
+          for index, raw_file in enumerate(raw_files)
+      ]
 
   job_file_template = jinja2.Template(
       JOB_FILE_TEMPLATE, undefined=jinja2.StrictUndefined
@@ -706,7 +709,7 @@ def GenerateJobFileString(
   )
 
 
-FILENAME_PARAM_REGEXP = re.compile('filename\s*=.*$', re.MULTILINE)
+FILENAME_PARAM_REGEXP = re.compile(r'filename\s*=.*$', re.MULTILINE)
 
 
 def ProcessedJobFileString(fio_jobfile_contents, remove_filename):
@@ -731,7 +734,7 @@ def GetOrGenerateJobFileString(
     job_file_path,
     scenario_strings,
     against_device,
-    disk,
+    disks,
     io_depths,
     num_jobs,
     working_set_size,
@@ -742,6 +745,7 @@ def GetOrGenerateJobFileString(
     parameters,
     job_file_contents,
     numa_nodes,
+    require_merge,
 ):
   """Get the contents of the fio job file we're working with.
 
@@ -754,7 +758,7 @@ def GetOrGenerateJobFileString(
       generate.
     against_device: bool. True if testing against a raw device, False if testing
       against a filesystem.
-    disk: the disk.BaseDisk object to test against.
+    disks: the disk.BaseDisk object(s) to test against.
     io_depths: iterable of integers. The IO queue depths to test.
     num_jobs: iterable of integers. The number of fio processes to test.
     working_set_size: int or None. If int, the size of the working set in GB.
@@ -766,6 +770,7 @@ def GetOrGenerateJobFileString(
     parameters: list. Other fio parameters to apply to all jobs.
     job_file_contents: string contents of fio job.
     numa_nodes: list. List of NUMA nodes.
+    require_merge: whether jobs will need to be merged for reporting.
 
   Returns:
     A string containing a fio job file.
@@ -783,9 +788,12 @@ def GetOrGenerateJobFileString(
   else:
     raw_files = []
     if against_device:
-      filename = disk.GetDevicePath()
-      if disk.is_striped:
-        raw_files = [d.GetDevicePath() for d in disk.disks]
+      filename = ':'.join([disk.GetDevicePath() for disk in disks])
+      for disk in disks:
+        if disk.is_striped:
+          raw_files += [d.GetDevicePath() for d in disk.disks]
+        else:
+          raw_files += [disk.GetDevicePath()]
     else:
       # Since we pass --directory to fio, we must use relative file
       # paths or get an error.
@@ -804,6 +812,7 @@ def GetOrGenerateJobFileString(
         parameters,
         numa_nodes,
         raw_files,
+        require_merge,
     )
 
 
@@ -906,7 +915,7 @@ def Prepare(benchmark_spec):
 def GetFileAsString(file_path):
   if not file_path:
     return None
-  with open(data.ResourcePath(file_path), 'r') as jobfile:
+  with open(data.ResourcePath(file_path)) as jobfile:
     return jobfile.read()
 
 
@@ -924,17 +933,28 @@ def PrepareWithExec(vm, exec_path):
   logging.info('FIO prepare on %s', vm)
   vm.Install('fio')
 
-  # Choose a disk or file name and optionally fill it
-  disk = vm.scratch_disks[0]
-
   if FillTarget():
-    logging.info('Fill device %s on %s', disk.GetDevicePath(), vm)
-    FillDevice(vm, disk, FLAGS.fio_fill_size, exec_path)
+    logging.info(
+        'Fill devices %s on %s',
+        [disk.GetDevicePath() for disk in vm.scratch_disks], vm)
+    background_tasks.RunThreaded(
+        lambda disk: FillDevice(vm, disk, FLAGS.fio_fill_size, exec_path),
+        vm.scratch_disks,
+    )
 
   # We only need to format and mount if the target mode is against
   # file with fill because 1) if we're running against the device, we
   # don't want it mounted and 2) if we're running against a file
   # without fill, it was never unmounted (see GetConfig()).
+  if len(vm.scratch_disks) > 1:
+    if not AgainstDevice():
+      raise errors.Setup.InvalidSetupError(
+          f'Target mode {FLAGS.fio_target_mode} tests against 1 file, '
+          'but multiple scratch disks are configured.'
+      )
+    return
+
+  disk = vm.scratch_disks[0]
   if FLAGS.fio_target_mode == AGAINST_FILE_WITH_FILL_MODE:
     disk.mount_point = FLAGS.scratch_dir or MOUNT_POINT
     disk_spec = vm.disk_specs[0]
@@ -995,8 +1015,8 @@ def RunWithExec(vm, exec_path, remote_job_file_path, job_file_contents):
   """
   logging.info('FIO running on %s', vm)
 
-  disk = vm.scratch_disks[0]
-  mount_point = disk.mount_point
+  disks = vm.scratch_disks
+  require_merge = FLAGS.fio_pinning or len(disks) > 1
   # Windows does not support numactl package.
   if vm.OS_TYPE in os_types.WINDOWS_OS_TYPES:
     numa_node_count = vm.numa_node_count or 1
@@ -1009,7 +1029,7 @@ def RunWithExec(vm, exec_path, remote_job_file_path, job_file_contents):
       FLAGS.fio_jobfile,
       FLAGS.fio_generate_scenarios,
       AgainstDevice(),
-      disk,
+      disks,
       FLAGS.fio_io_depths,
       FLAGS.fio_num_jobs,
       FLAGS.fio_working_set_size,
@@ -1020,6 +1040,7 @@ def RunWithExec(vm, exec_path, remote_job_file_path, job_file_contents):
       FLAGS.fio_parameters,
       job_file_contents,
       numa_nodes,
+      require_merge,
   )
   job_file_path = vm_util.PrependTempDir(vm.name + LOCAL_JOB_FILE_SUFFIX)
   with open(job_file_path, 'w') as job_file:
@@ -1033,17 +1054,19 @@ def RunWithExec(vm, exec_path, remote_job_file_path, job_file_contents):
     if 'filename' in job_file_string:
       filename_parameter = ''
     else:
-      filename_parameter = f'--filename={disk.GetDevicePath()}'
+      filenames = ':'.join([disk.GetDevicePath() for disk in disks])
+      filename_parameter = f'--filename={filenames}'
     fio_command = (
         f'{exec_path} --output-format=json '
         f'--random_generator={FLAGS.fio_rng} '
         f'{filename_parameter} {remote_job_file_path}'
     )
   else:
+    assert(len(disks) == 1)
     fio_command = (
         f'{exec_path} --output-format=json '
         f'--random_generator={FLAGS.fio_rng} '
-        f'--directory={mount_point} {remote_job_file_path}'
+        f'--directory={disks[0].mount_point} {remote_job_file_path}'
     )
 
   collect_logs = any([
@@ -1088,6 +1111,7 @@ def RunWithExec(vm, exec_path, remote_job_file_path, job_file_contents):
       skip_latency_individual_stats=(
           not _FIO_INCLUDE_LATENCY_PERCENTILES.value
       ),
+      require_merge=require_merge
   )
 
   samples.append(

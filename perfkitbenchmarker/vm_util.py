@@ -28,14 +28,13 @@ import subprocess
 import tempfile
 import threading
 import time
-from typing import Callable, Dict, Iterable, Optional, Tuple
+from typing import Callable, Dict, Iterable, Tuple
 
 from absl import flags
 import jinja2
 from perfkitbenchmarker import data
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import temp_dir
-from six.moves import range
 
 FLAGS = flags.FLAGS
 # Using logger rather than logging.info to avoid stack_level problems.
@@ -154,7 +153,7 @@ class RetriesExceededRetryError(RetryError):
   """Exception that is raised when a retryable function hits its retry limit."""
 
 
-class IpAddressSubset(object):
+class IpAddressSubset:
   """Enum of options for --ip_addresses."""
 
   REACHABLE = 'REACHABLE'
@@ -203,7 +202,7 @@ flags.DEFINE_enum(
 )
 
 
-class IpAddressMetadata(object):
+class IpAddressMetadata:
   INTERNAL = 'internal'
   EXTERNAL = 'external'
 
@@ -364,7 +363,7 @@ def Retry(
   return Wrap
 
 
-class _BoxedObject(object):
+class _BoxedObject:
   """Box a value in a reference so it is modifiable inside an inner function.
 
   In python3 the nonlocal keyword could be used instead - but for python2
@@ -386,12 +385,12 @@ def _ReadIssueCommandOutput(tf_out, tf_err):
 
 def IssueCommand(
     cmd: Iterable[str],
-    env: Optional[Dict[str, str]] = None,
-    timeout: Optional[int] = DEFAULT_TIMEOUT,
-    cwd: Optional[str] = None,
+    env: Dict[str, str] | None = None,
+    timeout: int | None = DEFAULT_TIMEOUT,
+    cwd: str | None = None,
     should_pre_log: bool = True,
     raise_on_failure: bool = True,
-    suppress_failure: Optional[Callable[[str, str, int], bool]] = None,
+    suppress_failure: Callable[[str, str, int], bool] | None = None,
     suppress_logging: bool = False,
     raise_on_timeout: bool = True,
     stack_level: int = 1,
@@ -551,8 +550,8 @@ def IssueCommand(
   # not errors from PKB infrastructure.
   if did_timeout.value and raise_on_timeout:
     debug_text = (
-        '{0}\nIssueCommand timed out after {1} seconds.  '
-        '{2} by perfkitbenchmarker.'.format(
+        '{}\nIssueCommand timed out after {} seconds.  '
+        '{} by perfkitbenchmarker.'.format(
             debug_text,
             timeout,
             'Process was killed'
@@ -765,7 +764,7 @@ def GenerateSSHConfig(vms, vm_groups):
     ofp.write(template.render({'vms': vms, 'vm_groups': vm_groups}))
 
   ssh_options = [
-      '  ssh -F {0} {1}'.format(target_file, pattern)
+      '  ssh -F {} {}'.format(target_file, pattern)
       for pattern in ('<vm_name>', 'vm<index>', '<group_name>-<index>')
   ]
   logging.info(

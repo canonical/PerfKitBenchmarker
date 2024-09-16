@@ -13,6 +13,7 @@
 # limitations under the License.
 """Tests for perfkitbenchmarker.providers.gcp.gce_network."""
 
+import builtins
 import contextlib
 import unittest
 
@@ -27,7 +28,6 @@ from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.configs import benchmark_config_spec
 from perfkitbenchmarker.providers.gcp import gce_network
 from tests import pkb_common_test_case
-from six.moves import builtins
 
 FLAGS = flags.FLAGS
 
@@ -145,11 +145,11 @@ class BaseGceNetworkTest(pkb_common_test_case.PkbCommonTestCase):
     config_spec = benchmark_config_spec.BenchmarkConfigSpec(
         benchmark_name, flag_values=FLAGS, **config_dict
     )
-    benchmark_module = next((
+    benchmark_module = next(
         b
         for b in linux_benchmarks.BENCHMARKS
         if b.BENCHMARK_NAME == benchmark_name
-    ))
+    )
     return benchmark_spec.BenchmarkSpec(benchmark_module, config_spec, _URI)
 
 
@@ -286,7 +286,7 @@ class TestGceNetworkConfig(BaseGceNetworkTest):
 class TestGceNetworkNames(BaseGceNetworkTest):
 
   def setUp(self):
-    super(TestGceNetworkNames, self).setUp()
+    super().setUp()
     # need a benchmarkspec in the context to run
     FLAGS.run_uri = _URI
     config_spec = benchmark_config_spec.BenchmarkConfigSpec(
@@ -302,7 +302,7 @@ class TestGceNetworkNames(BaseGceNetworkTest):
     zone = 'us-north1-b'
     cidr = None
     # long_cidr = '123.567.901/13'  # @TODO net_utils for address sanity checks
-    vm = mock.Mock(zone=zone, project=project, cidr=cidr, subnet_name=None)
+    vm = mock.Mock(zone=zone, project=project, cidr=cidr, subnet_names=None)
     net = gce_network.GceNetwork.GetNetwork(vm)
     net_name = net._MakeGceNetworkName()
 
@@ -319,7 +319,7 @@ class TestGceNetworkNames(BaseGceNetworkTest):
     self.assertEqual(
         expected_netname, net_name
     )  # pkb-network-uri45678 (default)
-    self.assertRegexpMatches(net_name, _REGEX_GCE_NET_NAMES)
+    self.assertRegex(net_name, _REGEX_GCE_NET_NAMES)
 
   def testGetSingleNetworkName(self):
     FLAGS.gce_subnet_region = 'us-south1-c'
@@ -328,7 +328,7 @@ class TestGceNetworkNames(BaseGceNetworkTest):
     project = _PROJECT
     zone = 'us-north1-b'
     cidr = None
-    vm = mock.Mock(zone=zone, project=project, cidr=cidr, subnet_name=None)
+    vm = mock.Mock(zone=zone, project=project, cidr=cidr, subnet_names=None)
     net = gce_network.GceNetwork.GetNetwork(vm)
     net_name = net._MakeGceNetworkName()
 
@@ -345,13 +345,13 @@ class TestGceNetworkNames(BaseGceNetworkTest):
     self.assertEqual(
         expected_netname, net_name
     )  # pkb-network-single-2-2-3-4-33-uri45678 (single)
-    self.assertRegexpMatches(net_name, _REGEX_GCE_NET_NAMES)
+    self.assertRegex(net_name, _REGEX_GCE_NET_NAMES)
 
   def testGetMultiNetworkName(self):
     project = _PROJECT
     zone = 'us-north1-b'
     cidr = '1.2.3.4/56'
-    vm = mock.Mock(zone=zone, project=project, cidr=cidr, subnet_name=None)
+    vm = mock.Mock(zone=zone, project=project, cidr=cidr, subnet_names=None)
     net = gce_network.GceNetwork.GetNetwork(vm)
     net_name = net._MakeGceNetworkName()
 
@@ -368,7 +368,7 @@ class TestGceNetworkNames(BaseGceNetworkTest):
     self.assertEqual(
         expected_netname, net_name
     )  # pkb-network-multi-1-2-3-4-56-uri45678 (multi)
-    self.assertRegexpMatches(net_name, _REGEX_GCE_NET_NAMES)
+    self.assertRegex(net_name, _REGEX_GCE_NET_NAMES)
 
   @flagsaver.flagsaver(gce_network_name=['my-network'])
   def testSpecifyNetworkName(self):
@@ -376,12 +376,12 @@ class TestGceNetworkNames(BaseGceNetworkTest):
         zone='us-north1-b',
         project=_PROJECT,
         cidr='1.2.3.4/56',
-        subnet_name=None,
+        subnet_names=None,
     )
     net = gce_network.GceNetwork.GetNetwork(vm)
     self.assertTrue(net.is_existing_network)
     self.assertEqual('my-network', net.network_resource.name)
-    self.assertIsNone(net.subnet_resource)
+    self.assertEqual('my-network', net.subnet_resource.name)
 
   @flagsaver.flagsaver(
       gce_network_name=['my-network'],
@@ -393,37 +393,25 @@ class TestGceNetworkNames(BaseGceNetworkTest):
         zone='us-north1-b',
         project=_PROJECT,
         cidr='1.2.3.4/56',
-        subnet_name=None,
+        subnet_names=None,
     )
     net = gce_network.GceNetwork.GetNetwork(vm)
     self.assertTrue(net.is_existing_network)
-    self.assertEqual('my-subnet', net.network_resource.name)
-    self.assertEqual('my-subnet', net.subnet_resource.name)
+    self.assertEqual('my-network', net.subnet_resource.name)
 
   @flagsaver.flagsaver(
       gce_network_name=['my-network'], gce_subnet_name=['my-subnet']
   )
-  def testNetworkNamePrecedence(self):
+  def testSubnetFlagPrecedence(self):
     vm = mock.Mock(
         zone='us-north1-b',
         project=_PROJECT,
         cidr='1.2.3.4/56',
-        subnet_name='default',
+        subnet_names='default',
     )
     net = gce_network.GceNetwork.GetNetwork(vm)
     self.assertTrue(net.is_existing_network)
-    self.assertEqual('default', net.network_resource.name)
-
-  def testVMSpecNetworkName(self):
-    vm = mock.Mock(
-        zone='us-north1-b',
-        project=_PROJECT,
-        cidr='1.2.3.4/56',
-        subnet_name='default',
-    )
-    net = gce_network.GceNetwork.GetNetwork(vm)
-    self.assertTrue(net.is_existing_network)
-    self.assertEqual('default', net.network_resource.name)
+    self.assertEqual('default', net.subnet_resource.name)
 
   ########
   # FireWall Names
@@ -456,7 +444,7 @@ class TestGceNetworkNames(BaseGceNetworkTest):
     )
 
     self.assertEqual(expected_name, fw_name)
-    self.assertRegexpMatches(fw_name, _REGEX_GCE_FW_NAMES)
+    self.assertRegex(fw_name, _REGEX_GCE_FW_NAMES)
 
   def testGetSingleFWName(self):
     FLAGS.gce_subnet_region = 'us-south1-c'
@@ -500,7 +488,7 @@ class TestGceNetworkNames(BaseGceNetworkTest):
     self.assertEqual(
         expected_name, fw_name
     )  # single-internal-2-2-3-4-33-uri45678
-    self.assertRegexpMatches(fw_name, _REGEX_GCE_FW_NAMES)
+    self.assertRegex(fw_name, _REGEX_GCE_FW_NAMES)
 
   def testGetMultiFWNameWithPorts(self):
     project = _PROJECT
@@ -546,7 +534,7 @@ class TestGceNetworkNames(BaseGceNetworkTest):
     self.assertEqual(
         expected_name, fw_name
     )  # multi-internal-1-2-3-4-56-49152-65535-uri45678
-    self.assertRegexpMatches(fw_name, _REGEX_GCE_FW_NAMES)
+    self.assertRegex(fw_name, _REGEX_GCE_FW_NAMES)
 
   def testGetMultiFWNameWithPortsDst(self):
     project = _PROJECT
@@ -590,7 +578,7 @@ class TestGceNetworkNames(BaseGceNetworkTest):
 
     # perfkit-firewall-multi-1-2-3-4-56-123-567-901-13-49152-65535-uri45678
     self.assertEqual(expected_name, fw_name)
-    self.assertRegexpMatches(fw_name, _REGEX_GCE_FW_NAMES)
+    self.assertRegex(fw_name, _REGEX_GCE_FW_NAMES)
 
 
 #  found in tests/gce_virtual_machine_test.py
@@ -614,7 +602,7 @@ def PatchCriticalObjects(retvals=None):
 class TestGceNetwork(BaseGceNetworkTest):
 
   def setUp(self):
-    super(TestGceNetwork, self).setUp()
+    super().setUp()
     # need a benchmarkspec in the context to run
     config_spec = benchmark_config_spec.BenchmarkConfigSpec(
         'cluster_boot', flag_values=FLAGS
@@ -626,7 +614,7 @@ class TestGceNetwork(BaseGceNetworkTest):
     project = 'myproject'
     zone = 'us-east1-a'
     vm = mock.Mock(
-        zone=zone, project=project, cidr=None, mtu=None, subnet_name=None
+        zone=zone, project=project, cidr=None, mtu=None, subnet_names=None,
     )
 
     net = gce_network.GceNetwork.GetNetwork(vm)
@@ -642,7 +630,13 @@ class TestGceNetwork(BaseGceNetworkTest):
 
   @mock.patch.object(vm_util, 'IssueCommand', return_value=('', '', 0))
   def testMtuSupport(self, mock_issue):
-    vm = mock.Mock(project='abc', cidr=None, mtu=1500, subnet_name=None)
+    vm = mock.Mock(
+        project='abc',
+        zone='us-central1-a',
+        cidr=None,
+        mtu=1500,
+        subnet_names=None,
+    )
 
     net = gce_network.GceNetwork.GetNetwork(vm)
     net.Create()

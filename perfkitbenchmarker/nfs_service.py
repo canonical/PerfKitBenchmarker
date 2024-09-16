@@ -39,7 +39,6 @@ specsfs:
 import abc
 import logging
 import re
-from typing import Optional
 
 from absl import flags
 from perfkitbenchmarker import background_tasks
@@ -85,7 +84,7 @@ class BaseNfsService(resource.BaseResource):
   DEFAULT_TIER = None
 
   def __init__(self, disk_spec: disk.BaseNFSDiskSpec, zone):
-    super(BaseNfsService, self).__init__()
+    super().__init__()
     self.disk_spec = disk_spec
     self.zone = zone
     self.server_directory = '/'
@@ -128,7 +127,7 @@ class StaticNfsService(BaseNfsService):
   CLOUD = 'Static'
 
   def __init__(self, disk_spec):
-    super(StaticNfsService, self).__init__(disk_spec, None)
+    super().__init__(disk_spec, None)
     self.ip_address = disk_spec.nfs_ip_address
     self.server_directory = disk_spec.nfs_directory or '/'
 
@@ -176,12 +175,12 @@ class UnmanagedNfsService(BaseNfsService):
 
   def __init__(
       self,
-      disk_spec: Optional[disk.BaseNFSDiskSpec],
+      disk_spec: disk.BaseNFSDiskSpec | None,
       server_vm,
       check_export_not_same_mount=True,
       server_directory=None,
   ):
-    super(UnmanagedNfsService, self).__init__(disk_spec, None)
+    super().__init__(disk_spec, None)
     self.server_vm = server_vm
     # Path on the server to export. Must be different from mount_point.
     if server_directory:
@@ -223,7 +222,7 @@ class UnmanagedNfsService(BaseNfsService):
     assert self.server_vm, 'NFS server VM not created.'
     self.server_vm.Install('nfs_server')
     self._ExportNfsDir(self.server_directory)
-    # Restart NFS service upon reboot if required (Centos7)
+    # Restart NFS service upon reboot if required
     self.server_vm.RemoteCommand(
         'sudo systemctl enable nfs', ignore_failure=True
     )

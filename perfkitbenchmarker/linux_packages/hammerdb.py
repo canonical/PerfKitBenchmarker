@@ -19,13 +19,11 @@ import functools
 import posixpath
 import re
 import statistics
-from typing import Any, FrozenSet, List, Optional
+from typing import Any, FrozenSet, List
 
 from absl import flags
 from dateutil import parser
 from perfkitbenchmarker import data
-from perfkitbenchmarker import errors
-from perfkitbenchmarker import os_types
 from perfkitbenchmarker import regex_util
 from perfkitbenchmarker import sample
 from perfkitbenchmarker import sql_engine_utils
@@ -124,7 +122,7 @@ HAMMERDB_SCRIPT = flags.DEFINE_enum(
     'The script to run for hammerdb.',
 )
 
-_HAMMERDB_BUILD_TIMEOUT = flags.DEFINE_integer(
+HAMMERDB_BUILD_TIMEOUT = flags.DEFINE_integer(
     'hammerdbcli_build_timeout',
     15000,
     'Timeout hammerdb build phase when exceed build timeout.',
@@ -231,8 +229,14 @@ HAMMERDB_RESTART_BEFORE_RUN = flags.DEFINE_bool(
     'Restart SQL Server before run phase',
 )
 
+HAMMERDB_SERVER_CONFIGURATION = flags.DEFINE_string(
+    'hammerdbcli_server_configuration',
+    '',
+    'Server configuration to use when benchmarking IAAS DB using HammerDB tool',
+)
 
-def SetDefaultConfig(num_cpus: Optional[int]):
+
+def SetDefaultConfig(num_cpus: int | None):
   """Set the default configurations of unfilled flags."""
   if HAMMERDB_NUM_VU.value is None:
     if HAMMERDB_SCRIPT.value == HAMMERDB_SCRIPT_TPC_H:
@@ -253,16 +257,7 @@ def SetDefaultConfig(num_cpus: Optional[int]):
 
 def CheckPrerequisites(_):
   """Verifies that benchmark setup is correct."""
-  # hammerdb 4.5 and later versions required glibc 2.29 or later,
-  # which is not available on ubuntu1804 and earlier.
-  if HAMMERDB_VERSION.value == HAMMERDB_4_5 and FLAGS.os_type in [
-      os_types.UBUNTU1604,
-      os_types.UBUNTU1804,
-  ]:
-    raise errors.Setup.InvalidFlagConfigurationError(
-        'Hammerdb version 4.5 is not supported on os type {}.'
-        'Use a later version of the os or an earlier version of hammerdb.'
-    )
+  pass
 
 
 # define Hammerdb exception
@@ -270,7 +265,7 @@ class HammerdbBenchmarkError(Exception):
   pass
 
 
-class HammerDbTclScript(object):
+class HammerDbTclScript:
   """Represents a TCL script that will be run inside of hammerdbcli."""
 
   def __init__(
@@ -318,19 +313,20 @@ class HammerDbTclScript(object):
     if (
         'Error' in stdout
         or 'FAILED' in stdout
+        or 'failure' in stdout  # SQL Server failures
         or 'Virtual Users remain running' in stdout
     ):
       raise HammerdbBenchmarkError(
-          'Script failed during the build phase with stdout {0}'.format(stdout)
+          'Script failed during the build phase with stdout {}'.format(stdout)
       )
 
   def Run(
       self,
       vm: virtual_machine.BaseVirtualMachine,
-      timeout: Optional[int] = 60 * 60 * 6,
+      timeout: int | None = 60 * 60 * 6,
   ) -> str:
     """Run hammerdbcli script."""
-    script_location = '{0}/{1}'.format(
+    script_location = '{}/{}'.format(
         LocalWorkingDirectory(), self.tcl_script_name
     )
     cmd = ''
@@ -349,7 +345,7 @@ class HammerDbTclScript(object):
             HAMMERDB_RUN_LOCATION,
             'PATH="$PATH:/opt/mssql-tools/bin" &&'
             + cmd
-            + 'sudo -E ./hammerdbcli auto {0}'.format(script_location),
+            + 'sudo -E ./hammerdbcli auto {}'.format(script_location),
         ),
         timeout=timeout,
     )
@@ -407,7 +403,7 @@ TPCH_PARAMS = frozenset({
 })
 
 
-class TclScriptParameters(object):
+class TclScriptParameters:
   """Handle of the parameters that may be needed by a TCL script."""
 
   def __init__(
@@ -428,7 +424,7 @@ class TclScriptParameters(object):
         SCRIPT_PARAMETER_PASSWORD: password,
         SCRIPT_PARAMETER_USER: user,
         SCRIPT_PARAMETER_AZURE: 'true' if is_managed_azure else 'false',
-        SCRIPT_PARAMETER_BUILD_TIMEOUT: _HAMMERDB_BUILD_TIMEOUT.value,
+        SCRIPT_PARAMETER_BUILD_TIMEOUT: HAMMERDB_BUILD_TIMEOUT.value,
     }
 
     if hammerdb_script == HAMMERDB_SCRIPT_TPC_H:
@@ -823,7 +819,7 @@ def LocalWorkingDirectory() -> str:
 
 
 def InDir(directory: str, command: str) -> str:
-  return 'cd {0} && {1}'.format(directory, command)
+  return 'cd {} && {}'.format(directory, command)
 
 
 def InLocalDir(command: str) -> str:
@@ -849,7 +845,7 @@ def SearchAndReplaceGuestFile(
   vm.RemoteCommand(
       InDir(
           directory,
-          "sed -i.bak 's:{0}:{1}:' {2}".format(search, replace, filename),
+          "sed -i.bak 's:{}:{}:' {}".format(search, replace, filename),
       )
   )
 
@@ -869,8 +865,8 @@ def Install(vm: virtual_machine.BaseVirtualMachine):
   """Installs hammerdbcli and dependencies on the VM."""
   vm.InstallPackages('curl')
   vm.InstallPackages('patch')
-  vm.RemoteCommand('mkdir -p {0}'.format(LocalWorkingDirectory()))
-  vm.RemoteCommand('sudo mkdir -p {0}'.format(HAMMERDB_RUN_LOCATION))
+  vm.RemoteCommand('mkdir -p {}'.format(LocalWorkingDirectory()))
+  vm.RemoteCommand('sudo mkdir -p {}'.format(HAMMERDB_RUN_LOCATION))
   vm.RemoteCommand(f'sudo chmod ugo+rwx {HAMMERDB_RUN_LOCATION}')
 
   tar_file = f'HammerDB-{HAMMERDB_VERSION.value}-Linux.tar.gz'
@@ -921,13 +917,13 @@ def SetupConfig(
 
   if db_engine not in SCRIPT_MAPPING:
     raise ValueError(
-        '{0} is currently not supported for running '
+        '{} is currently not supported for running '
         'hammerdb benchmarks.'.format(db_engine)
     )
 
   if hammerdb_script not in SCRIPT_MAPPING[db_engine]:
     raise ValueError(
-        '{0} is not a known hammerdb script.'.format(hammerdb_script)
+        '{} is not a known hammerdb script.'.format(hammerdb_script)
     )
 
   scripts = SCRIPT_MAPPING[db_engine][hammerdb_script]
@@ -953,7 +949,7 @@ def Run(
     vm: virtual_machine.BaseVirtualMachine,
     db_engine: str,
     hammerdb_script: str,
-    timeout: Optional[int] = 60 * 60 * 8,
+    timeout: int | None = 60 * 60 * 8,
 ) -> str:
   """Run the HammerDBCli Benchmark.
 

@@ -18,7 +18,7 @@ import dataclasses
 import logging
 import time
 import timeit
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 from absl import flags
 from perfkitbenchmarker import sample
 from perfkitbenchmarker import virtual_machine
@@ -30,6 +30,7 @@ SECOND = 'seconds'
 FLEXIBLE_SERVER_MYSQL = 'flexible-server-mysql'
 FLEXIBLE_SERVER_POSTGRES = 'flexible-server-postgres'
 
+OMNI = 'omni'
 MYSQL = 'mysql'
 MARIADB = 'mariadb'
 POSTGRES = 'postgres'
@@ -44,6 +45,7 @@ SPANNER_POSTGRES = 'spanner-postgres'
 ALLOYDB = 'alloydb-postgresql'
 
 ALL_ENGINES = [
+    OMNI,
     MARIADB,
     MYSQL,
     POSTGRES,
@@ -92,9 +94,9 @@ class DbConnectionProperties:
   port: int
   database_username: str
   database_password: str
-  instance_name: Optional[str] = None
-  database_name: Optional[str] = None
-  project: Optional[str] = None
+  instance_name: str | None = None
+  database_name: str | None = None
+  project: str | None = None
 
 
 class ISQLQueryTools(metaclass=abc.ABCMeta):
@@ -192,7 +194,7 @@ class ISQLQueryTools(metaclass=abc.ABCMeta):
       database_name: str = '',
       superuser: bool = False,
       session_variables: str = '',
-      timeout: Optional[int] = None,
+      timeout: int | None = None,
       ignore_failure: bool = False,
       suppress_stdout: bool = False,
   ):
@@ -307,7 +309,7 @@ class PostgresCliQueryTools(ISQLQueryTools):
       database_name = self.DEFAULT_DATABASE
     if not endpoint:
       endpoint = self.connection_properties.endpoint
-    return "'host={0} user={1} password={2} dbname={3}'".format(
+    return "'host={} user={} password={} dbname={}'".format(
         endpoint,
         self.connection_properties.database_username,
         self.connection_properties.database_password,
@@ -325,7 +327,7 @@ class PostgresCliQueryTools(ISQLQueryTools):
 
   def GetSysbenchConnectionString(self):
     return (
-        '--pgsql-host={0} --pgsql-user={1} --pgsql-password="{2}" '
+        '--pgsql-host={} --pgsql-user={} --pgsql-password="{}" '
         '--pgsql-port=5432'
     ).format(
         self.connection_properties.endpoint,
@@ -355,7 +357,7 @@ class SpannerPostgresCliQueryTools(PostgresCliQueryTools):
   DEFAULT_DATABASE = POSTGRES
 
   def Connect(
-      self, sessions: Optional[int] = None, database_name: str = ''
+      self, sessions: int | None = None, database_name: str = ''
   ) -> None:
     """Connects to the DB using PGAdapter.
 
@@ -378,7 +380,7 @@ class SpannerPostgresCliQueryTools(PostgresCliQueryTools):
       )
     properties = self.connection_properties
     database_name = database_name or properties.database_name
-    self.vm.RemoteCommand(
+    command = (
         'java -jar pgadapter.jar '
         '-dir /tmp '
         f'-p {properties.project} '
@@ -387,6 +389,8 @@ class SpannerPostgresCliQueryTools(PostgresCliQueryTools):
         f'{sessions_arg} '
         '&> /dev/null &'
     )
+
+    self.vm.RemoteCommand(command)
     # Connections need some time to startup, or the run command fails.
     time.sleep(_PGADAPTER_CONNECT_WAIT_SEC)
 
@@ -458,14 +462,14 @@ class MysqlCliQueryTools(ISQLQueryTools):
   def GetConnectionString(self, endpoint=''):
     if not endpoint:
       endpoint = self.connection_properties.endpoint
-    return '-h {0} -P 3306 -u {1} -p{2}'.format(
+    return '-h {} -P 3306 -u {} -p{}'.format(
         self.connection_properties.endpoint,
         self.connection_properties.database_username,
         self.connection_properties.database_password,
     )
 
   def GetSysbenchConnectionString(self):
-    return ('--mysql-host={0} --mysql-user={1} --mysql-password="{2}" ').format(
+    return ('--mysql-host={} --mysql-user={} --mysql-password="{}" ').format(
         self.connection_properties.endpoint,
         self.connection_properties.database_username,
         self.connection_properties.database_password,
@@ -563,7 +567,7 @@ def GetDbEngineType(db_engine: str) -> str:
       db_engine == AWS_AURORA_MYSQL_ENGINE or db_engine == FLEXIBLE_SERVER_MYSQL
   ):
     return MYSQL
-  elif db_engine == ALLOYDB:
+  elif db_engine == ALLOYDB or db_engine == OMNI:
     return POSTGRES
   elif db_engine == SPANNER_POSTGRES:
     return SPANNER_POSTGRES

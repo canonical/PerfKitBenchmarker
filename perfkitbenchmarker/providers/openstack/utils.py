@@ -29,7 +29,7 @@ from perfkitbenchmarker import vm_util
 FLAGS = flags.FLAGS
 
 
-class OpenStackCLICommand(object):
+class OpenStackCLICommand:
   """An openstack cli command.
 
   Attributes:
@@ -62,7 +62,7 @@ class OpenStackCLICommand(object):
     self._AddCommonFlags(resource)
 
   def __repr__(self):
-    return '{0}({1})'.format(type(self).__name__, ' '.join(self._GetCommand()))
+    return '{}({})'.format(type(self).__name__, ' '.join(self._GetCommand()))
 
   def _GetCommand(self):
     """Generates the openstack cli command.
@@ -72,7 +72,7 @@ class OpenStackCLICommand(object):
     """
     cmd = [FLAGS.openstack_cli_path]
     cmd.extend(self.args)
-    for flag_name, values in six.iteritems(self.flags):
+    for flag_name, values in self.flags.items():
       flag_name_str = '--%s' % flag_name
       if values is True:
         cmd.append(flag_name_str)

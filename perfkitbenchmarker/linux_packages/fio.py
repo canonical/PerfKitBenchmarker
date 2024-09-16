@@ -61,18 +61,17 @@ def GetFioExec():
 
 def _Install(vm):
   """Installs the fio package on the VM."""
-  # TODO(user): Upgrade to python3.
-  for p in ['build_tools', 'python', 'pip3', 'python_dev']:
+  for p in ['build_tools', 'pip']:
     vm.Install(p)
   for package in ('numpy', 'pandas'):
     vm.RemoteCommand(f'sudo pip3 install {package}')
-  vm.RemoteCommand('git clone {0} {1}'.format(GIT_REPO, FIO_DIR))
-  vm.RemoteCommand('cd {0} && git checkout {1}'.format(FIO_DIR, GIT_TAG))
+  vm.RemoteCommand('git clone {} {}'.format(GIT_REPO, FIO_DIR))
+  vm.RemoteCommand('cd {} && git checkout {}'.format(FIO_DIR, GIT_TAG))
 
   vm.PushDataFile('fio.patch', FIO_PATCH)
   vm.RemoteCommand(f'cd {FIO_DIR} && patch -l -p1 < fio.patch')
 
-  vm.RemoteCommand('cd {0} && ./configure && make'.format(FIO_DIR))
+  vm.RemoteCommand('cd {} && ./configure && make'.format(FIO_DIR))
   if flags.FLAGS.fio_hist_log:
     vm.PushDataFile(FIO_HIST_LOG_PARSER_PATCH)
     vm.RemoteCommand(
@@ -94,16 +93,20 @@ def YumInstall(vm):
 
 def AptInstall(vm):
   """Installs the fio package on the VM."""
-  vm.InstallPackages('libaio-dev libnuma-dev libaio1 bc zlib1g-dev')
+  libaio1_pkg = 'libaio1'
+  if vm.HasPackage('libaio1t64'):
+    libaio1_pkg = 'libaio1t64'
+  vm.InstallPackages(f'libaio-dev libnuma-dev {libaio1_pkg} bc zlib1g-dev')
   vm.InstallPackages('numactl')
   _Install(vm)
 
 
-def ParseJobFile(job_file):
+def ParseJobFile(job_file, merge=False):
   """Parse fio job file as dictionaries of sample metadata.
 
   Args:
     job_file: The contents of fio job file.
+    merge: whether the job files need to be merged later.
 
   Returns:
     A dictionary of dictionaries of sample metadata, using test name as keys,
@@ -115,7 +118,7 @@ def ParseJobFile(job_file):
   if GLOBAL in config.sections():
     global_metadata = dict(config.items(GLOBAL))
   section_metadata = {}
-  require_merge = FLAGS.fio_pinning
+  require_merge = merge
   for section in config.sections():
     if section == GLOBAL:
       continue
@@ -176,6 +179,7 @@ def ParseResults(
     log_file_base='',
     bin_vals=None,
     skip_latency_individual_stats=False,
+    require_merge=False,
 ):
   """Parse fio json output into samples.
 
@@ -189,6 +193,8 @@ def ParseResults(
       fio/tools/hist/fiologparser_hist.py
     skip_latency_individual_stats: Bool. If true, skips pulling latency stats
       that are not aggregate.
+    require_merge: whether the result samples require merging from multiple fio
+      jobs. (in event jobs are pinned to CPUs or raw disks.)
 
   Returns:
     A list of sample.Sample objects.
@@ -197,7 +203,9 @@ def ParseResults(
   # The samples should all have the same timestamp because they
   # come from the same fio run.
   timestamp = time.time()
-  parameter_metadata = ParseJobFile(job_file) if job_file else dict()
+  parameter_metadata = (
+      ParseJobFile(job_file, require_merge) if job_file else dict()
+  )
   io_modes = list(DATA_DIRECTION.values())
 
   # clat_hist files are indexed sequentially by inner job.  If you have a job

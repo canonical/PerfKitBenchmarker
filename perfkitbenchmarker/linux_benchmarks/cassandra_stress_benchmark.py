@@ -19,16 +19,16 @@ cassandra-stress tool page:
 http://docs.datastax.com/en/cassandra/2.1/cassandra/tools/toolsCStress_t.html
 """
 
-
 import collections
+import copy
 import functools
 import logging
 import math
 import posixpath
 import time
+from typing import Union
 
 from absl import flags
-from six.moves import range
 
 from perfkitbenchmarker import (background_tasks, configs, data, errors,
                                 regex_util, sample, vm_util)
@@ -106,6 +106,17 @@ flags.DEFINE_integer(
     'Number of retries when error encountered during stress.',
 )
 
+CASSANDRA_SERVER_ZONES = flags.DEFINE_list(
+    'cassandra_server_zones',
+    [],
+    'zones to launch the cassandra servers in. ',
+)
+
+CASSANDRA_CLIENT_ZONES = flags.DEFINE_list(
+    'cassandra_client_zones',
+    [],
+    'zones to launch the clients for the benchmark in. ',
+)
 # Use "./cassandra-stress help -pop" to get more details.
 # [dist=DIST(?)]: Seeds are selected from this distribution
 #  EXP(min..max):
@@ -198,11 +209,28 @@ cassandra_stress:
   description: Benchmark Cassandra using cassandra-stress
   vm_groups:
     workers:
-      vm_spec: *default_single_core
+      vm_spec:
+        GCP:
+          machine_type: c3-standard-4
+          zone: us-central1-a
+        Azure:
+          machine_type: Standard_D4_v5
+          zone: eastus2
+        AWS:
+          machine_type: m6i.xlarge
+          zone: us-east-1
       disk_spec: *default_500_gb
-      vm_count: 3
     client:
-      vm_spec: *default_single_core
+      vm_spec:
+        GCP:
+          machine_type: c3-standard-4
+          zone: us-central1-a
+        Azure:
+          machine_type: Standard_D4_v5
+          zone: eastus2
+        AWS:
+          machine_type: m6i.xlarge
+          zone: us-east-1
 """
 
 CASSANDRA_GROUP = 'workers'
@@ -229,9 +257,9 @@ RESULTS_METRICS = (
     'latency 99.9th percentile',  # 99.9% of the time the latency was less than
     # the number displayed in the column.
     'latency max',  # Maximum latency in milliseconds.
-    'Total partitions',  # Number of partitions.
-    'Total errors',  # Number of errors.
-    'Total operation time',
+    'total partitions',  # Number of partitions.
+    'total errors',  # Number of errors.
+    'total operation time',
 )  # Total operation time.
 
 # Metrics are aggregated between client vms.
@@ -247,7 +275,25 @@ MAXIMUM_METRICS = {'latency max'}
 
 
 def GetConfig(user_config):
-  return configs.LoadConfig(BENCHMARK_CONFIG, user_config, BENCHMARK_NAME)
+  cloud = FLAGS.cloud
+  config = configs.LoadConfig(BENCHMARK_CONFIG, user_config, BENCHMARK_NAME)
+  ConfigureVmGroups(
+      config, CASSANDRA_SERVER_ZONES.value, CASSANDRA_GROUP, cloud
+  )
+  ConfigureVmGroups(
+      config, CASSANDRA_CLIENT_ZONES.value, CLIENT_GROUP, cloud
+  )
+  return config
+
+
+def ConfigureVmGroups(config, flag, group_name, cloud):
+  for index, zone in enumerate(flag):
+    if index == 0:
+      config['vm_groups'][group_name]['vm_spec'][cloud]['zone'] = zone
+      continue
+    node = copy.deepcopy(config['vm_groups'][group_name])
+    node['vm_spec'][cloud]['zone'] = zone
+    config['vm_groups'][f'{group_name}_{index}'] = node
 
 
 def CheckPrerequisites(benchmark_config):
@@ -256,6 +302,14 @@ def CheckPrerequisites(benchmark_config):
   Raises:
     perfkitbenchmarker.data.ResourceNotFound: On missing resource.
   """
+  if not CASSANDRA_SERVER_ZONES.value:
+    raise errors.Setup.InvalidFlagConfigurationError(
+        'Specify zones for cassandra servers in cassandra_server_zones flag'
+    )
+  if not CASSANDRA_CLIENT_ZONES.value:
+    raise errors.Setup.InvalidFlagConfigurationError(
+        'Specify zones for cassandra clients in cassandra_client_zones flag'
+    )
   cassandra.CheckPrerequisites()
   if FLAGS.cassandra_stress_command == USER_COMMAND:
     data.ResourcePath(FLAGS.cassandra_stress_profile)
@@ -276,12 +330,14 @@ def CheckMetadata(metadata):
       )
 
 
-def GenerateMetadataFromFlags(benchmark_spec):
+def GenerateMetadataFromFlags(benchmark_spec, cassandra_vms, client_vms):
   """Generate metadata from command-line flags.
 
   Args:
     benchmark_spec: The benchmark specification. Contains all data that is
       required to run the benchmark.
+    cassandra_vms: cassandra server vms.
+    client_vms: cassandra client vms.
 
   Returns:
     dict. Contains metadata for this benchmark.
@@ -304,8 +360,9 @@ def GenerateMetadataFromFlags(benchmark_spec):
 
   metadata.update({
       'concurrent_reads': FLAGS.cassandra_concurrent_reads,
-      'num_data_nodes': len(vm_dict[CASSANDRA_GROUP]),
-      'num_loader_nodes': len(vm_dict[CLIENT_GROUP]),
+      'concurrent_writes': FLAGS.cassandra_concurrent_writes,
+      'num_data_nodes': len(cassandra_vms),
+      'num_loader_nodes': len(client_vms),
       'num_cassandra_stress_threads': FLAGS.num_cassandra_stress_threads,
       'command': FLAGS.cassandra_stress_command,
       'consistency_level': FLAGS.cassandra_stress_consistency_level,
@@ -332,12 +389,12 @@ def GenerateMetadataFromFlags(benchmark_spec):
   return metadata
 
 
-def PreloadCassandraServer(benchmark_spec, metadata):
+def PreloadCassandraServer(cassandra_vms, client_vms, metadata):
   """Preload cassandra cluster if necessary.
 
   Args:
-    benchmark_spec: The benchmark specification. Contains all data that is
-      required to run the benchmark.
+    cassandra_vms: cassandra server vms.
+    client_vms: client vms that run cassandra-stress.
     metadata: dict. Contains metadata for this benchmark.
   """
   if (
@@ -355,13 +412,24 @@ def PreloadCassandraServer(benchmark_spec, metadata):
       cassandra_stress_command,
   )
   RunCassandraStressTest(
-      benchmark_spec.vm_groups[CASSANDRA_GROUP],
-      benchmark_spec.vm_groups[CLIENT_GROUP],
+      cassandra_vms,
+      client_vms,
       metadata['num_preload_keys'],
       cassandra_stress_command,
   )
   logging.info('Waiting %s for keyspace to propagate.', PROPAGATION_WAIT_TIME)
   time.sleep(PROPAGATION_WAIT_TIME)
+
+
+def ParseVmGroups(vm_dict):
+  cassandra_vms = []
+  client_vms = []
+  for key, value in vm_dict.items():
+    if key.startswith(CASSANDRA_GROUP):
+      cassandra_vms.append(value[0])
+    elif key.startswith(CLIENT_GROUP):
+      client_vms.append(value[0])
+  return cassandra_vms, client_vms
 
 
 def Prepare(benchmark_spec):
@@ -372,8 +440,7 @@ def Prepare(benchmark_spec):
       required to run the benchmark.
   """
   vm_dict = benchmark_spec.vm_groups
-  cassandra_vms = vm_dict[CASSANDRA_GROUP]
-  client_vms = vm_dict[CLIENT_GROUP]
+  cassandra_vms, client_vms = ParseVmGroups(vm_dict)
   logging.info('VM dictionary %s', vm_dict)
 
   logging.info('Authorizing loader[0] permission to access all other vms.')
@@ -383,22 +450,26 @@ def Prepare(benchmark_spec):
   background_tasks.RunThreaded(
       lambda vm: vm.Install('cassandra'), cassandra_vms
   )
+
   background_tasks.RunThreaded(
       lambda vm: vm.Install('cassandra_stress'), client_vms
   )
   seed_vm = cassandra_vms[0]
   configure = functools.partial(cassandra.Configure, seed_vms=[seed_vm])
   background_tasks.RunThreaded(configure, cassandra_vms)
-
   cassandra.StartCluster(seed_vm, cassandra_vms[1:])
-
   if FLAGS.cassandra_stress_command == USER_COMMAND:
     for vm in client_vms:
       vm.PushFile(FLAGS.cassandra_stress_profile, TEMP_PROFILE_PATH)
-  metadata = GenerateMetadataFromFlags(benchmark_spec)
+  metadata = GenerateMetadataFromFlags(
+      benchmark_spec, cassandra_vms, client_vms
+  )
   if metadata['num_preload_keys']:
     CheckMetadata(metadata)
-  PreloadCassandraServer(benchmark_spec, metadata)
+  cassandra.CreateKeyspace(
+      seed_vm, replication_factor=FLAGS.cassandra_replication_factor
+  )
+  PreloadCassandraServer(cassandra_vms, client_vms, metadata)
 
 
 def _ResultFilePath(vm):
@@ -431,40 +502,43 @@ def RunTestOnLoader(
     population_params: string. Representing additional population parameters.
   """
   if command == USER_COMMAND:
-    command += ' profile={profile} ops\({ops}\)'.format(
+    command += r' profile={profile} ops\({ops}\)'.format(
         profile=TEMP_PROFILE_PATH, ops=user_operations
     )
 
     schema_option = ''
   else:
     if command == MIXED_COMMAND:
-      command += ' ratio\({ratio}\)'.format(
+      command += r' ratio\({ratio}\)'.format(
           ratio=FLAGS.cassandra_stress_mixed_ratio
       )
     # TODO: Support more complex replication strategy.
-    schema_option = '-schema replication\(factor={replication_factor}\)'.format(
-        replication_factor=FLAGS.cassandra_stress_replication_factor
+    schema_option = (
+        r'-schema replication\(factor={replication_factor}\)'.format(
+            replication_factor=FLAGS.cassandra_stress_replication_factor
+        )
     )
-
-  population_range = '%s..%s' % (int(loader_index * population_per_vm + 1),
-                                 int((loader_index + 1) * population_per_vm))
+  population_range = '%s..%s' % (
+      loader_index * population_per_vm + 1,
+      (loader_index + 1) * population_per_vm,
+  )
   if population_params:
     population_params = '%s,%s' % (population_range, population_params)
   else:
     population_params = population_range
   if population_dist:
-    population_dist = '-pop dist=%s\(%s\)' % (
+    population_dist = r'-pop dist=%s\(%s\)' % (
         population_dist,
         population_params,
     )
   else:
     population_dist = '-pop seq=%s' % population_params
   vm.RobustRemoteCommand(
-      '{cassandra} {command} cl={consistency_level} n={num_keys} '
-      '-node {nodes} {schema} {population_dist} '
-      '-log file={result_file} -rate threads={threads} '
-      '-errors retries={retries}'.format(
-          cassandra=cassandra.GetCassandraStressPath(vm),
+      'sudo {cassandra_stress_command} {command} cl={consistency_level}'
+      ' n={num_keys} -node {nodes} {schema} {population_dist} -log'
+      ' file={result_file} -rate threads={threads} -errors retries={retries}'
+      .format(
+          cassandra_stress_command=cassandra.GetCassandraStressPath(vm),
           command=command,
           consistency_level=FLAGS.cassandra_stress_consistency_level,
           num_keys=operations_per_vm,
@@ -505,7 +579,7 @@ def RunCassandraStressTest(
   data_node_ips = [vm.internal_ip for vm in cassandra_vms]
   population_size = population_size or num_operations
   operations_per_vm = int(math.ceil(float(num_operations) / num_loaders))
-  population_per_vm = population_size / num_loaders
+  population_per_vm = int(population_size / num_loaders)
   if num_operations % num_loaders:
     logging.warn(
         'Total number of operations rounded to %s '
@@ -534,6 +608,57 @@ def RunCassandraStressTest(
   background_tasks.RunThreaded(RunTestOnLoader, args)
 
 
+def ParseResp(resp) -> dict[str, Union[float, int]]:
+  """Parses response from Cassandra stress test.
+
+  Args:
+    resp: metric data to parse
+
+  Returns:
+    dict of all the metrics and their values
+  """
+  all_rows = resp.split('\n')
+  metric_values = {}
+  for row in all_rows:
+    if row.strip() == 'Results:' or not row.strip():
+      continue
+    metric_details = _ParseResultRow(row)
+    if metric_details:
+      metric_name, metric_value = metric_details
+      metric_values[metric_name] = metric_value
+  return metric_values
+
+
+def _ParseResultRow(row: str) -> tuple[str, float] | None:
+  """Parses a single row of the result file."""
+  try:
+    metric_name = regex_util.ExtractGroup('(.*) :', row, 1).lower().strip()
+  except regex_util.NoMatchError:
+    logging.error('Metric name not found in row: %s', row)
+    return None
+  if metric_name not in RESULTS_METRICS:
+    return None
+  try:
+    metric_data = regex_util.ExtractGroup(
+        r'(.*) :\s*(\d{1,3}(,\d{3})*(\.\d+)*)', row, 2
+    ).strip()
+  except regex_util.NoMatchError:
+    logging.error('Invalid value for %s: %s', metric_name, row)
+    return None
+  if metric_name == 'total operation time':
+    operation_time_values = regex_util.ExtractGroup(
+        r'(.*) :\s*(\d{2}:\d{2}:\d{2})', row, 2
+    ).split(':')
+    metric_value = (
+        int(operation_time_values[0].strip()) * 3600
+        + int(operation_time_values[1].strip()) * 60
+        + int(operation_time_values[2].strip())
+    )
+  else:
+    metric_value = float(metric_data.strip().replace(',', ''))
+  return (metric_name, metric_value)
+
+
 def CollectResultFile(vm, results):
   """Collect result file on vm.
 
@@ -545,31 +670,26 @@ def CollectResultFile(vm, results):
   result_path = _ResultFilePath(vm)
   vm.PullFile(vm_util.GetTempDir(), result_path)
   resp, _ = vm.RemoteCommand('tail -n 20 ' + result_path)
+  metrics = ParseResp(resp)
+  logging.info('Metrics: %s', metrics)
   for metric in RESULTS_METRICS:
-    value = regex_util.ExtractGroup(r'%s[\t ]+: ([\d\.:]+)' % metric, resp)
-    if metric == RESULTS_METRICS[-1]:  # Total operation time
-      value = value.split(':')
-      results[metric].append(
-          int(value[0]) * 3600 + int(value[1]) * 60 + int(value[2])
-      )
-    else:
-      results[metric].append(float(value))
+    if metric not in metrics:
+      raise ValueError(f'Metric {metric} not found in result file.')
+    value = metrics[metric]
+    results[metric].append(value)
 
 
-def CollectResults(benchmark_spec, metadata):
+def CollectResults(loader_vms, metadata):
   """Collect and parse test results.
 
   Args:
-    benchmark_spec: The benchmark specification. Contains all data that is
-      required to run the benchmark.
+    loader_vms: client vms.
     metadata: dict. Contains metadata for this benchmark.
 
   Returns:
     A list of sample.Sample objects.
   """
   logging.info('Gathering results.')
-  vm_dict = benchmark_spec.vm_groups
-  loader_vms = vm_dict[CLIENT_GROUP]
   raw_results = collections.defaultdict(list)
   args = [((vm, raw_results), {}) for vm in loader_vms]
   background_tasks.RunThreaded(CollectResultFile, args)
@@ -581,6 +701,7 @@ def CollectResults(benchmark_spec, metadata):
       value = math.fsum(raw_results[metric])
       if metric not in AGGREGATED_METRICS:
         value = value / len(loader_vms)
+    unit = ''
     if metric.startswith('latency'):
       unit = 'ms'
     elif metric.endswith('rate'):
@@ -588,7 +709,6 @@ def CollectResults(benchmark_spec, metadata):
     elif metric == 'Total operation time':
       unit = 'seconds'
     results.append(sample.Sample(metric, value, unit, metadata))
-  logging.info('Cassandra results:\n%s', results)
   return results
 
 
@@ -602,11 +722,16 @@ def Run(benchmark_spec):
   Returns:
     A list of sample.Sample objects.
   """
-  metadata = GenerateMetadataFromFlags(benchmark_spec)
-
+  cassandra_vms, client_vms = ParseVmGroups(benchmark_spec.vm_groups)
+  metadata = GenerateMetadataFromFlags(
+      benchmark_spec, cassandra_vms, client_vms
+  )
+  metadata['cassandra_version'] = cassandra.GetCassandraVersion(
+      benchmark_spec.vm_groups[CASSANDRA_GROUP][0]
+  )
   RunCassandraStressTest(
-      benchmark_spec.vm_groups[CASSANDRA_GROUP],
-      benchmark_spec.vm_groups[CLIENT_GROUP],
+      cassandra_vms,
+      client_vms,
       metadata['num_keys'],
       metadata['command'],
       metadata.get('operations'),
@@ -614,7 +739,7 @@ def Run(benchmark_spec):
       metadata['population_dist'],
       metadata['population_parameters'],
   )
-  return CollectResults(benchmark_spec, metadata)
+  return CollectResults(client_vms, metadata)
 
 
 def Cleanup(benchmark_spec):

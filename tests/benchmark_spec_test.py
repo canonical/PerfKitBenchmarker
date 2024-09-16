@@ -64,6 +64,7 @@ cluster_boot:
         GCP:
           machine_type: n1-standard-4
           project: my-project
+          zone: us-central1-c
 """
 STATIC_VM_CONFIG = """
 static_vms:
@@ -81,7 +82,7 @@ cluster_boot:
       static_vms:
        - *vm1
        - ip_address: 2.2.2.2
-         os_type: rhel7
+         os_type: ubuntu2404
          ssh_private_key: /path/to/key2
          user_name: user2
          disk_specs:
@@ -100,6 +101,7 @@ cluster_boot:
       vm_spec:
         GCP:
           machine_type: n1-standard-4
+          zone: us-central1-c
 """
 
 _SIMPLE_EDW_CONFIG = """
@@ -117,7 +119,7 @@ edw_benchmark:
 class _BenchmarkSpecTestCase(pkb_common_test_case.PkbCommonTestCase):
 
   def setUp(self):
-    super(_BenchmarkSpecTestCase, self).setUp()
+    super().setUp()
     FLAGS.cloud = provider_info.GCP
     FLAGS.temp_dir = 'tmp'
     FLAGS.ignore_package_requirements = True
@@ -255,7 +257,7 @@ class ConstructVmsTestCase(_BenchmarkSpecTestCase):
 
     self.assertIsInstance(vm0, gce_vm.GceVirtualMachine)
     self.assertIsInstance(vm1, static_vm.StaticVirtualMachine)
-    self.assertIsInstance(vm2, static_vm.Rhel7BasedStaticVirtualMachine)
+    self.assertIsInstance(vm2, static_vm.Ubuntu2404BasedStaticVirtualMachine)
     self.assertIsInstance(vm3, gce_vm.GceVirtualMachine)
 
     self.assertEqual(vm2.disk_specs[0].mount_point, '/scratch')

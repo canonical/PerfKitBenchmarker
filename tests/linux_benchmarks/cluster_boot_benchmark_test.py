@@ -1,6 +1,5 @@
 """Tests for cluster_boot_delete."""
 
-from typing import Optional
 import unittest
 
 import freezegun
@@ -33,8 +32,8 @@ def vm_mock(index: int, timestamp: float) -> mock.Mock:
 
 def vm_mock_given_delete_times(
     index: int,
-    delete_start_time: Optional[float] = None,
-    delete_end_time: Optional[float] = None,
+    delete_start_time: float | None = None,
+    delete_end_time: float | None = None,
 ) -> mock.Mock:
   """Creates a mock vm with a provided delete_start_time and delete_end_time.
 
@@ -181,7 +180,9 @@ class ClusterBootBenchmarkTest(
         pkb_common_test_case.CreateBenchmarkSpecFromYaml()
     )
 
-    vm_spec = gce_virtual_machine.GceVmSpec('cluster_boot_benchmark_test')
+    vm_spec = gce_virtual_machine.GceVmSpec(
+        'cluster_boot_benchmark_test', zone='us-central1-a'
+    )
     vm = gce_virtual_machine.Ubuntu2204BasedGceVirtualMachine(vm_spec)
     vm.create_start_time = 1
     vm.create_return_time = 2

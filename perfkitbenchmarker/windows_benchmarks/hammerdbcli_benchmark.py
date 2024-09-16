@@ -78,6 +78,36 @@ hammerdbcli:
             machine_type: Standard_D4s_v5
             zone: eastus
             boot_disk_type: Premium_LRS
+      servers_replicas:
+        os_type: windows2022_desktop_sqlserver_2019_standard
+        vm_spec:
+          GCP:
+            machine_type: n2-standard-4
+            zone: us-central1-c
+            boot_disk_size: 50
+          AWS:
+            machine_type: m6i.xlarge
+            zone: us-east-1a
+          Azure:
+            machine_type: Standard_D4s_v5
+            zone: eastus
+            boot_disk_type: Premium_LRS
+        disk_spec:
+          GCP:
+            disk_size: 500
+            disk_type: pd-ssd
+            num_striped_disks: 1
+            mount_point: /scratch
+          AWS:
+            disk_size: 500
+            disk_type: gp2
+            num_striped_disks: 1
+            mount_point: /scratch
+          Azure:
+            disk_size: 500
+            disk_type: Premium_LRS
+            num_striped_disks: 1
+            mount_point: /scratch
       servers:
         os_type: windows2022_desktop_sqlserver_2019_standard
         vm_spec:
@@ -115,7 +145,6 @@ hammerdbcli:
             machine_type: n2-standard-16
             zone: us-central1-c
             boot_disk_size: 50
-            boot_disk_type: pd-ssd
           AWS:
             machine_type: m6i.4xlarge
             zone: us-east-1a
@@ -157,19 +186,17 @@ def GetConfig(user_config):
     # We need two additional vms for sql ha deployment.
     # First vm to act as the second node in sql cluster
     # and additional vm to act as a domain controller.
-
-    config['relational_db']['vm_groups']['servers']['vm_count'] = 2
+    config['relational_db']['vm_groups']['servers_replicas']['vm_count'] = 1
+    config['relational_db']['vm_groups']['servers']['vm_count'] = 1
     config['relational_db']['vm_groups']['controller']['vm_count'] = 1
-    config['relational_db']['vm_groups']['controller']['vm_spec'][FLAGS.cloud][
-        'zone'
-    ] = config['relational_db']['vm_groups']['servers']['vm_spec'][FLAGS.cloud][
-        'zone'
-    ]
 
     if FLAGS.db_high_availability_type == 'FCIMW':
       config['relational_db']['vm_groups']['servers']['disk_spec'][FLAGS.cloud][
           'multi_writer_mode'
       ] = True
+      config['relational_db']['vm_groups']['servers']['disk_spec'][FLAGS.cloud][
+          'multi_writer_group_name'
+      ] = 'sqlsrv'
 
   return config
 
@@ -202,38 +229,53 @@ def Prepare(benchmark_spec):
   hammerdb.SetDefaultConfig(num_cpus)
   vm.Install('hammerdb')
 
-  is_azure = FLAGS.cloud == 'Azure' and FLAGS.use_managed_db
-  if (
-      benchmark_spec.relational_db.spec.high_availability
-      and benchmark_spec.relational_db.spec.high_availability_type == 'AOAG'
-  ):
-    db_name = linux_hammerdb.MAP_SCRIPT_TO_DATABASE_NAME[
-        linux_hammerdb.HAMMERDB_SCRIPT.value
-    ]
-    relational_db.client_vm_query_tools.IssueSqlCommand(
-        """CREATE DATABASE [{0}];
-        BACKUP DATABASE [{0}] TO DISK = 'F:\\Backup\\{0}.bak';
-        ALTER AVAILABILITY GROUP [{1}] ADD DATABASE [{0}];
-        """.format(db_name, sql_engine_utils.SQLSERVER_AOAG_NAME)
-    )
-  elif is_azure and hammerdb.HAMMERDB_SCRIPT.value == 'tpc_c':
-    # Create the database first only Azure requires creating the database.
-    relational_db.client_vm_query_tools.IssueSqlCommand('CREATE DATABASE tpcc;')
+  retryable_exceptions = Exception
+  max_retries = 3
+  for tries in range(max_retries):
+    try:
+      # Drop tpcc database if it exists for retry
+      relational_db.client_vm_query_tools.IssueSqlCommand(
+          'DROP DATABASE IF EXISTS tpcc;', timeout=60 * 5
+      )
 
-  hammerdb.SetupConfig(
-      vm,
-      sql_engine_utils.SQLSERVER,
-      hammerdb.HAMMERDB_SCRIPT.value,
-      relational_db.endpoint,
-      relational_db.port,
-      relational_db.spec.database_password,
-      relational_db.spec.database_username,
-      is_azure,
-  )
+      is_azure = FLAGS.cloud == 'Azure' and FLAGS.use_managed_db
+      if (
+          benchmark_spec.relational_db.spec.high_availability
+          and benchmark_spec.relational_db.spec.high_availability_type == 'AOAG'
+      ):
+        db_name = linux_hammerdb.MAP_SCRIPT_TO_DATABASE_NAME[
+            linux_hammerdb.HAMMERDB_SCRIPT.value
+        ]
+        relational_db.client_vm_query_tools.IssueSqlCommand(
+            """CREATE DATABASE [{0}];
+            BACKUP DATABASE [{0}] TO DISK = 'F:\\Backup\\{0}.bak';
+            ALTER AVAILABILITY GROUP [{1}] ADD DATABASE [{0}];
+            """.format(db_name, sql_engine_utils.SQLSERVER_AOAG_NAME)
+        )
+      elif is_azure and hammerdb.HAMMERDB_SCRIPT.value == 'tpc_c':
+        # Create the database first only Azure requires creating the database.
+        relational_db.client_vm_query_tools.IssueSqlCommand(
+            'CREATE DATABASE tpcc;'
+        )
 
-  # SQL Server exhibits better performance when restarted after prepare step
-  if FLAGS.hammerdbcli_restart_before_run:
-    relational_db.RestartDatabase()
+      hammerdb.SetupConfig(
+          vm,
+          sql_engine_utils.SQLSERVER,
+          hammerdb.HAMMERDB_SCRIPT.value,
+          relational_db.endpoint,
+          relational_db.port,
+          relational_db.spec.database_password,
+          relational_db.spec.database_username,
+          is_azure,
+      )
+
+      # SQL Server exhibits better performance when restarted after prepare step
+      if FLAGS.hammerdbcli_restart_before_run:
+        relational_db.RestartDatabase()
+      return
+    except retryable_exceptions as e:
+      if tries >= max_retries - 1:
+        raise e
 
 
 def SetMinimumRecover(relational_db):
@@ -297,7 +339,7 @@ def Run(benchmark_spec):
       client_vms[0],
       sql_engine_utils.SQLSERVER,
       hammerdb.HAMMERDB_SCRIPT.value,
-      timeout=None,
+      timeout=linux_hammerdb.HAMMERDB_RUN_TIMEOUT.value,
   )
 
   metadata = GetMetadata()

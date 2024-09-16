@@ -23,7 +23,7 @@ nodes), and no datasets are configured. In order to run queries, these
 additional resources must be pre-provisioned or provisioned in the benchmark.
 """
 
-from typing import List, Optional, Type
+from typing import List, Type
 
 from perfkitbenchmarker import resource
 from perfkitbenchmarker import sample
@@ -46,7 +46,7 @@ class EdwComputeResource(resource.BaseResource):
   SERVICE_TYPE = 'abstract'
 
   def __init__(self, edw_service_spec):
-    super(EdwComputeResource, self).__init__()
+    super().__init__()
     self.compute_resource_identifier = None
 
   def GetLifecycleMetrics(self) -> List[sample.Sample]:
@@ -70,7 +70,7 @@ class EdwComputeResource(resource.BaseResource):
 
 def GetEdwComputeResourceClass(
     cloud: str, edw_compute_service_type: str
-) -> Optional[Type[EdwComputeResource]]:
+) -> Type[EdwComputeResource] | None:
   return resource.GetResourceClass(
       EdwComputeResource, CLOUD=cloud, SERVICE_TYPE=edw_compute_service_type
   )

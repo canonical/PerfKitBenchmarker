@@ -19,11 +19,9 @@ import abc
 import logging
 import os
 import pathlib
-from typing import Optional
 
 from absl import flags
 from perfkitbenchmarker import errors
-import six
 
 flags.DEFINE_string(
     'object_storage_credential_file', None, 'Directory of credential file.'
@@ -52,7 +50,7 @@ class AutoRegisterObjectStorageMeta(abc.ABCMeta):
   STORAGE_NAME = None
 
   def __init__(cls, name, bases, dct):
-    super(AutoRegisterObjectStorageMeta, cls).__init__(name, bases, dct)
+    super().__init__(name, bases, dct)
     if cls.STORAGE_NAME in _OBJECT_STORAGE_REGISTRY:
       logging.info(
           "Duplicate storage implementations for name '%s'. "
@@ -65,7 +63,7 @@ class AutoRegisterObjectStorageMeta(abc.ABCMeta):
 
 
 class ObjectStorageService(
-    six.with_metaclass(AutoRegisterObjectStorageMeta, object)
+    metaclass=AutoRegisterObjectStorageMeta
 ):
   """Base class for ObjectStorageServices."""
 
@@ -179,6 +177,7 @@ class ObjectStorageService(
     Returns:
       A list of top level subfolder names. Can be empty if there are no folders.
     """
+    del bucket
     return []
 
   @abc.abstractmethod
@@ -282,7 +281,7 @@ class ObjectStorageService(
     Returns:
       A dict of key, value pairs to add to our sample metadata.
     """
-
+    del vm
     return {}
 
   def UpdateSampleMetadata(self, samples):
@@ -323,7 +322,7 @@ class ObjectStorageService(
     return self.GetDownloadUrl(bucket, object_name, use_https)
 
   # Different services require uploads to be POST or PUT.
-  UPLOAD_HTTP_METHOD: Optional[str] = None
+  UPLOAD_HTTP_METHOD: str | None = None
 
   def MakeBucketPubliclyReadable(self, bucket: str, also_make_writable=False):
     """Make a bucket readable and optionally writable by everyone."""

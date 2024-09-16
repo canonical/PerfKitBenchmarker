@@ -56,6 +56,7 @@ cloud_spanner_ycsb:
     enable_freeze_restore: True
     vm_groups:
       default:
+        os_type: ubuntu2204  # Python 2
         vm_spec: *default_single_core
         vm_count: 1
   flags:
@@ -101,7 +102,7 @@ def CheckPrerequisites(_):
   """Validates correct flag usages before running this benchmark."""
   for scope in REQUIRED_SCOPES:
     if scope not in FLAGS.gcloud_scopes:
-      raise ValueError('Scope {0} required.'.format(scope))
+      raise ValueError('Scope {} required.'.format(scope))
   if ycsb.CPU_OPTIMIZATION.value and (
       ycsb.CPU_OPTIMIZATION_MEASUREMENT_MINS.value
       <= gcp_spanner.CPU_API_DELAY_MINUTES
@@ -222,6 +223,7 @@ def _BuildSchema():
 
 
 def _Install(vm):
+  """Installs YCSB on the VM."""
   vm.Install('ycsb')
 
   # Run custom VM installation commands.

@@ -15,8 +15,8 @@
 
 This collector collects activities for processors using mpstat.
 Samples are reported in the form of mpstat_{metric} or mpstat_avg_{metric}.
-mpstat_{metric} is the reported {metric} for the given mpstat_interval and
-mpstat_count for a specific cpu. The cpu id is reported in the sample metadata.
+mpstat_{metric} is the reported {metric} for the given mpstat_interval for a
+specific cpu. The cpu id is reported in the sample metadata.
 mpstat_avg_{metric} is the average of {metric} over all cpus.
 Currently, only aggregated statistics are reported. Specifically, intr/s, %usr,
 %nice, %sys, %iowait, %irq, %soft, %steal, %guest, %idle. Individual stats can
@@ -48,7 +48,7 @@ import datetime
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from absl import flags
 from perfkitbenchmarker import background_tasks
@@ -56,7 +56,6 @@ from perfkitbenchmarker import events
 from perfkitbenchmarker import sample
 from perfkitbenchmarker import stages
 from perfkitbenchmarker.traces import base_collector
-import six
 
 _MPSTAT = flags.DEFINE_boolean(
     'mpstat',
@@ -67,7 +66,7 @@ _MPSTAT = flags.DEFINE_boolean(
 _MPSTAT_BREAKDOWN = flags.DEFINE_enum(
     'mpstat_breakdown',
     'SUM',
-    ['SUM', 'CPU', 'ALL'],
+    ['SUM', 'SCPU', 'CPU', 'ALL'],
     'Level of aggregation for statistics. Accepted '
     'values are "SUM", "CPU", "ALL". Defaults to SUM. See '
     'https://linux.die.net/man/1/mpstat for details.',
@@ -79,13 +78,8 @@ _MPSTAT_CPUS = flags.DEFINE_string(
 )
 _MPSTAT_INTERVAL = flags.DEFINE_integer(
     'mpstat_interval',
-    1,
-    'The amount of time in seconds between each mpstat report.Defaults to 1.',
-)
-_MPSTAT_COUNT = flags.DEFINE_integer(
-    'mpstat_count',
-    1,
-    'The number of reports generated at interval apart.Defaults to 1.',
+    5,
+    'The amount of time in seconds between each mpstat report.Defaults to 5.',
 )
 _MPSTAT_PUBLISH = flags.DEFINE_boolean(
     'mpstat_publish', False, 'Whether to publish mpstat statistics.'
@@ -168,7 +162,7 @@ def _GetCPUAverageMetrics(
     host_stats: List[Dict[str, Any]],
     number_of_cpus: int,
     metadata: Dict[str, Any],
-    timestamp: Optional[float] = None,
+    timestamp: float | None = None,
 ):
   """Get average metrics for all CPUs.
 
@@ -242,7 +236,7 @@ def _GetCPUAverageInterruptions(
     host_stats: List[Dict[str, Any]],
     number_of_cpus: int,
     metadata: Dict[str, Any],
-    timestamp: Optional[float] = None,
+    timestamp: float | None = None,
 ):
   """Get average interruption for all CPUs.
 
@@ -410,12 +404,10 @@ class MpstatCollector(base_collector.BaseCollector):
     # time formatting from mpstat
     return (
         'export S_TIME_FORMAT=ISO; mpstat -I {breakdown} -u -P '
-        '{processor_number} {interval} {count} -o JSON > {output} 2>&1 &'
-        .format(
+        '{processor_number} {interval} -o JSON > {output} 2>&1 &'.format(
             breakdown=FLAGS.mpstat_breakdown,
             processor_number=FLAGS.mpstat_cpus,
             interval=self.interval,
-            count=FLAGS.mpstat_count,
             output=collector_file,
         )
     )
@@ -431,8 +423,7 @@ class MpstatCollector(base_collector.BaseCollector):
     def _Analyze(role, output):
       """Parse file and record samples."""
       with open(
-          os.path.join(self.output_directory, os.path.basename(output)), 'r'
-      ) as fp:
+          os.path.join(self.output_directory, os.path.basename(output))) as fp:
         output = json.loads(fp.read())
         metadata = {
             'event': 'mpstat',
@@ -448,7 +439,7 @@ class MpstatCollector(base_collector.BaseCollector):
         )
 
     background_tasks.RunThreaded(
-        _Analyze, [((k, w), {}) for k, w in six.iteritems(self._role_mapping)]
+        _Analyze, [((k, w), {}) for k, w in self._role_mapping.items()]
     )
 
 

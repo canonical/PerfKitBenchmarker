@@ -35,6 +35,13 @@ _RESOURCE_REGISTRY = {}
 RegisteredType = TypeVar('RegisteredType')
 ResourceType = type[RegisteredType]
 
+# Constants used for annotating resources with timeout metadata:
+# GCP labels only allow hyphens (-), underscores (_), lowercase characters, and
+# numbers and International characters.
+# metadata allow all characters and numbers.
+METADATA_TIME_FORMAT = '%Y%m%dt%H%M%Sz'
+TIMEOUT_METADATA_KEY = 'timeout_utc'
+
 
 def GetResourceClass(base_class: ResourceType, **kwargs) -> ResourceType:
   """Returns the subclass with the corresponding attributes.
@@ -64,7 +71,7 @@ class AutoRegisterResourceMeta(abc.ABCMeta):
     auto_registry.RegisterClass(
         _RESOURCE_REGISTRY, cls, cls.REQUIRED_ATTRS, cls.RESOURCE_TYPE
     )
-    super(AutoRegisterResourceMeta, cls).__init__(name, bases, dct)
+    super().__init__(name, bases, dct)
 
   @classmethod
   def GetAttributes(mcs) -> list[tuple[Any, ...]]:
@@ -114,7 +121,7 @@ class BaseResource(metaclass=AutoRegisterResourceMeta):
       create_on_restore_error=False,
       delete_on_freeze_error=False,
   ):
-    super(BaseResource, self).__init__()
+    super().__init__()
     # Class level attributes does not persist after pickle
     # Copy required attributes to the object
     for attribute in self.REQUIRED_ATTRS:

@@ -33,7 +33,7 @@ REDIS_VERSION_MAPPING = {
     'redis_4_0': '4.0.10',
     'redis_5_0': '5.0.6',
     'redis_6_x': '6.x',
-    'redis_7_x': '7.0',
+    'redis_7_x': '7.1',
 }
 
 
@@ -41,20 +41,20 @@ class ElastiCacheRedis(managed_memory_store.BaseManagedMemoryStore):
   """Object representing a AWS Elasticache redis instance."""
 
   CLOUD = provider_info.AWS
+  SERVICE_TYPE = 'elasticache'
   MEMORY_STORE = managed_memory_store.REDIS
 
   # AWS Clusters can take up to 2 hours to create
   READY_TIMEOUT = 120 * 60
 
   def __init__(self, spec):
-    super(ElastiCacheRedis, self).__init__(spec)
+    super().__init__(spec)
     self.subnet_group_name = 'subnet-%s' % self.name
-    self.version = REDIS_VERSION_MAPPING[spec.config.cloud_redis.redis_version]
+    self.version = REDIS_VERSION_MAPPING[spec.version]
     self.node_type = FLAGS.elasticache_node_type
     self.redis_region = FLAGS.cloud_redis_region
     self.failover_zone = FLAGS.elasticache_failover_zone
     self.failover_subnet = None
-    self.failover_style = FLAGS.redis_failover_style
 
     self.subnets = []
 
@@ -98,14 +98,14 @@ class ElastiCacheRedis(managed_memory_store.BaseManagedMemoryStore):
         ),
         'cloud_redis_node_type': self.node_type,
         'cloud_redis_region': self.redis_region,
-        'cloud_redis_primary_zone': self.spec.vms[0].zone,
+        'cloud_redis_primary_zone': self._GetClientVm().zone,
         'cloud_redis_failover_zone': self.failover_zone,
     })
     return self.metadata
 
   def _CreateDependencies(self):
     """Create the subnet dependencies."""
-    subnet_id = self.spec.vms[0].network.subnet.id
+    subnet_id = self._GetClientVm().network.subnet.id
     cmd = [
         'aws',
         'elasticache',
@@ -123,7 +123,7 @@ class ElastiCacheRedis(managed_memory_store.BaseManagedMemoryStore):
     if self.failover_style == (
         managed_memory_store.Failover.FAILOVER_SAME_REGION
     ):
-      regional_network = self.spec.vms[0].network.regional_network
+      regional_network = self._GetClientVm().network.regional_network
       vpc_id = regional_network.vpc.id
       cidr = regional_network.vpc.NextSubnetCidrBlock()
       self.failover_subnet = aws_network.AwsSubnet(
@@ -133,7 +133,7 @@ class ElastiCacheRedis(managed_memory_store.BaseManagedMemoryStore):
       cmd += [self.failover_subnet.id]
 
     # Subnets determine where shards can be placed.
-    regional_network = self.spec.vms[0].network.regional_network
+    regional_network = self._GetClientVm().network.regional_network
     vpc_id = regional_network.vpc.id
     for zone in self.zones:
       cidr = regional_network.vpc.NextSubnetCidrBlock()
@@ -184,7 +184,7 @@ class ElastiCacheRedis(managed_memory_store.BaseManagedMemoryStore):
     ]
 
     if not self._clustered:
-      cmd += ['--preferred-cache-cluster-a-zs', self.spec.vms[0].zone]
+      cmd += ['--preferred-cache-cluster-a-zs', self._GetClientVm().zone]
       if (
           self.failover_style
           == managed_memory_store.Failover.FAILOVER_SAME_REGION
@@ -194,11 +194,19 @@ class ElastiCacheRedis(managed_memory_store.BaseManagedMemoryStore):
           self.failover_style
           == managed_memory_store.Failover.FAILOVER_SAME_ZONE
       ):
-        cmd += [self.spec.vms[0].zone]
+        cmd += [self._GetClientVm().zone]
       if self.failover_style != managed_memory_store.Failover.FAILOVER_NONE:
         cmd += ['--automatic-failover-enabled', '--num-cache-clusters', '2']
     else:
-      cmd += ['--num-node-groups', str(self.node_count)]
+      cmd += [
+          '--num-node-groups',
+          str(self.shard_count),
+          '--replicas-per-node-group',
+          str(self.replicas_per_shard),
+      ]
+
+    if len(self.zones) > 1:
+      cmd.append('--multi-az-enabled')
 
     if self.enable_tls:
       cmd += [

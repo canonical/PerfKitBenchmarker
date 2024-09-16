@@ -15,7 +15,9 @@
 
 import json
 import unittest
+from unittest import mock
 from absl import flags
+from absl.testing import parameterized
 from perfkitbenchmarker.providers.gcp import bigquery
 from tests import pkb_common_test_case
 
@@ -34,14 +36,28 @@ _BASE_BIGQUERY_SPEC = {
 FLAGS = flags.FLAGS
 
 
-class FakeRemoteVM(object):
+EDW_SERVICE_SPEC = mock.Mock(
+    snapshot=None,
+    concurrency=5,
+    node_type=None,
+    node_count=1,
+    endpoint=None,
+    db=None,
+    user=None,
+    password=None,
+    type='bqfederated',
+    cluster_identifier='proj.dataset',
+)
+
+
+class FakeRemoteVM:
 
   def Install(self, package_name):
     if package_name != 'google_cloud_sdk':
       raise RuntimeError
 
 
-class FakeRemoteVMForCliClientInterfacePrepare(object):
+class FakeRemoteVMForCliClientInterfacePrepare:
   """Class to setup a Fake VM that prepares a Client VM (CLI Client)."""
 
   def __init__(self):
@@ -74,7 +90,7 @@ class FakeRemoteVMForCliClientInterfacePrepare(object):
     pass
 
 
-class FakeRemoteVMForCliClientInterfaceExecuteQuery(object):
+class FakeRemoteVMForCliClientInterfaceExecuteQuery:
   """Class to setup a Fake VM that executes script on Client VM (CLI Client)."""
 
   def RemoteCommand(self, command):
@@ -92,7 +108,7 @@ class FakeRemoteVMForCliClientInterfaceExecuteQuery(object):
     return response, None
 
 
-class FakeRemoteVMForJavaClientInterfacePrepare(object):
+class FakeRemoteVMForJavaClientInterfacePrepare:
   """Class to setup a Fake VM that prepares a Client VM (JAVA Client)."""
 
   def __init__(self):
@@ -115,7 +131,7 @@ class FakeRemoteVMForJavaClientInterfacePrepare(object):
       raise RuntimeError
 
 
-class FakeRemoteVMForJavaClientInterfaceExecuteQuery(object):
+class FakeRemoteVMForJavaClientInterfaceExecuteQuery:
   """Class to setup a Fake VM that executes script on Client VM (JAVA Client)."""
 
   def RemoteCommand(self, command):
@@ -123,7 +139,7 @@ class FakeRemoteVMForJavaClientInterfaceExecuteQuery(object):
       return None, None
 
     expected_command = (
-        'java -cp bq-java-client-2.16.jar '
+        'java -Xmx6g -cp bq-jdbc-simba-client-1.2.jar '
         'com.google.cloud.performance.edw.Single --project {} '
         '--credentials_file {} --dataset {} --query_file '
         '{}'
@@ -138,7 +154,7 @@ class FakeRemoteVMForJavaClientInterfaceExecuteQuery(object):
     return response, None
 
 
-class FakeBenchmarkSpec(object):
+class FakeBenchmarkSpec:
   """Fake BenchmarkSpec to use for setting client interface attributes."""
 
   def __init__(self, client_vm):
@@ -149,7 +165,7 @@ class FakeBenchmarkSpec(object):
 class BigqueryTestCase(pkb_common_test_case.PkbCommonTestCase):
 
   def setUp(self):
-    super(BigqueryTestCase, self).setUp()
+    super().setUp()
     FLAGS.cloud = 'GCP'
     FLAGS.run_uri = _TEST_RUN_URI
     FLAGS.zones = [_GCP_ZONE_US_CENTRAL_1_C]
@@ -220,6 +236,72 @@ class BigqueryTestCase(pkb_common_test_case.PkbCommonTestCase):
     performance, details = interface.ExecuteQuery(QUERY_NAME)
     self.assertEqual(performance, 1.0)
     self.assertDictEqual(details, {'client': 'JAVA', 'job_id': 'JOB_ID'})
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name='NoLocationNoTableFormat',
+          cluster_identifier=(
+              'mybqfederated.tpcds1000_parquet_compressed_partitioned_gcs'
+          ),
+          expected_fields={
+              'format': 'parquet',
+              'table_format': 'None',
+              'compression': 'compressed',
+              'partitioning': 'partitioned',
+              'storage': 'gcs',
+              'location': 'us',
+          },
+      ),
+      dict(
+          testcase_name='NoTableFormat',
+          cluster_identifier=(
+              'mybqfederated.tpcds1000_parquet_snappy_part_gcs_uscentral1'
+          ),
+          expected_fields={
+              'format': 'parquet',
+              'table_format': 'None',
+              'compression': 'snappy',
+              'partitioning': 'part',
+              'storage': 'gcs',
+              'location': 'uscentral1',
+          },
+      ),
+      dict(
+          testcase_name='WithTableFormat',
+          cluster_identifier=(
+              'mybqfederated.tpcds1000_parquet_iceberg_snappy_part_gcs_us'
+          ),
+          expected_fields={
+              'format': 'parquet',
+              'table_format': 'iceberg',
+              'compression': 'snappy',
+              'partitioning': 'part',
+              'storage': 'gcs',
+              'location': 'us',
+          },
+      ),
+      dict(
+          testcase_name='UnparseableClusterId',
+          cluster_identifier='mybqfederated.yolo',
+          expected_fields={
+              'format': 'unknown',
+              'table_format': 'unknown',
+              'compression': 'unknown',
+              'partitioning': 'unknown',
+              'storage': 'unknown',
+              'location': 'unknown',
+          },
+      ),
+  )
+  def testBqFederatedGetDataDetail(
+      self,
+      cluster_identifier: str,
+      expected_fields: dict[str, str],
+  ):
+    EDW_SERVICE_SPEC.cluster_identifier = cluster_identifier
+    edw = bigquery.Bqfederated(EDW_SERVICE_SPEC)
+    data_details = edw.GetDataDetails()
+    self.assertEqual(data_details, data_details | expected_fields)
 
 
 if __name__ == '__main__':

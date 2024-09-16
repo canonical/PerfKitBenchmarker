@@ -78,6 +78,7 @@ kubernetes_mongodb:
   vm_groups:
     clients:
       vm_spec: *default_single_core
+      os_type: ubuntu2204  # Python 2
       vm_count: null
 """
 
@@ -106,7 +107,7 @@ def _PrepareClient(vm):
   log_config = """<configuration><root level="WARN"/></configuration>"""
 
   vm.RemoteCommand(
-      "echo '{0}' > {1}/logback.xml".format(log_config, ycsb.YCSB_DIR)
+      "echo '{}' > {}/logback.xml".format(log_config, ycsb.YCSB_DIR)
   )
 
 

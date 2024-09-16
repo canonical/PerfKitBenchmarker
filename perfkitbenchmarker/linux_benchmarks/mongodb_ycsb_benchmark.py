@@ -86,6 +86,7 @@ mongodb_ycsb:
       vm_spec: *default_single_core
       vm_count: 1
     clients:
+      os_type: ubuntu2204  # Python 2
       vm_spec: *default_single_core
       vm_count: 1
   flags:
@@ -207,7 +208,7 @@ def _PrepareClient(vm: _LinuxVM) -> None:
   log_config = """<configuration><root level="WARN"/></configuration>"""
 
   vm.RemoteCommand(
-      "echo '{0}' > {1}/logback.xml".format(log_config, ycsb.YCSB_DIR)
+      "echo '{}' > {}/logback.xml".format(log_config, ycsb.YCSB_DIR)
   )
 
 

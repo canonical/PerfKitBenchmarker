@@ -598,9 +598,9 @@ def RunNetperf(vm, benchmark_name, server_ips, num_streams, client_ips):
     # Unzip parsed output
     # Note that latency_samples are invalid with multiple threads because stats
     # are computed per-thread by netperf, so we don't use them here.
-    throughput_samples, _, latency_histograms = [
+    throughput_samples, _, latency_histograms = (
         list(t) for t in zip(*parsed_output)
-    ]
+    )
     # They should all have the same units
     throughput_unit = throughput_samples[0].unit
     # Extract the throughput values from the samples

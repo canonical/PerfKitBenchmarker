@@ -25,7 +25,7 @@ import random
 import re
 import statistics
 import time
-from typing import Any, Dict, List, Optional, Text, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 
 from absl import flags
 from absl import logging
@@ -80,7 +80,7 @@ MEMTIER_LARGE_CLUSTER = flags.DEFINE_bool(
 )
 
 
-class MemtierMode(object):
+class MemtierMode:
   """Enum of options for --memtier_run_mode."""
 
   MEASURE_CPU_LATENCY = 'MEASURE_CPU_LATENCY'
@@ -120,6 +120,15 @@ MEMTIER_REQUESTS = flags.DEFINE_integer(
     (
         'Mutually exclusive with memtier_run_duration. Number of total requests'
         ' per client. Defaults to 10000.'
+    ),
+)
+MEMTIER_EXPIRY_RANGE = flags.DEFINE_string(
+    'memtier_expiry_range',
+    None,
+    (
+        'Use random expiry values from the specified range. '
+        'Must be expressed as [0-n]-[1-n]. Applies for keys created when '
+        'loading the db and when running the memtier benchmark. '
     ),
 )
 flag_util.DEFINE_integerlist(
@@ -293,11 +302,11 @@ def YumInstall(vm):
   vm.Install('build_tools')
   vm.InstallPackages(YUM_PACKAGES)
 
-  vm.RemoteCommand('git clone {0} {1}'.format(GIT_REPO, MEMTIER_DIR))
-  vm.RemoteCommand('cd {0} && git checkout {1}'.format(MEMTIER_DIR, GIT_TAG))
+  vm.RemoteCommand('git clone {} {}'.format(GIT_REPO, MEMTIER_DIR))
+  vm.RemoteCommand('cd {} && git checkout {}'.format(MEMTIER_DIR, GIT_TAG))
   pkg_config = 'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH}'
   vm.RemoteCommand(
-      'cd {0} && autoreconf -ivf && {1} ./configure && '
+      'cd {} && autoreconf -ivf && {} ./configure && '
       'sudo make install'.format(MEMTIER_DIR, pkg_config)
   )
 
@@ -306,8 +315,8 @@ def AptInstall(vm):
   """Installs the memtier package on the VM."""
   vm.Install('build_tools')
   vm.InstallPackages(APT_PACKAGES)
-  vm.RemoteCommand('git clone {0} {1}'.format(GIT_REPO, MEMTIER_DIR))
-  vm.RemoteCommand('cd {0} && git checkout {1}'.format(MEMTIER_DIR, GIT_TAG))
+  vm.RemoteCommand('git clone {} {}'.format(GIT_REPO, MEMTIER_DIR))
+  vm.RemoteCommand('cd {} && git checkout {}'.format(MEMTIER_DIR, GIT_TAG))
   if MEMTIER_LARGE_CLUSTER.value:
     vm.RemoteCommand(f'rm -rf {MEMTIER_DIR}')
     vm.InstallPreprovisionedPackageData(
@@ -317,7 +326,7 @@ def AptInstall(vm):
         f'tar -C {MEMTIER_DIR} -xvzf {MEMTIER_DIR}/{_LARGE_CLUSTER_TAR}'
     )
   vm.RemoteCommand(
-      'cd {0} && autoreconf -ivf && ./configure && sudo make install'.format(
+      'cd {} && autoreconf -ivf && ./configure && sudo make install'.format(
           MEMTIER_DIR
       )
   )
@@ -325,7 +334,7 @@ def AptInstall(vm):
 
 def _Uninstall(vm):
   """Uninstalls the memtier package on the VM."""
-  vm.RemoteCommand('cd {0} && sudo make uninstall'.format(MEMTIER_DIR))
+  vm.RemoteCommand('cd {} && sudo make uninstall'.format(MEMTIER_DIR))
 
 
 def YumUninstall(vm):
@@ -339,28 +348,29 @@ def AptUninstall(vm):
 
 
 def BuildMemtierCommand(
-    server: Optional[str] = None,
-    port: Optional[int] = None,
-    protocol: Optional[str] = None,
-    clients: Optional[int] = None,
-    threads: Optional[int] = None,
-    ratio: Optional[str] = None,
-    data_size: Optional[int] = None,
-    data_size_list: Optional[str] = None,
-    pipeline: Optional[int] = None,
-    key_minimum: Optional[int] = None,
-    key_maximum: Optional[int] = None,
-    key_pattern: Optional[str] = None,
-    requests: Optional[Union[str, int]] = None,
-    run_count: Optional[int] = None,
-    random_data: Optional[bool] = None,
-    test_time: Optional[int] = None,
-    outfile: Optional[pathlib.PosixPath] = None,
-    password: Optional[str] = None,
-    cluster_mode: Optional[bool] = None,
-    shard_addresses: Optional[str] = None,
-    tls: Optional[bool] = None,
-    json_out_file: Optional[pathlib.PosixPath] = None,
+    server: str | None = None,
+    port: int | None = None,
+    protocol: str | None = None,
+    clients: int | None = None,
+    threads: int | None = None,
+    ratio: str | None = None,
+    data_size: int | None = None,
+    data_size_list: str | None = None,
+    pipeline: int | None = None,
+    key_minimum: int | None = None,
+    key_maximum: int | None = None,
+    key_pattern: str | None = None,
+    requests: Union[str, int] | None = None,
+    run_count: int | None = None,
+    random_data: bool | None = None,
+    test_time: int | None = None,
+    outfile: pathlib.PosixPath | None = None,
+    password: str | None = None,
+    cluster_mode: bool | None = None,
+    shard_addresses: str | None = None,
+    tls: bool | None = None,
+    expiry_range: str | None = None,
+    json_out_file: pathlib.PosixPath | None = None,
 ) -> str:
   """Returns command arguments used to run memtier."""
   # Arguments passed with a parameter
@@ -388,12 +398,16 @@ def BuildMemtierCommand(
     args['data-size-list'] = data_size_list
   else:
     args['data-size'] = data_size
+  if expiry_range:
+    args['expiry-range'] = expiry_range
   # Arguments passed without a parameter
   no_param_args = {
       'random-data': random_data,
       'cluster-mode': cluster_mode,
       'tls': tls,
-      'tls-skip-verify': tls,
+      # Don't skip certificate verification by default. keydb_memtier_benchmark
+      # does this by hacking in ca args into the server ip.
+      'tls-skip-verify': tls and FLAGS.cloud_redis_tls,
   }
   # Build the command
   cmd = []
@@ -438,6 +452,7 @@ def _LoadSingleVM(
       cluster_mode=MEMTIER_CLUSTER_MODE.value,
       password=request.server_password,
       tls=MEMTIER_TLS.value,
+      expiry_range=MEMTIER_EXPIRY_RANGE.value,
   )
   load_vm.RemoteCommand(cmd)
 
@@ -446,7 +461,7 @@ def Load(
     vms: list[virtual_machine.VirtualMachine],
     server_ip: str,
     server_port: int,
-    server_password: Optional[str] = None,
+    server_password: str | None = None,
 ) -> None:
   """Loads the database before performing tests."""
   load_requests = []
@@ -480,7 +495,7 @@ def RunOverAllClientVMs(
     pipeline,
     threads,
     clients,
-    password: Optional[str] = None,
+    password: str | None = None,
 ) -> 'List[MemtierResult]':
   """Run redis memtier on all client vms.
 
@@ -530,7 +545,7 @@ def RunOverAllThreadsPipelinesAndClients(
     client_vms,
     server_ip: str,
     server_ports: List[int],
-    password: Optional[str] = None,
+    password: str | None = None,
 ) -> List[sample.Sample]:
   """Runs memtier over all pipeline and thread combinations."""
   samples = []
@@ -583,7 +598,7 @@ def _RunParallelConnections(
     threads: int,
     clients: int,
     pipelines: int,
-    password: Optional[str] = None,
+    password: str | None = None,
 ) -> list['MemtierResult']:
   """Runs memtier in parallel with the given connections."""
   run_args = []
@@ -741,7 +756,7 @@ def _BinarySearchForLatencyCappedThroughput(
     load_modifiers: list[_LoadModifier],
     server_ip: str,
     server_port: int,
-    password: Optional[str] = None,
+    password: str | None = None,
 ) -> list['MemtierResult']:
   """Runs memtier to find the maximum throughput under a latency cap."""
   results = []
@@ -814,7 +829,7 @@ def MeasureLatencyCappedThroughput(
     server_shard_count: int,
     server_ip: str,
     server_port: int,
-    password: Optional[str] = None,
+    password: str | None = None,
 ) -> List[sample.Sample]:
   """Runs memtier to find the maximum throughput under a latency cap."""
   max_threads = client_vm.NumCpusForBenchmark(report_only_physical_cpus=True)
@@ -848,7 +863,7 @@ def MeasureLatencyCappedThroughputDistribution(
     server_port: int,
     client_vms: list[virtual_machine.VirtualMachine],
     server_shard_count: int,
-    password: Optional[str] = None,
+    password: str | None = None,
 ) -> list[sample.Sample]:
   """Measures distribution of throughput across several iterations.
 
@@ -1097,9 +1112,9 @@ def _Run(
     threads: int,
     pipeline: int,
     clients: int,
-    password: Optional[str] = None,
-    unique_id: Optional[str] = None,
-    shard_addresses: Optional[str] = None,
+    password: str | None = None,
+    unique_id: str | None = None,
+    shard_addresses: str | None = None,
 ) -> 'MemtierResult':
   """Runs the memtier benchmark on the vm."""
   logging.info(
@@ -1175,7 +1190,7 @@ def _Run(
     json_path = os.path.join(vm_util.GetTempDir(), json_results_file_name)
     vm_util.IssueCommand(['rm', '-f', json_path])
     vm.PullFile(vm_util.GetTempDir(), json_results_file)
-    with open(json_path, 'r') as ts_json:
+    with open(json_path) as ts_json:
       time_series_json = ts_json.read()
       if not time_series_json:
         logging.warning('No metrics in time series json.')
@@ -1192,7 +1207,7 @@ def _Run(
         )
         time_series_json = json.loads(time_series_json)
 
-  with open(output_path, 'r') as output:
+  with open(output_path) as output:
     summary_data = output.read()
     logging.info(summary_data)
   return MemtierResult.Parse(summary_data, time_series_json)
@@ -1204,6 +1219,7 @@ def GetMetadata(clients: int, threads: int, pipeline: int) -> Dict[str, Any]:
       'memtier_protocol': MEMTIER_PROTOCOL.value,
       'memtier_run_count': MEMTIER_RUN_COUNT.value,
       'memtier_requests': MEMTIER_REQUESTS.value,
+      'memtier_expiry_range': MEMTIER_EXPIRY_RANGE.value,
       'memtier_threads': threads,
       'memtier_clients': clients,
       'memtier_ratio': MEMTIER_RATIO.value,
@@ -1213,6 +1229,7 @@ def GetMetadata(clients: int, threads: int, pipeline: int) -> Dict[str, Any]:
       'memtier_version': GIT_TAG,
       'memtier_run_mode': MEMTIER_RUN_MODE.value,
       'memtier_cluster_mode': MEMTIER_CLUSTER_MODE.value,
+      'memtier_tls': MEMTIER_TLS.value,
   }
   if MEMTIER_DATA_SIZE_LIST.value:
     meta['memtier_data_size_list'] = MEMTIER_DATA_SIZE_LIST.value
@@ -1248,13 +1265,13 @@ class MemtierResult:
   ops_series: List[int] = dataclasses.field(default_factory=list)
   latency_series: Dict[str, List[int]] = dataclasses.field(default_factory=dict)
 
-  runtime_info: Dict[Text, Text] = dataclasses.field(default_factory=dict)
+  runtime_info: Dict[str, str] = dataclasses.field(default_factory=dict)
   metadata: Dict[str, Any] = dataclasses.field(default_factory=dict)
   parameters: MemtierBinarySearchParameters = MemtierBinarySearchParameters()
 
   @classmethod
   def Parse(
-      cls, memtier_results: Text, time_series_json: Optional[Dict[Any, Any]]
+      cls, memtier_results: str, time_series_json: Dict[Any, Any] | None
   ) -> 'MemtierResult':
     """Parse memtier_benchmark result textfile and return results.
 
@@ -1316,7 +1333,7 @@ class MemtierResult:
     )
 
   def GetSamples(
-      self, metadata: Optional[Dict[str, Any]] = None
+      self, metadata: Dict[str, Any] | None = None
   ) -> List[sample.Sample]:
     """Return this result as a list of samples."""
     if metadata:
@@ -1521,7 +1538,7 @@ def AggregateMemtierResults(
 
 
 def _ParseHistogram(
-    memtier_results: Text,
+    memtier_results: str,
 ) -> Tuple[MemtierHistogram, MemtierHistogram]:
   """Parses the 'Request Latency Distribution' section of memtier output."""
   set_histogram = []
@@ -1555,7 +1572,7 @@ class MemtierAggregateResult:
 
 
 def _ParseTotalThroughputAndLatency(
-    memtier_results: Text,
+    memtier_results: str,
 ) -> 'MemtierAggregateResult':
   """Parses the 'TOTALS' output line and return throughput and latency."""
   columns = None
@@ -1633,7 +1650,7 @@ def _ConvertPercentToAbsolute(total_value: int, percent: float) -> float:
 
 
 def _ParseTimeSeries(
-    time_series_json: Optional[Dict[Any, Any]]
+    time_series_json: Dict[Any, Any] | None,
 ) -> Tuple[List[int], List[int], Dict[str, List[int]]]:
   """Parse time series ops throughput from json output."""
   timestamps = []
@@ -1690,7 +1707,7 @@ def _ParseTimeSeries(
   )
 
 
-def _GetRuntimeInfo(time_series_json: Optional[Dict[Any, Any]]):
+def _GetRuntimeInfo(time_series_json: Dict[Any, Any] | None):
   """Fetch runtime info (i.e start, end times and duration) from json output."""
   runtime_info = {}
   if time_series_json:
