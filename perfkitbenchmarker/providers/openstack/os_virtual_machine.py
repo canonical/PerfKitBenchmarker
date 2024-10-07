@@ -440,34 +440,26 @@ class OpenStackVirtualMachine(virtual_machine.BaseVirtualMachine):
     return result
 
 
-class Rhel7BasedOpenStackVirtualMachine(
-    OpenStackVirtualMachine, linux_virtual_machine.Rhel7Mixin
+class Ubuntu1804BasedOpenStackVirtualMachine(
+    OpenStackVirtualMachine, linux_virtual_machine.Ubuntu1804Mixin
 ):
-  DEFAULT_IMAGE = 'rhel-7.2'
-
-
-class CentOs7BasedOpenStackVirtualMachine(
-    OpenStackVirtualMachine, linux_virtual_machine.CentOs7Mixin
-):
-  DEFAULT_IMAGE = 'centos7'
-
-
-class Ubuntu1804BasedOpenStackVirtualMachine(OpenStackVirtualMachine,
-                                          linux_virtual_machine.Ubuntu1804Mixin):
   DEFAULT_IMAGE = 'ubuntu1804'
 
 
-class Ubuntu2004BasedOpenStackVirtualMachine(OpenStackVirtualMachine,
-                                          linux_virtual_machine.Ubuntu2004Mixin):
+class Ubuntu2004BasedOpenStackVirtualMachine(
+    OpenStackVirtualMachine, linux_virtual_machine.Ubuntu2004Mixin
+):
   DEFAULT_IMAGE = 'ubuntu2004'
 
 
-class Ubuntu2204BasedOpenStackVirtualMachine(OpenStackVirtualMachine,
-                                          linux_virtual_machine.Ubuntu2204Mixin):
+class Ubuntu2204BasedOpenStackVirtualMachine(
+    OpenStackVirtualMachine, linux_virtual_machine.Ubuntu2204Mixin
+):
   DEFAULT_IMAGE = 'ubuntu2204'
 
-class Ubuntu2404BasedOpenStackVirtualMachine(OpenStackVirtualMachine,
-                                          linux_virtual_machine.Ubuntu2204Mixin):
+class Ubuntu2404BasedOpenStackVirtualMachine(
+    OpenStackVirtualMachine, linux_virtual_machine.Ubuntu2204Mixin
+):
   DEFAULT_IMAGE = 'ubuntu2404'
 
 class ClearBasedOpenStackVirtualMachine(
