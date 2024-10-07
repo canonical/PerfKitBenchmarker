@@ -457,10 +457,10 @@ class Ubuntu2204BasedOpenStackVirtualMachine(
 ):
   DEFAULT_IMAGE = 'ubuntu2204'
 
-class Ubuntu2404BasedOpenStackVirtualMachine(
-    OpenStackVirtualMachine, linux_virtual_machine.Ubuntu2204Mixin
-):
-  DEFAULT_IMAGE = 'ubuntu2404'
+# class Ubuntu2404BasedOpenStackVirtualMachine(
+#     OpenStackVirtualMachine, linux_virtual_machine.Ubuntu2404Mixin
+# ):
+#   DEFAULT_IMAGE = 'ubuntu2404'
 
 class ClearBasedOpenStackVirtualMachine(
     OpenStackVirtualMachine, linux_virtual_machine.ClearMixin
