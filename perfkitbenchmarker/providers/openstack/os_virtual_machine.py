@@ -29,8 +29,14 @@ import threading
 
 from absl import flags
 
-from perfkitbenchmarker import (disk_strategies, errors, linux_virtual_machine,
-                                provider_info, virtual_machine, vm_util)
+from perfkitbenchmarker import (
+  disk_strategies,
+  errors,
+  linux_virtual_machine,
+  provider_info,
+  virtual_machine,
+  vm_util,
+)
 from perfkitbenchmarker.providers.openstack import os_disk, os_network
 from perfkitbenchmarker.providers.openstack import utils as os_utils
 
@@ -438,12 +444,6 @@ class OpenStackVirtualMachine(virtual_machine.BaseVirtualMachine):
     if self.post_provisioning_script:
       result['post_provisioning_script'] = self.post_provisioning_script
     return result
-
-
-class Ubuntu1804BasedOpenStackVirtualMachine(
-    OpenStackVirtualMachine, linux_virtual_machine.Ubuntu1804Mixin
-):
-  DEFAULT_IMAGE = 'ubuntu1804'
 
 
 class Ubuntu2004BasedOpenStackVirtualMachine(
