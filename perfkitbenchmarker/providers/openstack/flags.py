@@ -88,6 +88,12 @@ flags.DEFINE_string(
 )
 
 flags.DEFINE_string(
+    'openstack_volume_zone',
+    default=None,
+    help='Optional volume availability zone to use.',
+)
+
+flags.DEFINE_string(
     'openstack_image_username', 'ubuntu', 'Ssh username for cloud image'
 )
 

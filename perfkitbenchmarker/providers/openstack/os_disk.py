@@ -14,11 +14,10 @@
 
 import json
 import logging
+
 from absl import flags
-from perfkitbenchmarker import disk
-from perfkitbenchmarker import errors
-from perfkitbenchmarker import provider_info
-from perfkitbenchmarker import vm_util
+
+from perfkitbenchmarker import disk, errors, provider_info, vm_util
 from perfkitbenchmarker.configs import option_decoders
 from perfkitbenchmarker.providers.openstack import utils as os_utils
 
@@ -30,7 +29,10 @@ STANDARD = 'standard'
 def CreateVolume(resource, name):
   """Creates a remote (Cinder) block volume."""
   vol_cmd = os_utils.OpenStackCLICommand(resource, 'volume', 'create', name)
-  vol_cmd.flags['availability-zone'] = resource.zone
+  if zone:=FLAGS.openstack_volume_zone:
+    vol_cmd.flags['availability-zone'] = zone
+  else:
+    vol_cmd.flags['availability-zone'] = resource.zone
   vol_cmd.flags['size'] = resource.disk_size
   if FLAGS.openstack_volume_type:
     vol_cmd.flags['type'] = FLAGS.openstack_volume_type
@@ -42,6 +44,10 @@ def CreateVolume(resource, name):
 def CreateBootVolume(resource, name, image):
   """Creates a remote (Cinder) block volume with a boot image."""
   vol_cmd = os_utils.OpenStackCLICommand(resource, 'volume', 'create', name)
+  if zone:=FLAGS.openstack_volume_zone:
+    vol_cmd.flags['availability-zone'] = zone
+  else:
+    vol_cmd.flags['availability-zone'] = resource.zone
   vol_cmd.flags['availability-zone'] = resource.zone
   vol_cmd.flags['image'] = image
   vol_cmd.flags['size'] = resource.disk_size or GetImageMinDiskSize(
