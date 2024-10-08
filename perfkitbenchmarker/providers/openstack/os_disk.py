@@ -73,7 +73,12 @@ def GetImageMinDiskSize(resource, image):
 def DeleteVolume(resource, volume_id):
   """Deletes a remote (Cinder) block volume."""
   vol_cmd = os_utils.OpenStackCLICommand(
-      resource, 'volume', 'delete', volume_id
+      resource, 'volume', 'set', '--detached', volume_id
+  )
+  del vol_cmd.flags['format']  # volume delete does not support json output
+  vol_cmd.Issue()
+  vol_cmd = os_utils.OpenStackCLICommand(
+      resource, 'volume', 'delete', volume_id, '--force'
   )
   del vol_cmd.flags['format']  # volume delete does not support json output
   vol_cmd.Issue()
