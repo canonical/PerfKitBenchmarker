@@ -146,14 +146,14 @@ BENCHMARK_CONFIG = """
 nginx:
   description: Benchmarks Nginx server performance.
   vm_groups:
-    clients:
-      vm_spec: *default_single_core
-      vm_count: null
     server:
       vm_spec: *default_single_core
     upstream_servers:
       vm_spec: *default_dual_core
-      vm_count: 10
+      vm_count: 6
+    clients:
+      vm_spec: *default_single_core
+      vm_count: null
 """
 
 _CONTENT_FILENAME = 'random_content'
@@ -315,7 +315,7 @@ def _TuneNetworkStack(vm):
   """Tune the network stack to improve throughput.
 
   These settings are based on the recommendations in
-  https://learn.arm.com/learning-paths/servers-and-cloud-computing/nginx_tune.
+  https://armkeil.blob.core.windows.net/developer/Files/pdf/white-paper/guidelines-for-deploying-nginx-plus-on-aws.pdf.
 
   Args:
     vm: The VM to tune.

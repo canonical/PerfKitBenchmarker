@@ -18,7 +18,6 @@ Man: http://manpages.ubuntu.com/manpages/natty/man1/fio.1.html
 Quick howto: http://www.bluestop.org/fio/HOWTO.txt
 """
 
-import itertools
 import json
 import logging
 import posixpath
@@ -27,13 +26,10 @@ import time
 from typing import Any
 
 import jinja2
-from absl import flags
 
 from perfkitbenchmarker import (background_tasks, configs, data, errors,
-                                flag_util, os_types, sample, units, vm_util)
-from perfkitbenchmarker.linux_packages import fio, numactl
-from perfkitbenchmarker.providers.openstack.utils import \
-    wait_for_sync_manager_green_light
+                                flag_util, sample, units, vm_util)
+from perfkitbenchmarker.linux_packages import fio
 
 PKB_FIO_LOG_FILE_NAME = 'pkb_fio_avg'
 LOCAL_JOB_FILE_SUFFIX = '_fio.job'  # used with vm_util.PrependTempDir()
@@ -111,12 +107,6 @@ flags.DEFINE_list(
     '--fio_jobfile.   You can also specify a scenario in the '
     'format accesspattern_blocksize_operation_workingset '
     'for a custom workload.',
-)
-flags.DEFINE_bool(
-    'fio_pinning',
-    False,
-    'Use in conjunction with fio_generate_scenarios. Any scenario is split '
-    'across raw disk and numa nodes and raw disks are pinned to numa nodes.',
 )
 flags.DEFINE_bool(
     'fio_use_default_scenarios',
@@ -350,7 +340,7 @@ group_reporting=1
 {%- endfor %}
 {%- for scenario in scenarios %}
 
-{%- for pair in disk_numa_pair %}
+{%- for pair in disks_list %}
 
 [{{scenario['name']}}-io-depth-{{scenario['iodepth']}}-num-jobs-{{scenario['numjobs']}}{%- if scenario['target_raw_device'] == True %}.{{pair['index']}}{%- endif%}]
 {%- if pair['index'] == 0 %}
@@ -376,18 +366,6 @@ size={{scenario['size']}}
 numjobs={{scenario['numjobs']}}
 {%- if scenario['rate'] is defined %}
 rate={{scenario['rate']}}
-{%- endif%}
-{%- if scenario['iodepth_batch_submit'] is defined %}
-iodepth_batch_submit={{scenario['iodepth_batch_submit']}}
-{%- endif%}
-{%- if scenario['iodepth_batch_complete_max'] is defined %}
-iodepth_batch_complete_max={{scenario['iodepth_batch_complete_max']}}
-{%- endif%}
-{%- if scenario['numa_cpu_nodes'] is defined %}
-numa_cpu_nodes={{scenario['numa_cpu_nodes']}}
-{%- endif%}
-{%- if pair['numa_cpu_nodes'] is defined %}
-numa_cpu_nodes={{pair['numa_cpu_nodes']}}
 {%- endif%}
 {%- if pair['disk_filename'] is defined %}
 filename={{pair['disk_filename']}}
@@ -560,7 +538,6 @@ def GenerateJobFileString(
     ramptime: int,
     direct: bool,
     parameters: list[str],
-    numa_nodes: list[int],
     raw_files: list[str],
     require_merge: bool,
 ) -> str:
@@ -578,7 +555,6 @@ def GenerateJobFileString(
       logging any performance numbers.
     direct: boolean. Whether to use direct IO.
     parameters: list. Other fio parameters to be applied to all jobs.
-    numa_nodes: list. List of NUMA nodes.
     raw_files: A list of raw device paths.
     require_merge: Whether the jobs will be merged to be reported later.
 
@@ -641,49 +617,15 @@ def GenerateJobFileString(
           scenario_copy['numjobs'] = num_job
           jinja_scenarios.append(scenario_copy)
 
-  # Use NUMA-aware configs to better represent modern workloads such as
-  # databases. Following best practices suggested by
-  # https://cloud.google.com/compute/docs/disks/benchmark-hyperdisk-performance#prepare_for_testing.
-  # The following ensures proper use of NUMA locality. HdX NVME-to-CPU not
-  # used in the 1-NUMA case.
-
-  # any setup has at least 1 disk and 1 numa. So index 0 is always present.
-  # This (index) is also used to signal the jobfile to stonewall.
-  # We do not enumerate node and disk here because
-  # we only do it if we want to pin node and disks together.
-  disk_numa_pair = [{'index': 0}]
+  disks_list = [{'index': 0}]
 
   for scenario in jinja_scenarios:
     if _FIO_RATE_BANDWIDTH_LIMIT.value:
       scenario['rate'] = _FIO_RATE_BANDWIDTH_LIMIT.value
-    scenario['iodepth_batch_submit'] = scenario['iodepth']
-    scenario['iodepth_batch_complete_max'] = scenario['iodepth']
     scenario['target_raw_device'] = require_merge
 
-    # There are two ways to really work a disk:
-    # 1. you can create many jobs, each of which is pinned to a different numa
-    #    and/or a different raw disk. These jobs are not stonewalled so they
-    #    all run simultaneously.
-    # 2. you can create 1 job, which is set to use all numa nodes and targets
-    #    all (striped or no) disks.
-    if require_merge and FLAGS.fio_pinning:
-      if numa_nodes != [0]:
-        # spread raw disks across numas
-        raw_disk_numa_pairs = (
-            zip(numa_nodes, raw_files)
-            if len(numa_nodes) >= len(raw_files)
-            else zip(itertools.cycle(numa_nodes), raw_files)
-        )
-        disk_numa_pair = [
-            {
-                'index': index,
-                'numa_cpu_nodes': str(pair[0]),
-                'disk_filename': pair[1],
-            }
-            for index, pair in enumerate(raw_disk_numa_pairs)
-        ]
-    elif require_merge and raw_files:
-      disk_numa_pair = [
+    if require_merge and raw_files:
+      disks_list = [
           {
               'index': index,
               'disk_filename': raw_file,
@@ -704,7 +646,7 @@ def GenerateJobFileString(
           scenarios=jinja_scenarios,
           direct=int(direct),
           parameters=parameters,
-          disk_numa_pair=disk_numa_pair,
+          disks_list=disks_list,
       )
   )
 
@@ -744,7 +686,6 @@ def GetOrGenerateJobFileString(
     direct,
     parameters,
     job_file_contents,
-    numa_nodes,
     require_merge,
 ):
   """Get the contents of the fio job file we're working with.
@@ -769,7 +710,6 @@ def GetOrGenerateJobFileString(
     direct: boolean. Whether to use direct IO.
     parameters: list. Other fio parameters to apply to all jobs.
     job_file_contents: string contents of fio job.
-    numa_nodes: list. List of NUMA nodes.
     require_merge: whether jobs will need to be merged for reporting.
 
   Returns:
@@ -810,7 +750,6 @@ def GetOrGenerateJobFileString(
         ramptime,
         direct,
         parameters,
-        numa_nodes,
         raw_files,
         require_merge,
     )
@@ -1016,14 +955,7 @@ def RunWithExec(vm, exec_path, remote_job_file_path, job_file_contents):
   logging.info('FIO running on %s', vm)
 
   disks = vm.scratch_disks
-  require_merge = FLAGS.fio_pinning or len(disks) > 1
-  # Windows does not support numactl package.
-  if vm.OS_TYPE in os_types.WINDOWS_OS_TYPES:
-    numa_node_count = vm.numa_node_count or 1
-    numa_nodes = list(range(numa_node_count))
-  else:
-    numa_map = numactl.GetNuma(vm)
-    numa_nodes = list(numa_map.keys())
+  require_merge = len(disks) > 1
 
   job_file_string = GetOrGenerateJobFileString(
       FLAGS.fio_jobfile,
@@ -1039,7 +971,6 @@ def RunWithExec(vm, exec_path, remote_job_file_path, job_file_contents):
       _DIRECT_IO.value,
       FLAGS.fio_parameters,
       job_file_contents,
-      numa_nodes,
       require_merge,
   )
   job_file_path = vm_util.PrependTempDir(vm.name + LOCAL_JOB_FILE_SUFFIX)
@@ -1147,4 +1078,5 @@ def CleanupVM(vm):
   if not AgainstDevice() and not FLAGS.fio_jobfile:
     # If the user supplies their own job file, then they have to clean
     # up after themselves, because we don't know their temp file name.
+    vm.RemoveFile(posixpath.join(vm.GetScratchDir(), DEFAULT_TEMP_FILE_NAME))    # up after themselves, because we don't know their temp file name.
     vm.RemoveFile(posixpath.join(vm.GetScratchDir(), DEFAULT_TEMP_FILE_NAME))

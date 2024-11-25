@@ -21,10 +21,11 @@ AMAZON_NEURON = 'amazon_neuron'
 CENTOS_STREAM9 = 'centos_stream9'
 CLEAR = 'clear'
 COS = 'cos'  # stable
+COS_DEV = 'cos_dev'
+COS117 = 'cos117'
+COS113 = 'cos113'
 COS109 = 'cos109'
 COS105 = 'cos105'
-COS101 = 'cos101'
-COS_DEV = 'cos_dev'
 CORE_OS = 'core_os'
 DEBIAN11 = 'debian11'
 DEBIAN11_BACKPORTS = 'debian11_backports'
@@ -40,6 +41,7 @@ ROCKY_LINUX9_OPTIMIZED = 'rocky_linux9_optimized'
 UBUNTU2004 = 'ubuntu2004'
 UBUNTU2004_EFA = 'ubuntu2004_efa'
 UBUNTU2004_DL = 'ubuntu2004_dl'
+DEBIAN12_DL = 'debian12_dl'
 AMAZONLINUX2_DL = 'amazonlinux2_dl'
 UBUNTU2204 = 'ubuntu2204'
 UBUNTU2404 = 'ubuntu2404'
@@ -86,9 +88,10 @@ WINDOWS = 'windows'
 CONTAINER_OS_TYPES = [
     CORE_OS,
     COS,
+    COS117,
+    COS113,
     COS109,
     COS105,
-    COS101,
     COS_DEV,
 ]
 
@@ -102,6 +105,7 @@ LINUX_OS_TYPES = CONTAINER_OS_TYPES + [
     DEBIAN11,
     DEBIAN11_BACKPORTS,
     DEBIAN12,
+    DEBIAN12_DL,
     FEDORA36,
     FEDORA37,
     RHEL8,
@@ -152,10 +156,20 @@ AMAZONLINUX_TYPES = [
     AMAZON_NEURON,
 ]
 
+EL_OS_TYPES = [
+    CENTOS_TYPES,
+    RHEL8,
+    RHEL9,
+    ROCKY_LINUX8,
+    ROCKY_LINUX8_OPTIMIZED,
+    ROCKY_LINUX9,
+    ROCKY_LINUX9_OPTIMIZED,
+]
+
 ALL = LINUX_OS_TYPES + WINDOWS_OS_TYPES
 BASE_OS_TYPES = [CLEAR, CORE_OS, DEBIAN, RHEL, WINDOWS]
 
 # May change from time to time.
-DEFAULT = UBUNTU2004
+DEFAULT = UBUNTU2404
 
 flags.DEFINE_enum('os_type', DEFAULT, ALL, "The VM's OS type.")

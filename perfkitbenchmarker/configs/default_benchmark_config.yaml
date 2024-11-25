@@ -4,13 +4,13 @@
 default_disk_spec: &default_disk_spec
   GCP:
     disk_size: 200
-    disk_type: pd-ssd
+    disk_type: pd-balanced
   AWS:
     disk_size: 200
-    disk_type: gp2
+    disk_type: gp3
   Azure:
     disk_size: 200
-    disk_type: Premium_LRS
+    disk_type: PremiumV2_LRS
 
 speccpu2017_int_rate_flags_base: &speccpu2017_int_rate_flags_base
   build_fortran: True
@@ -96,8 +96,8 @@ mysql_tpcc:
           # TODO(andytzhu) - Add AWS/Azure
           GCP:
             boot_disk_size: 200
-            boot_disk_type: pd-ssd
         disk_spec:
+          # 4TB pd-balanced has 27k IOPS, 1260 MB/s throughput.
           GCP:
             disk_size: 4000
             disk_type: pd-balanced
@@ -108,7 +108,7 @@ mysql_tpcc:
             provisioned_iops: 10000
             provisioned_throughput: 300
             num_striped_disks: 4
-          Azure: # Premiumv2 disks matching 4TB pd-ssd
+          Azure:
             disk_size: 2000
             disk_type: PremiumV2_LRS
             provisioned_iops: 40000
@@ -120,6 +120,8 @@ postgres_tpcc:
     db_engine: postgres
     db_engine_version: '13'
     hammerdbcli_version: '4.3'
+    hammerdbcli_optimized_server_configuration: restorable
+    hammerdbcli_tpcc_all_warehouse: True
     hammerdbcli_tpcc_time_profile: True
     hammerdbcli_tpcc_log_transactions: True
     hammerdbcli_tpcc_duration: 30
@@ -139,11 +141,11 @@ postgres_tpcc:
           # TODO(andytzhu) - Add AWS/Azure
           GCP:
             boot_disk_size: 200
-            boot_disk_type: pd-ssd
         disk_spec:
+          # 4TB pd-ssd has 27k IOPS, 1260 MB/s throughput.
           GCP:
             disk_size: 4000
-            disk_type: pd-ssd
+            disk_type: pd-balanced
           # These aim to match a 4 TB PD-SSD in performance and price. AWS can get better performance.
           AWS:
             disk_size: 1000
@@ -151,8 +153,7 @@ postgres_tpcc:
             provisioned_iops: 16000
             provisioned_throughput: 300
             num_striped_disks: 4
-          # TODO(andytzhu) - Add Azure iops/throughput/striping.
-          Azure: # Premiumv2 disks matching 4TB pd-ssd
+          Azure:
             disk_size: 2000
             disk_type: PremiumV2_LRS
             provisioned_iops: 64000
@@ -171,12 +172,12 @@ hpcc_stream:
 redis_memtier_full_house_loaded:
   name: redis_memtier
   flags:
-    memtier_clients: 8
+    memtier_clients: 32
     memtier_requests: -1
     memtier_run_duration: 800
     memtier_threads: 4
     redis_eviction_policy: allkeys-lru
-    redis_server_version: '5.0.5'
+    redis_server_version: '5.0.14'
     redis_total_num_processes: 0
 
 # TODO: redis_server_io_threads

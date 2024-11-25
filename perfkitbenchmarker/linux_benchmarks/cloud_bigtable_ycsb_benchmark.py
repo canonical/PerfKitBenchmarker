@@ -82,6 +82,18 @@ _USE_JAVA_VENEER_CLIENT = flags.DEFINE_boolean(
     False,
     'If true, will use the googlebigtableclient with ycsb.',
 )
+# Temporary until old driver is deprecated.
+_USE_UPGRADED_DRIVER = flags.DEFINE_boolean(
+    'google_bigtable_use_upgraded_driver',
+    False,
+    'If true, will use the googlebigtableclient2 with ycsb. Requires'
+    ' --google_bigtable_use_java_veneer_client to be true.',
+)
+_ENABLE_DIRECT_PATH = flags.DEFINE_boolean(
+    'google_bigtable_enable_direct_path',
+    False,
+    'If true, sets an environment variable to enable DirectPath.',
+)
 _ENABLE_TRAFFIC_DIRECTOR = flags.DEFINE_boolean(
     'google_bigtable_enable_traffic_director',
     False,
@@ -204,6 +216,13 @@ def CheckPrerequisites(benchmark_config: Dict[str, Any]) -> None:
         f' {gcp_bigtable.CPU_API_DELAY_MINUTES}.'
     )
 
+  # Temporary until old driver is deprecated.
+  if _USE_UPGRADED_DRIVER.value and not _USE_JAVA_VENEER_CLIENT.value:
+    raise errors.Setup.InvalidFlagConfigurationError(
+        '--google_bigtable_use_upgraded_driver requires'
+        ' --google_bigtable_use_java_veneer_client to be true.'
+    )
+
 
 def _GetTableName() -> str:
   return _STATIC_TABLE_NAME.value or 'ycsb{}'.format(FLAGS.run_uri)
@@ -273,6 +292,13 @@ def _Install(vm: virtual_machine.VirtualMachine, bigtable: _Bigtable) -> None:
         vm.RenderTemplate(file_path, os.path.splitext(remote_path)[0], context)
       else:
         vm.RemoteCopy(file_path, remote_path)
+
+  if _ENABLE_DIRECT_PATH.value:
+    # Requires minimum client bigtable 2.45.0 or bigtable-hbase 2.14.5.
+    vm.RemoteCommand(
+        'echo "export CBT_ENABLE_DIRECTPATH=true" | sudo tee -a'
+        ' /etc/environment'
+    )
 
 
 @vm_util.Retry()
@@ -392,10 +418,20 @@ def _GetYcsbExecutor(
   """Gets the YCSB executor class for loading and running the benchmark."""
   ycsb_memory = min(vms[0].total_memory_kb // 1024, 4096)
   jvm_args = pipes.quote(f' -Xmx{ycsb_memory}m')
+  env = {}
+  if _ENABLE_DIRECT_PATH.value:
+    env['CBT_ENABLE_DIRECTPATH'] = str(_ENABLE_DIRECT_PATH.value)
 
   if _USE_JAVA_VENEER_CLIENT.value:
     executor_flags = {'jvm-args': jvm_args, 'table': _GetTableName()}
-    return ycsb.YCSBExecutor('googlebigtable', **executor_flags)
+    # Temporary until old driver is deprecated.
+    if _USE_UPGRADED_DRIVER.value:
+      return ycsb.YCSBExecutor(
+          'googlebigtable2', environment=env, **executor_flags
+      )
+    return ycsb.YCSBExecutor(
+        'googlebigtable', environment=env, **executor_flags
+    )
 
   # Add hbase conf dir to the classpath.
   executor_flags = {
@@ -403,7 +439,9 @@ def _GetYcsbExecutor(
       'jvm-args': jvm_args,
       'table': _GetTableName(),
   }
-  return ycsb.YCSBExecutor(FLAGS.hbase_binding, **executor_flags)
+  return ycsb.YCSBExecutor(
+      FLAGS.hbase_binding, environment=env, **executor_flags
+  )
 
 
 def _LoadDatabase(
@@ -436,6 +474,7 @@ def Run(benchmark_spec: bm_spec.BenchmarkSpec) -> List[sample.Sample]:
 
   metadata = {
       'ycsb_client_vms': len(vms),
+      'direct_path': _ENABLE_DIRECT_PATH.value,
   }
   metadata.update(instance.GetResourceMetadata())
 
@@ -469,13 +508,25 @@ def _CommonArgs(instance: _Bigtable) -> Dict[str, str]:
 
   kwargs = {'columnfamily': COLUMN_FAMILY}
   if _USE_JAVA_VENEER_CLIENT.value:
-    kwargs['google.bigtable.instance.id'] = instance.name
-    kwargs['google.bigtable.app_profile.id'] = gcp_bigtable.APP_PROFILE_ID.value
-    kwargs['google.bigtable.project.id'] = FLAGS.project or _GetDefaultProject()
-    kwargs['google.bigtable.data.endpoint'] = (
-        gcp_bigtable.ENDPOINT.value + ':443'
-    )
-
+    # Temporary until old driver is deprecated.
+    if _USE_UPGRADED_DRIVER.value:
+      kwargs['googlebigtable2.project'] = FLAGS.project or _GetDefaultProject()
+      kwargs['googlebigtable2.instance'] = instance.name
+      kwargs['googlebigtable2.app-profile'] = gcp_bigtable.APP_PROFILE_ID.value
+      kwargs['googlebigtable2.family'] = COLUMN_FAMILY
+      kwargs['googlebigtable2.timestamp'] = '0'
+      kwargs.pop('columnfamily')
+    else:
+      kwargs['google.bigtable.instance.id'] = instance.name
+      kwargs['google.bigtable.app_profile.id'] = (
+          gcp_bigtable.APP_PROFILE_ID.value
+      )
+      kwargs['google.bigtable.project.id'] = (
+          FLAGS.project or _GetDefaultProject()
+      )
+      kwargs['google.bigtable.data.endpoint'] = (
+          gcp_bigtable.ENDPOINT.value + ':443'
+      )
   return kwargs
 
 
@@ -491,11 +542,14 @@ def _GenerateRunKwargs(instance: _Bigtable) -> Dict[str, str]:
 
   run_kwargs = _CommonArgs(instance)
 
-  # By default YCSB uses a BufferedMutator for Puts / Deletes.
-  # This leads to incorrect update latencies, since since the call returns
-  # before the request is acked by the server.
-  # Disable this behavior during the benchmark run.
-  run_kwargs['clientbuffering'] = 'false'
+  if _USE_JAVA_VENEER_CLIENT.value and _USE_UPGRADED_DRIVER.value:
+    run_kwargs['googlebigtable2.use-batching'] = 'false'
+  else:
+    # By default YCSB uses a BufferedMutator for Puts / Deletes.
+    # This leads to incorrect update latencies, since since the call returns
+    # before the request is acked by the server.
+    # Disable this behavior during the benchmark run.
+    run_kwargs['clientbuffering'] = 'false'
 
   return run_kwargs
 
@@ -512,9 +566,13 @@ def _GenerateLoadKwargs(instance: _Bigtable) -> Dict[str, str]:
 
   load_kwargs = _CommonArgs(instance)
 
-  # During the load stage, use a buffered mutator with a single thread.
-  # The BufferedMutator will handle multiplexing RPCs.
-  load_kwargs['clientbuffering'] = 'true'
+  if _USE_JAVA_VENEER_CLIENT.value and _USE_UPGRADED_DRIVER.value:
+    load_kwargs['googlebigtable2.use-batching'] = 'true'
+  else:
+    # During the load stage, use a buffered mutator with a single thread.
+    # The BufferedMutator will handle multiplexing RPCs.
+    load_kwargs['clientbuffering'] = 'true'
+
   if not FLAGS['ycsb_preload_threads'].present:
     load_kwargs['threads'] = '1'
 

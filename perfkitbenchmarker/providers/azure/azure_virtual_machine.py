@@ -124,12 +124,6 @@ _SCHEDULED_EVENTS_CMD_WIN = (
 # Recognized Errors
 _OS_PROVISIONING_TIMED_OUT = 'OSProvisioningTimedOut'
 
-# Map to neoverse-n1
-AZURE_ARM_TYPES = [
-    r'(Standard_D[0-9]+pl?d?s_v5)',
-    r'(Standard_E[0-9]+pd?s_v5)',
-]
-
 CONFIDENTIAL_MILAN_TYPES = [
     r'(Standard_DC[0-9]+as?d?s_v5)',
     r'(Standard_EC[0-9]+as?d?s_v5)',
@@ -137,13 +131,13 @@ CONFIDENTIAL_MILAN_TYPES = [
 
 # Reference -
 # https://learn.microsoft.com/en-us/azure/virtual-machines/trusted-launch#virtual-machines-sizes
-TRUSTED_LAUNCH_UNSUPPORTED_TYPES = AZURE_ARM_TYPES + [
+TRUSTED_LAUNCH_UNSUPPORTED_TYPES = [
     r'(Standard_A[0-9]+_v2)',
-    r'(Standard_D[0-9]+_v2)',
-    r'(Standard_D[0-9]+_v3)',
-    r'(Standard_E[0-9]+_v3)',
+    r'(Standard_[DE][0-9]+_v[2-3])',
     r'(Standard_M[0-9]+.*)',
     r'(Standard_ND[0-9]+a.*)',
+    # Arm V5
+    r'(Standard_[DE][0-9]+pl?d?s_v5)',
 ]
 
 TRUSTED_LAUNCH_UNSUPPORTED_OS_TYPES = [
@@ -159,6 +153,8 @@ NVME_MACHINE_FAMILIES = [
     'Standard_Ms_v3',
     'Standard_Mds_v3',
 ]
+
+_SKU_NOT_AVAILABLE = 'SkuNotAvailable'
 
 
 class AzureVmSpec(virtual_machine.BaseVmSpec):
@@ -468,7 +464,13 @@ class AzureDedicatedHostGroup(resource.BaseResource):
     if self.availability_zone:
       create_cmd.extend(['--zone', self.availability_zone])
 
-    vm_util.IssueCommand(create_cmd)
+    _, stderr, retcode = vm_util.IssueCommand(
+        create_cmd, raise_on_failure=False
+    )
+    if _SKU_NOT_AVAILABLE in stderr:
+      raise errors.Benchmarks.UnsupportedConfigError(stderr)
+    elif retcode:
+      raise errors.VmUtil.IssueCommandError(stderr)
 
   def _Delete(self):
     """See base class."""
@@ -578,7 +580,13 @@ class AzureDedicatedHost(resource.BaseResource):
         '--platform-fault-domain',
         '0',
     ] + self.resource_group.args
-    vm_util.IssueCommand(create_cmd)
+    _, stderr, retcode = vm_util.IssueCommand(
+        create_cmd, raise_on_failure=False
+    )
+    if _SKU_NOT_AVAILABLE in stderr:
+      raise errors.Benchmarks.UnsupportedConfigError(stderr)
+    elif retcode:
+      raise errors.VmUtil.IssueCommandError(stderr)
 
   def _Delete(self):
     """See base class."""
@@ -617,12 +625,23 @@ class AzureDedicatedHost(resource.BaseResource):
       return False
 
 
-def _MachineTypeIsArm(machine_type):
+def _MachineTypeIsArm(machine_type) -> bool:
   """Check if the machine type uses ARM."""
-  return any(
-      re.search(machine_series, machine_type)
-      for machine_series in AZURE_ARM_TYPES
-  )
+  return bool(re.match('Standard_[DE][0-9]+p', machine_type))
+
+
+# TODO(pclay): Move out of this class.
+def _GetArmArch(machine_type) -> str | None:
+  """Get the ARM architecture for the machine type."""
+  if _MachineTypeIsArm(machine_type):
+    generation = util.GetMachineSeriesNumber(machine_type)
+    if generation == 5:
+      return 'neoverse-n1'
+    elif generation == 6:
+      return 'neoverse-n2'
+    else:
+      raise ValueError('Unknown ARM machine type: ' + machine_type)
+  return None
 
 
 class AzureVirtualMachine(
@@ -693,7 +712,7 @@ class AzureVirtualMachine(
         )
         or self.OS_TYPE in TRUSTED_LAUNCH_UNSUPPORTED_OS_TYPES
     )
-    arm_arch = 'neoverse-n1' if _MachineTypeIsArm(self.machine_type) else None
+    arm_arch = _GetArmArch(self.machine_type)
     if arm_arch:
       self.host_arch = arm_arch
       self.is_aarch64 = True
@@ -937,10 +956,10 @@ class AzureVirtualMachine(
           and 'OverconstrainedZonalAllocationRequest' in stderr
       ):
         raise errors.Benchmarks.UnsupportedConfigError(stderr)
-      elif 'SkuNotAvailable' in stderr:
+      elif _SKU_NOT_AVAILABLE in stderr:
         raise errors.Benchmarks.UnsupportedConfigError(stderr)
       else:
-        raise errors.Resource.CreationError()
+        raise errors.Resource.CreationError(stderr)
 
   def _Exists(self):
     """Returns True if the VM exists."""
@@ -1377,14 +1396,20 @@ class Windows2019CoreAzureVirtualMachine(
     BaseWindowsAzureVirtualMachine, windows_virtual_machine.Windows2019CoreMixin
 ):
   GEN2_IMAGE_URN = 'MicrosoftWindowsServer:windowsserver-gen2preview:2019-datacenter-gen2:latest'
-  GEN1_IMAGE_URN = 'MicrosoftWindowsServer:WindowsServer:2019-Datacenter-Core:latest'
+  GEN1_IMAGE_URN = (
+      'MicrosoftWindowsServer:WindowsServer:2019-Datacenter-Core:latest'
+  )
 
 
 class Windows2022CoreAzureVirtualMachine(
     BaseWindowsAzureVirtualMachine, windows_virtual_machine.Windows2022CoreMixin
 ):
-  GEN2_IMAGE_URN = 'MicrosoftWindowsServer:WindowsServer:2022-Datacenter-Core-g2:latest'
-  GEN1_IMAGE_URN = 'MicrosoftWindowsServer:WindowsServer:2022-Datacenter-Core:latest'
+  GEN2_IMAGE_URN = (
+      'MicrosoftWindowsServer:WindowsServer:2022-Datacenter-Core-g2:latest'
+  )
+  GEN1_IMAGE_URN = (
+      'MicrosoftWindowsServer:WindowsServer:2022-Datacenter-Core:latest'
+  )
 
 
 class Windows2016DesktopAzureVirtualMachine(
@@ -1407,7 +1432,9 @@ class Windows2022DesktopAzureVirtualMachine(
     BaseWindowsAzureVirtualMachine,
     windows_virtual_machine.Windows2022DesktopMixin,
 ):
-  GEN2_IMAGE_URN = 'MicrosoftWindowsServer:WindowsServer:2022-Datacenter-g2:latest'
+  GEN2_IMAGE_URN = (
+      'MicrosoftWindowsServer:WindowsServer:2022-Datacenter-g2:latest'
+  )
   GEN1_IMAGE_URN = 'MicrosoftWindowsServer:WindowsServer:2022-Datacenter:latest'
 
 

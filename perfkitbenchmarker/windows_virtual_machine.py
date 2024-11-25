@@ -192,6 +192,15 @@ class BaseWindowsMixin(os_mixin.BaseOsMixin):
 
     return stdout, stderr
 
+  def PartitionDisk(self, dev_name, dev_path, num_partitions, partition_size):
+    raise NotImplementedError()
+
+  def IsDiskFormatted(self, dev_name, num_partitions):
+    raise NotImplementedError()
+
+  def hasStripedDiskDevice(self, dev_name: str) -> bool:
+    raise NotImplementedError()
+
   def RemoteCopy(self, local_path, remote_path='', copy_to=True):
     """Copies a file to or from the VM.
 

@@ -19,9 +19,11 @@ import logging
 import os
 import posixpath
 import re
+
 from absl import flags
 from perfkitbenchmarker import data
 from perfkitbenchmarker import errors
+from perfkitbenchmarker import os_types
 from perfkitbenchmarker import sample
 from perfkitbenchmarker import stages
 from perfkitbenchmarker.linux_packages import build_tools
@@ -114,6 +116,16 @@ flags.DEFINE_string(
     None,
     'Used by the PKB speccpu benchmarks. If set, the benchmark will execute '
     'this script instead of invoking runspec binary directly.',
+)
+flags.DEFINE_enum(
+    'runspec_tuned_profile',
+    None,
+    [
+        'throughput-performance',
+        'latency-performance',
+        'virtual-guest',
+    ],
+    'TuneD profile for SPEC CPU',
 )
 
 VM_STATE_ATTR = 'speccpu_vm_state'
@@ -356,6 +368,13 @@ def Install(vm):
   vm.Install('fortran')
   vm.Install('build_tools')
 
+  if vm.OS_TYPE in os_types.EL_OS_TYPES:
+    vm.InstallPackages('libxcrypt-compat')
+
+  if FLAGS.runspec_tuned_profile:
+    vm.Install('tuned')
+    vm.RemoteCommand(f'sudo tuned-adm profile {FLAGS.runspec_tuned_profile}')
+
   # If runspec_build_tool_version is not set,
   # install 4.7 gcc/g++/gfortan. If either one of the flag is set, we assume
   # user is smart
@@ -384,7 +403,7 @@ def _PrepareWithPreprovisionedTarFile(vm, speccpu_vm_state):
       scratch_dir,
   )
   vm.RemoteCommand(
-      'cd {dir} && tar xvfz {tar}'.format(
+      'cd {dir} && tar xfz {tar}'.format(
           dir=scratch_dir, tar=speccpu_vm_state.base_tar_file_path
       )
   )
