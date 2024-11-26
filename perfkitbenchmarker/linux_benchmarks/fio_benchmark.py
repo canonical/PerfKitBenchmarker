@@ -26,6 +26,7 @@ import time
 from typing import Any
 
 import jinja2
+from absl import flags
 
 from perfkitbenchmarker import (background_tasks, configs, data, errors,
                                 flag_util, sample, units, vm_util)
@@ -1073,6 +1074,13 @@ def Cleanup(benchmark_spec):
 
 
 def CleanupVM(vm):
+  logging.info('FIO Cleanup up on %s', vm)
+  vm.RemoveFile(REMOTE_JOB_FILE_PATH)
+  if not AgainstDevice() and not FLAGS.fio_jobfile:
+    # If the user supplies their own job file, then they have to clean
+    # up after themselves, because we don't know their temp file name.
+    vm.RemoveFile(posixpath.join(vm.GetScratchDir(), DEFAULT_TEMP_FILE_NAME))    # up after themselves, because we don't know their temp file name.
+    vm.RemoveFile(posixpath.join(vm.GetScratchDir(), DEFAULT_TEMP_FILE_NAME))def CleanupVM(vm):
   logging.info('FIO Cleanup up on %s', vm)
   vm.RemoveFile(REMOTE_JOB_FILE_PATH)
   if not AgainstDevice() and not FLAGS.fio_jobfile:
