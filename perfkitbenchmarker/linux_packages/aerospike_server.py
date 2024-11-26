@@ -20,12 +20,9 @@ import hashlib
 import logging
 
 from absl import flags
-from perfkitbenchmarker import background_tasks
-from perfkitbenchmarker import data
-from perfkitbenchmarker import errors
-from perfkitbenchmarker import linux_packages
-from perfkitbenchmarker import os_types
-from perfkitbenchmarker import vm_util
+
+from perfkitbenchmarker import (background_tasks, data, errors, linux_packages,
+                                os_types, vm_util)
 
 FLAGS = flags.FLAGS
 
@@ -34,7 +31,8 @@ GIT_TAG = '6.0.0.2'
 AEROSPIKE_DIR = '%s/aerospike-server' % linux_packages.INSTALL_DIR
 
 AEROSPIKE_VERSION_NAME_FOR_OS = {
-    os_types.UBUNTU2004: 'ubuntu20_amd64',
+    os_types.UBUNTU2004: 'ubuntu20.04.tgz',
+    os_types.UBUNTU2204: 'ubuntu20.04.tgz',
     os_types.RHEL8: 'el8_amd64',
 }
 
@@ -50,24 +48,28 @@ class AerospikeEdition(enum.Enum):
 MEMORY = 'memory'
 DISK = 'disk'
 
-DEFAULT_VERSION = '6.2.0'
+_AEROSPIKE_EDITION = flags.DEFINE_enum_class(
+    'aerospike_edition',
+    AerospikeEdition.COMNUNITY,
+    AerospikeEdition,
+    'The type of edition aerospike uses.',
+)
+if _AEROSPIKE_EDITION.value == AerospikeEdition.COMNUNITY:
+  DEFAULT_VERSION = '6.1.0.1'
+else:
+  DEFAULT_VERSION = '6.2.0'
+
+# https://download.aerospike.com/artifacts/aerospike-server-community/6.1.0.1/aerospike-server-community-6.1.0.1-ubuntu20.04.tgz
 DEFAULT_INSTALL_URL = (
-    'https://enterprise.aerospike.com/enterprise/download/server/{}/artifact/{}'
+    'https://download.aerospike.com/artifacts/aerospike-server-{}/{}/aerospike-server-{}-{}-{}'
 )
 
 
 # Link could be found here
 # https://aerospike.com/download/#servers
 
-_AEROSPIKE_ENTERPRISE_VERSION = flags.DEFINE_string(
-    'aerospike_enterprise_version', DEFAULT_VERSION, 'Aerospike version to use'
-)
-
-_AEROSPIKE_EDITION = flags.DEFINE_enum_class(
-    'aerospike_edition',
-    AerospikeEdition.COMNUNITY,
-    AerospikeEdition,
-    'The type of edition aerospike uses.',
+_AEROSPIKE_VERSION = flags.DEFINE_string(
+    'aerospike_version', DEFAULT_VERSION, 'Aerospike version to use'
 )
 flags.DEFINE_enum(
     'aerospike_storage_type',
@@ -130,26 +132,26 @@ def _GetAerospikeConfig(idx=None):
     return '~/aerospike/aerospike.conf'
 
 
-def _InstallFromGit(vm):
-  vm.RemoteCommand('git clone {} {}'.format(GIT_REPO, _GetAerospikeDir()))
-  # Comment out Werror flag and compile. With newer compilers gcc7xx,
-  # compilation is broken due to warnings.
-  vm.RemoteCommand(
-      'cd {0} && git checkout {1} && git submodule update --init '
-      '&& sed -i "s/COMMON_CFLAGS += -Werror/# $COMMON_CFLAGS += -Werror/" '
-      '{0}/make_in/Makefile.in '
-      '&& make'.format(_GetAerospikeDir(), GIT_TAG)
-  )
-  for idx in range(FLAGS.aerospike_instances):
-    vm.RemoteCommand(
-        f'mkdir {linux_packages.INSTALL_DIR}/{idx}; '
-        f'cp -rf {_GetAerospikeDir()} {_GetAerospikeDir(idx)}'
-    )
+# def _InstallFromGit(vm):
+#   vm.RemoteCommand('git clone {} {}'.format(GIT_REPO, _GetAerospikeDir()))
+#   # Comment out Werror flag and compile. With newer compilers gcc7xx,
+#   # compilation is broken due to warnings.
+#   vm.RemoteCommand(
+#       'cd {0} && git checkout {1} && git submodule update --init '
+#       '&& sed -i "s/COMMON_CFLAGS += -Werror/# $COMMON_CFLAGS += -Werror/" '
+#       '{0}/make_in/Makefile.in '
+#       '&& make'.format(_GetAerospikeDir(), GIT_TAG)
+#   )
+#   for idx in range(FLAGS.aerospike_instances):
+#     vm.RemoteCommand(
+#         f'mkdir {linux_packages.INSTALL_DIR}/{idx}; '
+#         f'cp -rf {_GetAerospikeDir()} {_GetAerospikeDir(idx)}'
+#     )
 
 
 def _InstallFromPackage(vm):
   """Installs the aerospike_server package on the VM."""
-  if FLAGS.aerospike_instances != 1:
+  if FLAGS.aerospike_instances != 1 and _AEROSPIKE_EDITION.value == AerospikeEdition.ENTERPRISE:
     raise NotImplementedError(
         'Only support one instance of aerospike on enterprise'
     )
@@ -162,14 +164,17 @@ def _InstallFromPackage(vm):
   vm.RemoteCommand(
       'wget -O aerospike.tgz '
       + DEFAULT_INSTALL_URL.format(
-          _AEROSPIKE_ENTERPRISE_VERSION.value,
+          _AEROSPIKE_EDITION.value,
+          _AEROSPIKE_VERSION.value,
+          _AEROSPIKE_EDITION.value,
+          _AEROSPIKE_VERSION.value,
           AEROSPIKE_VERSION_NAME_FOR_OS[FLAGS.os_type],
       )
   )
   # Create log directory
-  vm.Install('python')
-  vm.InstallPackages('dpkg')
-  vm.InstallPackages('netcat')
+  # vm.Install('python')
+  # vm.InstallPackages('dpkg')
+  # vm.InstallPackages('netcat')
   vm.RemoteCommand('sudo mkdir -p /var/log/aerospike')
 
   vm.RemoteCommand('mkdir -p aerospike')
@@ -184,14 +189,15 @@ def _InstallFromPackage(vm):
 
 def _Install(vm):
   """Installs the Aerospike server on the VM."""
-  vm.Install('build_tools')
-  vm.Install('lua5_1')
+  # vm.Install('build_tools')
+  # vm.Install('lua5_1')
   vm.Install('openssl')
   vm.Install('wget')
-  if _AEROSPIKE_EDITION.value == AerospikeEdition.COMNUNITY:
-    _InstallFromGit(vm)
-  else:
-    _InstallFromPackage(vm)
+  # if _AEROSPIKE_EDITION.value == AerospikeEdition.COMNUNITY:
+  #   _InstallFromGit(vm)
+  # else:
+  #   _InstallFromPackage(vm)
+  _InstallFromPackage(vm)
 
 
 def YumInstall(vm):
@@ -201,7 +207,7 @@ def YumInstall(vm):
 
 def AptInstall(vm):
   """Installs the aerospike_server package on the VM."""
-  vm.InstallPackages('netcat-openbsd zlib1g-dev')
+  # vm.InstallPackages('netcat-openbsd zlib1g-dev')
   _Install(vm)
 
 

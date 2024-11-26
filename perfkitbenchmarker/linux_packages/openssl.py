@@ -14,6 +14,11 @@
 
 
 """Module containing OpenSSL installation and cleanup functions."""
+from absl import flags
+
+from perfkitbenchmarker import os_types
+
+FLAGS = flags.FLAGS
 
 
 def YumInstall(vm):
@@ -23,7 +28,12 @@ def YumInstall(vm):
 
 def AptInstall(vm):
   """Installs OpenSSL on the VM."""
-  vm.InstallPackages('openssl libssl-dev')
+  if FLAGS.os_type == os_types.UBUNTU2204:
+    vm.InstallPackages('openssl')
+    vm.RemoteCommand('wget http://archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2_amd64.deb')
+    vm.RemoteCommand("DEBIAN_FRONTEND='noninteractive' sudo dpkg -i libssl1.1_1.1.1f-1ubuntu2_amd64.deb")
+  else:
+    vm.InstallPackages('openssl libssl-dev')
 
 
 def AptInstallQAT(vm):
@@ -38,4 +48,4 @@ def AptInstallQAT(vm):
   vm.RemoteCommand('git clone https://github.com/intel/intel-ipsec-mb.git && cd intel-ipsec-mb && git checkout v1.3 && make -j && sudo make install NOLDCONFIG=y')
 
   # Install QAT_Engine
-  vm.RemoteCommand('git clone https://github.com/intel/QAT_Engine.git && cd QAT_Engine && git checkout v1.2.0 && ./autogen.sh && ./configure --enable-qat_sw && make -j && sudo make install')
+  vm.RemoteCommand('git clone https://github.com/intel/QAT_Engine.git && cd QAT_Engine && git checkout v1.2.0 && ./autogen.sh && ./configure --enable-qat_sw && make -j && sudo make install')  vm.RemoteCommand('git clone https://github.com/intel/QAT_Engine.git && cd QAT_Engine && git checkout v1.2.0 && ./autogen.sh && ./configure --enable-qat_sw && make -j && sudo make install')

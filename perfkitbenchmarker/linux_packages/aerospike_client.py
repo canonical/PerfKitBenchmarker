@@ -24,16 +24,15 @@ import re
 from typing import Any, List
 
 from absl import flags
-from perfkitbenchmarker import os_types
-from perfkitbenchmarker import regex_util
-from perfkitbenchmarker import sample
-from perfkitbenchmarker import vm_util
+
+from perfkitbenchmarker import os_types, regex_util, sample, vm_util
 
 FLAGS = flags.FLAGS
 
 # https://download.aerospike.com/artifacts/aerospike-tools/7.0.5/
 AEROSPIKE_TOOL_VERSION_NAME_FOR_OS = {
     os_types.UBUNTU2004: 'ubuntu20.04',
+    os_types.UBUNTU2204: 'ubuntu22.04',
     os_types.RHEL8: 'el8',
 }
 
