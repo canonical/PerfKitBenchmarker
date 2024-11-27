@@ -41,7 +41,7 @@ AEROSPIKE_VERSION_NAME_FOR_OS = {
 class AerospikeEdition(enum.Enum):
   """Aerospike Edition constant."""
 
-  COMNUNITY = 'comnunity'
+  COMNUNITY = 'community'
   ENTERPRISE = 'enterprise'
 
 
