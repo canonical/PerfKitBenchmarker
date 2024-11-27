@@ -48,4 +48,4 @@ def AptInstallQAT(vm):
   vm.RemoteCommand('git clone https://github.com/intel/intel-ipsec-mb.git && cd intel-ipsec-mb && git checkout v1.3 && make -j && sudo make install NOLDCONFIG=y')
 
   # Install QAT_Engine
-  vm.RemoteCommand('git clone https://github.com/intel/QAT_Engine.git && cd QAT_Engine && git checkout v1.2.0 && ./autogen.sh && ./configure --enable-qat_sw && make -j && sudo make install')  vm.RemoteCommand('git clone https://github.com/intel/QAT_Engine.git && cd QAT_Engine && git checkout v1.2.0 && ./autogen.sh && ./configure --enable-qat_sw && make -j && sudo make install')
+  vm.RemoteCommand('git clone https://github.com/intel/QAT_Engine.git && cd QAT_Engine && git checkout v1.2.0 && ./autogen.sh && ./configure --enable-qat_sw && make -j && sudo make install')  
