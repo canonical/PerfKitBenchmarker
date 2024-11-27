@@ -122,9 +122,6 @@ def _GetAerospikeDir(idx=None):
 
 
 def _GetAerospikeConfig(idx=None):
-  if AEROSPIKE_EDITION.value == COMNUNITY:
-    return f'{_GetAerospikeDir(idx)}/as/etc/aerospike_dev.conf'
-  else:
     return '~/aerospike/aerospike.conf'
 
 
