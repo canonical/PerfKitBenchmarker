@@ -15,7 +15,6 @@
 
 """Module containing aerospike server installation and cleanup functions."""
 
-import enum
 import hashlib
 import logging
 
@@ -177,11 +176,12 @@ def _InstallFromPackage(vm):
   vm.RemoteCommand('mkdir -p aerospike')
   vm.RemoteCommand('tar -xvf aerospike.tgz -C aerospike --strip-components=1')
   vm.RemoteCommand('cd ./aerospike && sudo ./asinstall')
-  # lincense key file needs to be in prepvosional data directory
-  vm.DownloadPreprovisionedData('./aerospike', 'aerospike', 'features.conf')
-  vm.RemoteCommand(
-      'sudo mv ./aerospike/features.conf /etc/aerospike/features.conf'
-  )
+  if AEROSPIKE_EDITION.value == ENTERPRISE:
+    # lincense key file needs to be in prepvosional data directory
+    vm.DownloadPreprovisionedData('./aerospike', 'aerospike', 'features.conf')
+    vm.RemoteCommand(
+        'sudo mv ./aerospike/features.conf /etc/aerospike/features.conf'
+    )
 
 
 def _Install(vm):
@@ -309,31 +309,31 @@ def WipeDisk(server, devices):
     _ZeroizeHeader(device)
 
 
-def BuildAndStartCommunityAerospike(server, idx):
-  """Build and start commmunity version of aerospike."""
-  server.RemoteCommand(f'cd {_GetAerospikeDir(idx)} && make init')
-  # Persist the nohup command past the ssh session
-  # "sh -c 'cd /wherever; nohup ./whatever > /dev/null 2>&1 &'"
-  log_file = f'~/aerospike-{server.name}-{idx}.log'
-  cmd = (
-      f"sh -c 'cd {_GetAerospikeDir(idx)} && nohup sudo make start > "
-      f"{log_file} 2>&1 &'"
-  )
-  server.RemoteCommand(cmd)
-  server.PullFile(vm_util.GetTempDir(), log_file)
-  _WaitForServerUp(server, idx)
-  logging.info('Aerospike server configured and started.')
-  server.RemoteCommand(
-      'sudo asadm -e "show best-practices"'
-  )
-  # In certain cases where file descriptor is not enough, the server will
-  # hanging when processing disk IOs. Logging to expose more debugging info.
-  server.RemoteCommand(
-      'sudo cat /var/log/aerospike/aerospike.log | grep "descriptor"'
-  )
+# def BuildAndStartCommunityAerospike(server, idx):
+#   """Build and start commmunity version of aerospike."""
+#   server.RemoteCommand(f'cd {_GetAerospikeDir(idx)} && make init')
+#   # Persist the nohup command past the ssh session
+#   # "sh -c 'cd /wherever; nohup ./whatever > /dev/null 2>&1 &'"
+#   log_file = f'~/aerospike-{server.name}-{idx}.log'
+#   cmd = (
+#       f"sh -c 'cd {_GetAerospikeDir(idx)} && nohup sudo make start > "
+#       f"{log_file} 2>&1 &'"
+#   )
+#   server.RemoteCommand(cmd)
+#   server.PullFile(vm_util.GetTempDir(), log_file)
+#   _WaitForServerUp(server, idx)
+#   logging.info('Aerospike server configured and started.')
+#   server.RemoteCommand(
+#       'sudo asadm -e "show best-practices"'
+#   )
+#   # In certain cases where file descriptor is not enough, the server will
+#   # hanging when processing disk IOs. Logging to expose more debugging info.
+#   server.RemoteCommand(
+#       'sudo cat /var/log/aerospike/aerospike.log | grep "descriptor"'
+#   )
 
 
-def RestartEnterpriseAerospike(server):
+def RestartAerospike(server):
   server.RemoteCommand('sudo mv ~/aerospike/aerospike.conf /etc/aerospike/')
   server.RemoteCommand('sudo systemctl restart aerospike')
   _WaitForServerUp(server, 0)
@@ -393,10 +393,8 @@ def ConfigureAndStart(server, seed_node_ips=None):
             ),
         },
     )
-    if AEROSPIKE_EDITION.value == COMNUNITY:
-      BuildAndStartCommunityAerospike(server, idx)
-    else:
-      RestartEnterpriseAerospike(server)
+
+    RestartAerospike(server)
 
 
 def Uninstall(vm):
