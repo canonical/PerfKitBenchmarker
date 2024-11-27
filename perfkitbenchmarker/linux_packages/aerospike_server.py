@@ -51,10 +51,10 @@ MEMORY = 'memory'
 DISK = 'disk'
 
 
-if AEROSPIKE_EDITION.value == COMNUNITY:
-  DEFAULT_VERSION = '6.1.0.1'
-else:
-  DEFAULT_VERSION = '6.2.0'
+# if AEROSPIKE_EDITION.value == COMNUNITY:
+#   DEFAULT_VERSION = '6.1.0.1'
+# else:
+#   DEFAULT_VERSION = '6.2.0'
 
 # https://download.aerospike.com/artifacts/aerospike-server-community/6.1.0.1/aerospike-server-community-6.1.0.1-ubuntu20.04.tgz
 DEFAULT_INSTALL_URL = (
@@ -66,7 +66,7 @@ DEFAULT_INSTALL_URL = (
 # https://aerospike.com/download/#servers
 
 _AEROSPIKE_VERSION = flags.DEFINE_string(
-    'aerospike_version', DEFAULT_VERSION, 'Aerospike version to use'
+    'aerospike_version', '6.1.0.1', 'Aerospike version to use, recommendation: 6.1.0.1 for community edition, 6.2.0 for enterprise edition'
 )
 flags.DEFINE_enum(
     'aerospike_storage_type',
