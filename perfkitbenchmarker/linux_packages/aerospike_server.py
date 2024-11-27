@@ -36,25 +36,22 @@ AEROSPIKE_VERSION_NAME_FOR_OS = {
     os_types.RHEL8: 'el8_amd64',
 }
 
+COMNUNITY = 'community'
+ENTERPRISE = 'enterprise'
 
-@enum.unique
-class AerospikeEdition(enum.Enum):
-  """Aerospike Edition constant."""
-
-  COMNUNITY = 'community'
-  ENTERPRISE = 'enterprise'
+AEROSPIKE_EDITION = flags.DEFINE_enum(
+    'aerospike_edition',
+    COMNUNITY,
+    [COMNUNITY, ENTERPRISE],
+    'The type of edition aerospike uses.',
+)
 
 
 MEMORY = 'memory'
 DISK = 'disk'
 
-_AEROSPIKE_EDITION = flags.DEFINE_enum_class(
-    'aerospike_edition',
-    AerospikeEdition.COMNUNITY,
-    AerospikeEdition,
-    'The type of edition aerospike uses.',
-)
-if _AEROSPIKE_EDITION.value == AerospikeEdition.COMNUNITY:
+
+if AEROSPIKE_EDITION.value == COMNUNITY:
   DEFAULT_VERSION = '6.1.0.1'
 else:
   DEFAULT_VERSION = '6.2.0'
@@ -110,13 +107,13 @@ MIN_FREE_KBYTES = 1160000
 
 
 _AEROSPIKE_CONFIGS = {
-    AerospikeEdition.COMNUNITY: 'aerospike_community.conf.j2',
-    AerospikeEdition.ENTERPRISE: 'aerospike_enterprise.conf.j2',
+    COMNUNITY: 'aerospike_community.conf.j2',
+    ENTERPRISE: 'aerospike_enterprise.conf.j2',
 }
 
 
 def _GetAerospikeDir(idx=None):
-  if _AEROSPIKE_EDITION.value == AerospikeEdition.COMNUNITY:
+  if AEROSPIKE_EDITION.value == COMNUNITY:
     if idx is None:
       return f'{linux_packages.INSTALL_DIR}/aerospike-server'
     else:
@@ -126,7 +123,7 @@ def _GetAerospikeDir(idx=None):
 
 
 def _GetAerospikeConfig(idx=None):
-  if _AEROSPIKE_EDITION.value == AerospikeEdition.COMNUNITY:
+  if AEROSPIKE_EDITION.value == COMNUNITY:
     return f'{_GetAerospikeDir(idx)}/as/etc/aerospike_dev.conf'
   else:
     return '~/aerospike/aerospike.conf'
@@ -151,7 +148,7 @@ def _GetAerospikeConfig(idx=None):
 
 def _InstallFromPackage(vm):
   """Installs the aerospike_server package on the VM."""
-  if FLAGS.aerospike_instances != 1 and _AEROSPIKE_EDITION.value == AerospikeEdition.ENTERPRISE:
+  if FLAGS.aerospike_instances != 1 and AEROSPIKE_EDITION.value == ENTERPRISE:
     raise NotImplementedError(
         'Only support one instance of aerospike on enterprise'
     )
@@ -164,9 +161,9 @@ def _InstallFromPackage(vm):
   vm.RemoteCommand(
       'wget -O aerospike.tgz '
       + DEFAULT_INSTALL_URL.format(
-          _AEROSPIKE_EDITION.value,
+          AEROSPIKE_EDITION.value,
           _AEROSPIKE_VERSION.value,
-          _AEROSPIKE_EDITION.value,
+          AEROSPIKE_EDITION.value,
           _AEROSPIKE_VERSION.value,
           AEROSPIKE_VERSION_NAME_FOR_OS[FLAGS.os_type],
       )
@@ -193,7 +190,7 @@ def _Install(vm):
   # vm.Install('lua5_1')
   vm.Install('openssl')
   vm.Install('wget')
-  # if _AEROSPIKE_EDITION.value == AerospikeEdition.COMNUNITY:
+  # if AEROSPIKE_EDITION.value == COMNUNITY:
   #   _InstallFromGit(vm)
   # else:
   #   _InstallFromPackage(vm)
@@ -377,7 +374,7 @@ def ConfigureAndStart(server, seed_node_ips=None):
           idx * num_device_per_instance : (idx + 1) * num_device_per_instance
       ]
     server.RenderTemplate(
-        data.ResourcePath(_AEROSPIKE_CONFIGS[_AEROSPIKE_EDITION.value]),
+        data.ResourcePath(_AEROSPIKE_CONFIGS[AEROSPIKE_EDITION.value]),
         _GetAerospikeConfig(idx),
         {
             'devices': current_devices,
@@ -396,7 +393,7 @@ def ConfigureAndStart(server, seed_node_ips=None):
             ),
         },
     )
-    if _AEROSPIKE_EDITION.value == AerospikeEdition.COMNUNITY:
+    if AEROSPIKE_EDITION.value == COMNUNITY:
       BuildAndStartCommunityAerospike(server, idx)
     else:
       RestartEnterpriseAerospike(server)
