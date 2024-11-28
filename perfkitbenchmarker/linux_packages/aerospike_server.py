@@ -362,7 +362,7 @@ def ConfigureAndStart(server, seed_node_ips=None):
       '| sudo tee /proc/sys/vm/min_free_kbytes'
   )
   server.RemoteCommand('echo 0 | sudo tee /proc/sys/vm/swappiness')
-  server.RemoteCommand('ulimit -n %d' % FLAGS.aerospike_proto_fd_max)
+  server.RemoteCommand('echo "root - nofile %d" | sudo tee -a /etc/security/limits.conf') % FLAGS.aerospike_proto_fd_max
   for idx in range(FLAGS.aerospike_instances):
     current_devices = []
     if devices:
