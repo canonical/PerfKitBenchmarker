@@ -404,7 +404,7 @@ def Run(benchmark_spec: bm_spec.BenchmarkSpec) -> List[sample.Sample]:
         'replication_factor': FLAGS.aerospike_replication_factor,
         'client_threads': threads,
         'read_percent': AEROSPIKE_READ_PERCENT.value,
-        'aerospike_edition': FLAGS.aerospike_edition.value,
+        'aerospike_edition': FLAGS.aerospike_edition,
         'aerospike_enable_strong_consistency': (
             FLAGS.aerospike_enable_strong_consistency
         ),
@@ -419,10 +419,9 @@ def Run(benchmark_spec: bm_spec.BenchmarkSpec) -> List[sample.Sample]:
             AEROSPIKE_TEST_WORKLOAD_OBJECT_SPEC.value
         ),
     })
-    if FLAGS.aerospike_edition == aerospike_server.AerospikeEdition.ENTERPRISE:
-      metadata.update({
-          'aerospike_version': FLAGS.aerospike_enterprise_version,
-      })
+    metadata.update({
+        'aerospike_version': FLAGS.aerospike_version,
+    })
     for s in temp_samples:
       s.metadata.update(metadata)
     samples.extend(temp_samples)

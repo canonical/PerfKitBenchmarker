@@ -10,12 +10,12 @@ service {
   # See "man limits.conf" for how to set the system's "nofile" limit.
   proto-fd-max {{ proto_fd_max }}
 
-  work-directory run/work
+  work-directory opt/aerospike
   pidfile run/asd.pid
 }
 
 mod-lua {
-  user-path run/work/usr/udf/lua
+  user-path opt/aerospike/usr/udf/lua
 }
 
 logging {
