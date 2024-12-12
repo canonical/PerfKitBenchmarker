@@ -8,10 +8,8 @@ build occurred.
 import os.path
 
 from absl import flags
-from perfkitbenchmarker import configs
-from perfkitbenchmarker import sample
-from perfkitbenchmarker import vm_util
 
+from perfkitbenchmarker import configs, sample, vm_util
 
 FLAGS = flags.FLAGS
 
@@ -30,6 +28,9 @@ chromium_compile:
           zone: us-east-1a
         Azure:
           machine_type: Standard_F8
+          zone: eastus
+        OpenStack:
+          machine_type: m1.small
           zone: eastus
       disk_spec:
         # Standardize with 720 MB/s bandwidth to minimize I/O impact.
@@ -50,6 +51,10 @@ chromium_compile:
           disk_type: PremiumV2_LRS
           provisioned_iops: 18000
           provisioned_throughput: 360
+          mount_point: /scratch
+        OpenStack:
+          disk_type: standard
+          disk_size: 500
           mount_point: /scratch
       vm_count: 1
   flags:
