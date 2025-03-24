@@ -39,7 +39,6 @@ unmanaged_mysql_sysbench:
   description: Mysql on a VM benchmarked using Sysbench.
   vm_groups:
     server:
-      os_type: centos_stream9
       vm_spec:
         GCP:
           machine_type: c3-highmem-22
@@ -70,7 +69,6 @@ unmanaged_mysql_sysbench:
           provisioned_throughput: 800
           num_striped_disks: 2
     client:
-      os_type: centos_stream9
       vm_spec:
         GCP:
           machine_type: c3-standard-22
@@ -88,7 +86,6 @@ unmanaged_mysql_sysbench:
     db_engine: mysql
     sysbench_report_interval: 1
     sysbench_ssl_mode: required
-    db_high_availability: True
     sysbench_run_threads: 1,64,128,256,512,1024,2048
     sysbench_run_seconds: 300
 """

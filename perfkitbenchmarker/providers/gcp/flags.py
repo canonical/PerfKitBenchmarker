@@ -30,7 +30,7 @@ flags.DEFINE_integer(
     '(see https://cloud.google.com/compute/docs/local-ssd), and '
     'only applies for vms that can have a variable number of local SSDs.',
 )
-flags.DEFINE_string(
+GCLOUD_SCOPES = flags.DEFINE_string(
     'gcloud_scopes',
     None,
     'If set, space-separated list of scopes to apply to every created machine',
@@ -76,8 +76,15 @@ GCE_NETWORK_NAMES = flags.DEFINE_list(
     'The name of an already created '
     'network to use instead of creating a new one.',
 )
-GCE_NETWORK_TYPE = flags.DEFINE_string(
-    'gce_network_type', None, 'The network type or mode (i.e. auto, custom)'
+GCE_NETWORK_TYPE = flags.DEFINE_enum(
+    'gce_network_type',
+    'auto',
+    [
+        'auto',
+        'custom',
+        'legacy',
+    ],
+    'The subnet mode of the network (i.e. auto, custom, legacy)',
 )
 GCE_SUBNET_NAMES = flags.DEFINE_list(
     'gce_subnet_name',
@@ -191,6 +198,11 @@ GCE_CREATE_LOG_HTTP = flags.DEFINE_boolean(
     False,
     'If True, pass --log-http to gcloud compute instance create.',
 )
+GCE_NODE_GROUP = flags.DEFINE_string(
+    'gce_node_group',
+    None,
+    'The sole-tenant node group to use for the VM.',
+)
 
 flags.DEFINE_string(
     'gcp_node_type',
@@ -254,6 +266,12 @@ REDIS_ZONE_DISTRIBUTION = flags.DEFINE_enum(
     'Zones to distribute shards between. Only used if'
     ' --managed_memory_store_cluster is True.',
 )
+GCE_VM_SERVICE_ACCOUNT = flags.DEFINE_string(
+    'gce_vm_service_account',
+    None,
+    'Service account to use for authorization from a GCE VM.',
+)
+# TODO(user): Replace usages of this flag with --gce_vm_service_account.
 flags.DEFINE_string(
     'gcp_service_account', None, 'Service account to use for authorization.'
 )
@@ -281,6 +299,19 @@ GKE_NCCL_FAST_SOCKET = flags.DEFINE_boolean(
     'gke_enable_nccl_fast_socket',
     False,
     'Whether to enable NCCL fast socket on GKE.',
+)
+CONTAINER_REMOTE_BUILD_CONFIG = flags.DEFINE_string(
+    'container_remote_build_config',
+    None,
+    'The YAML or JSON file to use as the build configuration file.',
+)
+CONTAINER_RELEASE_CHANNEL = flags.DEFINE_enum(
+    'gke_release_channel',
+    None,
+    ['rapid', 'regular', 'stable'],
+    'The release channel to use for the container cluster. Different release'
+    ' channels support different Kubernetes versions and have different'
+    ' defaults.',
 )
 flags.DEFINE_string(
     'gcp_dataproc_subnet',
@@ -338,10 +369,8 @@ flags.DEFINE_enum(
     [
         'CLI',
         'JAVA',
-        'SIMBA_JDBC_1_2_4_1007',
-        'SIMBA_JDBC_1_3_3_1004',
-        'SIMBA_JDBC_1_5_0_1001',
-        'SIMBA_JDBC_1_5_2_1005',
+        'SIMBA_JDBC_1_6_2_1003',
+        'GOOGLE_JDBC',
         'PYTHON',
     ],
     'The Runtime Interface used when interacting with BigQuery.',
@@ -452,6 +481,13 @@ AI_BUCKET_URI = flags.DEFINE_string(
     'If set, use this pre-existing bucket for model upload. Otherwise will'
     ' create a bucket & copy needed information to it at runtime. Should not'
     ' have a gs:// prefix.',
+)
+
+GCLUSTER_PATH = flags.DEFINE_string(
+    'gcluster_path',
+    'gcluster',
+    # chmod 755, mv /usr/local/bin
+    'The path for the gcluster (cluster-toolkit) utility.',
 )
 
 

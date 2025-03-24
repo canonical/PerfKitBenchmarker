@@ -51,10 +51,14 @@ from perfkitbenchmarker.providers import azure
 from perfkitbenchmarker.providers.azure import azure_disk
 from perfkitbenchmarker.providers.azure import azure_disk_strategies
 from perfkitbenchmarker.providers.azure import azure_network
+from perfkitbenchmarker.providers.azure import flags as azure_flags
 from perfkitbenchmarker.providers.azure import util
 import yaml
 
+
 FLAGS = flags.FLAGS
+
+
 NUM_LOCAL_VOLUMES: dict[str, int] = {
     'Standard_L8s_v2': 1,
     'Standard_L16s_v2': 2,
@@ -146,10 +150,22 @@ TRUSTED_LAUNCH_UNSUPPORTED_OS_TYPES = [
 ]
 
 NVME_MACHINE_FAMILIES = [
+    'Standard_Das_v6',
+    'Standard_Dads_v6',
+    'Standard_Dals_v6',
+    'Standard_Dalds_v6',
+    'Standard_Ds_v6',
+    'Standard_Dds_v6',
+    'Standard_Eas_v6',
+    'Standard_Eads_v6',
     'Standard_Eibs_v5',
     'Standard_Ebs_v5',
     'Standard_Eibds_v5',
     'Standard_Ebds_v5',
+    'Standard_Es_v6',
+    'Standard_Fas_v6',
+    'Standard_Fals_v6',
+    'Standard_Fams_v6',
     'Standard_Ms_v3',
     'Standard_Mds_v3',
 ]
@@ -656,6 +672,14 @@ class AzureVirtualMachine(
   # globals guarded by _lock
   host_map = collections.defaultdict(list)
 
+  create_os_disk_strategy: azure_disk_strategies.AzureCreateOSDiskStrategy
+  nic: AzureNIC
+  public_ip: AzurePublicIPAddress | None = None
+  resource_group: azure_network.AzureResourceGroup
+  low_priority: bool
+  low_priority_status_code: int | None
+  spot_early_termination: bool
+
   def __init__(self, vm_spec):
     """Initialize an Azure virtual machine.
 
@@ -693,7 +717,7 @@ class AzureVirtualMachine(
     else:
       public_ip_name = None
       self.public_ip = None
-    self.nic = AzureNIC(
+    self.nic: AzureNIC = AzureNIC(
         self.network,
         self.name + '-nic',
         public_ip_name,
@@ -716,20 +740,22 @@ class AzureVirtualMachine(
     if arm_arch:
       self.host_arch = arm_arch
       self.is_aarch64 = True
+    self.hypervisor_generation = 2
     if vm_spec.image:
       self.image = vm_spec.image
     elif self.machine_type in _MACHINE_TYPES_ONLY_SUPPORT_GEN1_IMAGES:
+      self.hypervisor_generation = 1
       if hasattr(type(self), 'GEN1_IMAGE_URN'):
         self.image = type(self).GEN1_IMAGE_URN
       else:
         raise errors.Benchmarks.UnsupportedConfigError('No Azure gen1 image.')
     elif arm_arch:
       if hasattr(type(self), 'ARM_IMAGE_URN'):
-        self.image = type(self).ARM_IMAGE_URN
+        self.image = type(self).ARM_IMAGE_URN  # pytype: disable=attribute-error
       else:
         raise errors.Benchmarks.UnsupportedConfigError('No Azure ARM image.')
     elif self.machine_type_is_confidential:
-      self.image = type(self).CONFIDENTIAL_IMAGE_URN
+      self.image = type(self).CONFIDENTIAL_IMAGE_URN  # pytype: disable=attribute-error
     else:
       if hasattr(type(self), 'GEN2_IMAGE_URN'):
         self.image = type(self).GEN2_IMAGE_URN
@@ -810,17 +836,38 @@ class AzureVirtualMachine(
     os_disk_args = self.create_os_disk_strategy.GetCreationCommand()[
         'create-disk'
     ]
-    confidential_args = []
+    enable_secure_boot = azure_flags.AZURE_SECURE_BOOT.value
+    if (
+        self.trusted_launch_unsupported_type
+        and enable_secure_boot is not None
+    ):
+      raise errors.Benchmarks.UnsupportedConfigError(
+          "Please don't set --azure_secure_boot for"
+          f' {self.machine_type} machine_type. Attemping to update secure boot'
+          ' flag on a VM with standard security type fails with error "Use of'
+          ' UEFI settings is not supported...".',
+      )
+    security_args = []
+    secure_boot_args = []
+    # if machine is confidential or trusted launch, we can update secure boot
     if self.machine_type_is_confidential:
-      confidential_args = [
+      security_args = [
           '--enable-vtpm',
-          'true',
-          '--enable-secure-boot',
           'true',
           '--security-type',
           'ConfidentialVM',
           '--os-disk-security-encryption-type',
           'VMGuestStateOnly',
+      ]
+      if enable_secure_boot is None:
+        secure_boot_args = [
+            '--enable-secure-boot',
+            'true',
+        ]
+    if enable_secure_boot is not None:
+      secure_boot_args = [
+          '--enable-secure-boot',
+          str(enable_secure_boot).lower(),
       ]
 
     tags = {}
@@ -847,13 +894,23 @@ class AzureVirtualMachine(
             self.name,
         ]
         + os_disk_args
-        + confidential_args
+        + security_args
+        + secure_boot_args
         + self.resource_group.args
         + self.nic.args
         + tag_args
     )
-    if self.SupportsNVMe():
-      create_cmd.extend(['--disk-controller-type', 'NVMe'])
+    if self.hypervisor_generation > 1:
+      # Always specify disk controller type if supported (gen 2 hypervisor).
+      # If a machine supports both NVMe and SCSI, it will use NVMe, but PKB will
+      # assume it defaults to SCSI and fail to find the disk.
+      # Note this does mean PKB will downgrade machines that support both to
+      # SCSI unless they are explicitly specified as NVMe.
+      # TODO(pclay): Detect whether SKUs support NVMe.
+      if self.SupportsNVMe():
+        create_cmd.extend(['--disk-controller-type', 'NVMe'])
+      else:
+        create_cmd.extend(['--disk-controller-type', 'SCSI'])
     if self.trusted_launch_unsupported_type:
       create_cmd.extend(['--security-type', 'Standard'])
     if self.boot_startup_script:
@@ -1253,8 +1310,8 @@ class Rhel9BasedAzureVirtualMachine(
 class AlmaLinuxBasedAzureVirtualMachine(
     AzureVirtualMachine, linux_virtual_machine.RockyLinux8Mixin
 ):
-  GEN2_IMAGE_URN = 'almalinux:almalinux-hpc:8_7-hpc-gen2:latest'
-  GEN1_IMAGE_URN = 'almalinux:almalinux-hpc:8_7-hpc:latest'
+  GEN2_IMAGE_URN = 'almalinux:almalinux-hpc:8-hpc-gen2:latest'
+  GEN1_IMAGE_URN = 'almalinux:almalinux-hpc:8-hpc-gen1:latest'
 
 
 # Rocky Linux is now distributed via a community gallery:
@@ -1412,6 +1469,17 @@ class Windows2022CoreAzureVirtualMachine(
   )
 
 
+class Windows2025CoreAzureVirtualMachine(
+    BaseWindowsAzureVirtualMachine, windows_virtual_machine.Windows2025CoreMixin
+):
+  GEN2_IMAGE_URN = (
+      'MicrosoftWindowsServer:WindowsServer:2025-Datacenter-Core-g2:latest'
+  )
+  GEN1_IMAGE_URN = (
+      'MicrosoftWindowsServer:WindowsServer:2025-Datacenter-Core:latest'
+  )
+
+
 class Windows2016DesktopAzureVirtualMachine(
     BaseWindowsAzureVirtualMachine,
     windows_virtual_machine.Windows2016DesktopMixin,
@@ -1436,6 +1504,16 @@ class Windows2022DesktopAzureVirtualMachine(
       'MicrosoftWindowsServer:WindowsServer:2022-Datacenter-g2:latest'
   )
   GEN1_IMAGE_URN = 'MicrosoftWindowsServer:WindowsServer:2022-Datacenter:latest'
+
+
+class Windows2025DesktopAzureVirtualMachine(
+    BaseWindowsAzureVirtualMachine,
+    windows_virtual_machine.Windows2025DesktopMixin,
+):
+  GEN2_IMAGE_URN = (
+      'MicrosoftWindowsServer:WindowsServer:2025-Datacenter-g2:latest'
+  )
+  GEN1_IMAGE_URN = 'MicrosoftWindowsServer:WindowsServer:2025-Datacenter:latest'
 
 
 class Windows2019DesktopSQLServer2019StandardAzureVirtualMachine(

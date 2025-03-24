@@ -19,6 +19,7 @@ Timing for creation of the cluster and pods are handled by resource.py
 the beginning of cluster creation through the pod running.
 """
 
+import json
 import logging
 import time
 from typing import Callable, List
@@ -50,6 +51,7 @@ provision_container_cluster:
     type: Kubernetes
     vm_count: 1
     vm_spec: *default_dual_core
+    poll_for_events: true
 """
 
 # kubectl pods don't allow _'s.
@@ -161,13 +163,21 @@ def _BenchmarkClusterResize(
   cluster.WaitForRollout('daemonset/daemon-set')
 
   def GetPodOnNode() -> str:
-    pod, _, _ = container_service.RunKubectlCommand([
+    pods_json, _, _ = container_service.RunKubectlCommand([
         'get',
         'pod',
         '-o',
-        f'jsonpath={{.items[?(@.spec.nodeName=="{new_node}")].metadata.name}}',
+        'json',
     ])
-    return pod
+    # Kubectl's jsonpath does not support multiple filters, so we have to
+    # do the filtering manually.
+    pods = json.loads(pods_json)
+    for pod in pods['items']:
+      if pod['spec']['nodeName'] == new_node:
+        labels = pod['metadata'].get('labels')
+        if labels and labels.get('name') == 'daemon-set':
+          return pod['metadata']['name']
+    return ''
 
   new_pod = PollForData(
       GetPodOnNode,
@@ -203,33 +213,51 @@ def _GetKeyScalingEventTimes(
       if event.resource.kind == 'Pod' and event.resource.name == new_pod
   )
 
-  def First(items, predicate):
-    return next(item for item in items if predicate(item))
+  def First(
+      items: list[container_service.KubernetesEvent],
+      predicate: Callable[[container_service.KubernetesEvent], bool],
+      event_name: str,
+  ) -> dict[str, container_service.KubernetesEvent]:
+    filtered_item = next(filter(predicate, items), None)
+    if not filtered_item:
+      return {}
+    return {event_name: filtered_item}
 
-  key_events = {
-      'starting_kubelet': First(
-          node_events,
-          lambda event: event.message.startswith('Starting kubelet'),
-      ),
-      'node_registered': First(
-          node_events, lambda event: event.reason == 'RegisteredNode'
-      ),
-      'node_ready': First(
-          node_events, lambda event: event.reason == 'NodeReady'
-      ),
-      'image_pulling': First(
-          pod_events, lambda event: event.reason == 'Pulling'
-      ),
-      'image_pulled': First(pod_events, lambda event: event.reason == 'Pulled'),
-      'container_created': First(
-          pod_events,
-          lambda event: event.message.startswith('Created container'),
-      ),
-      'container_started': First(
-          pod_events,
-          lambda event: event.message.startswith('Started container'),
-      ),
-  }
+  key_events = {}
+  key_events |= First(
+      node_events,
+      lambda event: event.message.startswith('Starting kubelet'),
+      'starting_kubelet',
+  )
+  key_events |= First(
+      node_events,
+      lambda event: event.reason == 'RegisteredNode',
+      'node_registered',
+  )
+  key_events |= First(
+      node_events, lambda event: event.reason == 'NodeReady', 'node_ready'
+  )
+  key_events |= First(
+      pod_events, lambda event: event.reason == 'Pulling', 'image_pulling'
+  )
+  key_events |= First(
+      pod_events, lambda event: event.reason == 'Pulled', 'image_pulled'
+  )
+  key_events |= First(
+      pod_events,
+      lambda event: event.message.startswith('Created container'),
+      'container_created',
+  )
+  key_events |= First(
+      pod_events,
+      lambda event: event.message.startswith('Started container'),
+      'container_started',
+  )
+  if 'node_ready' not in key_events or 'container_started' not in key_events:
+    raise errors.Benchmarks.RunError(
+        'Expected to find node_ready and container_started events, but only'
+        ' had %s.' % key_events
+    )
   return {metric: event.timestamp for metric, event in key_events.items()}
 
 

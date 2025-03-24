@@ -614,6 +614,7 @@ class GcpDpbDataprocServerless(
     _, stderr, retcode = cmd.Issue(timeout=None, raise_on_failure=False)
     if retcode != 0:
       raise dpb_service.JobSubmissionError(stderr)
+    job_stderr = stderr
 
     fetch_batch_cmd = self.DataprocGcloudCommand(
         'batches', 'describe', self.batch_name
@@ -641,6 +642,7 @@ class GcpDpbDataprocServerless(
     return dpb_service.JobResult(
         run_time=(done_time - start_time).total_seconds(),
         pending_time=(start_time - pending_time).total_seconds(),
+        fetch_output_fn=lambda: (None, job_stderr),
     )
 
   def GetJobProperties(self) -> Dict[str, str]:
@@ -699,6 +701,8 @@ class GcpDpbDataprocServerless(
       result['spark.executor.memoryOverhead'] = (
           f'{self.spec.dataproc_serverless_memory_overhead}m'
       )
+    if self.spec.dataproc_serverless_runtime_engine == 'native':
+      result['spark.dataproc.runtimeEngine'] = 'native'
     result.update(super().GetJobProperties())
     return result
 
@@ -751,6 +755,7 @@ class GcpDpbDataprocServerless(
         'dpb_disk_size': self.metadata['dpb_disk_size'],
         'dpb_service_zone': self.metadata['dpb_service_zone'],
         'dpb_job_properties': self.metadata['dpb_job_properties'],
+        'dpb_runtime_engine': self.spec.dataproc_serverless_runtime_engine,
     }
 
   def CalculateLastJobCosts(self) -> dpb_service.JobCosts:

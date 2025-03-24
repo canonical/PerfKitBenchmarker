@@ -31,6 +31,7 @@ import time
 import uuid
 from absl import flags
 from perfkitbenchmarker import disk
+from perfkitbenchmarker import disk_strategies
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import flags as pkb_flags
 from perfkitbenchmarker import linux_virtual_machine
@@ -125,10 +126,13 @@ _MACHINE_TYPE_PREFIX_TO_ARM_ARCH = {
     'm8g': 'graviton4',
     'c8g': 'graviton4',
     'r8g': 'graviton4',
+    'i8g': 'graviton4',
     't4g': 'graviton2',
     'im4g': 'graviton2',
     'is4ge': 'graviton2',
+    'i4g': 'graviton2',
     'x2g': 'graviton2',
+    'hpc7g': 'graviton3E',
 }
 
 # Parameters for use with Elastic Network Interface
@@ -159,6 +163,8 @@ _EFA_V2_MACHINE_TYPES = (
     'trn1n.32xlarge',
 )
 
+_EFA_V3_MACHINE_TYPES = ('p5en.48xlarge',)
+
 _UNSUPPORTED = 'Unsupported'
 
 
@@ -182,7 +188,7 @@ class AwsVmNotCreatedError(Exception):
   """Error indicating that VM does not have a create_start_time."""
 
 
-class AwsImageNotFoundError(Exception):
+class AwsImageNotFoundError(vm_util.ImageNotFoundError):
   """Error indicating no appropriate AMI could be found."""
 
 
@@ -535,7 +541,26 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
   _lock = threading.Lock()
   deleted_hosts = set()
   host_map = collections.defaultdict(list)
+  client_token: str
+  create_cmd: list[str] | None
+  create_disk_strategy: disk_strategies.CreateDiskStrategy
+  device_by_disk_spec_id: dict[int, str]
+  disk_identifiers_by_device: dict[str, aws_disk.AWSDiskIdentifiers]
+  host: AwsDedicatedHost | None
+  id: str | None
+  instance_profile: str | None
   machine_type: str
+  network_eni_count: int
+  network_card_count: int
+  region: str
+  spot_early_termination: bool
+  spot_status_code: str | None
+  use_spot_instance: bool
+  firewall: aws_network.AwsFirewall
+  spot_price: float | None
+  spot_block_duration_minutes: int | None
+  boot_disk_size: int | None
+  num_hosts: int | None
 
   def __init__(self, vm_spec):
     """Initialize a AWS virtual machine.
@@ -805,7 +830,10 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
             network_interface['PrivateIpAddress']
         ] + self.internal_ips
       else:
-        self.internal_ips.append(network_interface['PrivateIpAddress'])
+        # EFAv3 only has internal IPs for every 4th NIC?
+        if (self.machine_type not in _EFA_V3_MACHINE_TYPES
+            or network_interface['Attachment']['NetworkCardIndex'] % 4 == 0):
+          self.internal_ips.append(network_interface['PrivateIpAddress'])
     if util.IsRegion(self.zone):
       self.zone = str(instance['Placement']['AvailabilityZone'])
 
@@ -900,7 +928,9 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
           f'echo "{self.user_name} - memlock unlimited" | '
           'sudo tee -a /etc/security/limits.conf'
       )
-    self.RemoteCommand('cd aws-efa-installer; sudo ./efa_installer.sh -y')
+    self.RemoteCommand(
+        'cd aws-efa-installer; sudo ./efa_installer.sh -y --skip-kmod'
+    )
     if not self.TryRemoteCommand('ulimit -l | grep unlimited'):
       # efa_installer.sh should reboot enabling this change, reboot if necessary
       self.Reboot()
@@ -926,6 +956,15 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
       self.aws_tags.update(util.MakeDefaultTags())
       # Signal (along with timeout_utc) that VM is short lived.
       self.aws_tags['vm_nature'] = 'ephemeral'
+    reservation_id = aws_flags.AWS_CAPACITY_BLOCK_RESERVATION_ID.value
+    if reservation_id:
+      reservation_args = [
+          '--count=1',
+          '--instance-market-options=MarketType="capacity-block"',
+          '--capacity-reservation-specification=CapacityReservationTarget='
+          '{CapacityReservationId=%s}' % reservation_id]
+    else:
+      reservation_args = []
     create_cmd = util.AWS_PREFIX + [
         'ec2',
         'run-instances',
@@ -936,7 +975,7 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
         '--key-name=%s' % AwsKeyFileManager.GetKeyNameForRun(),
         '--tag-specifications=%s'
         % util.FormatTagSpecifications('instance', self.aws_tags),
-    ]
+    ] + reservation_args
 
     if FLAGS.aws_vm_hibernate:
       create_cmd.extend([
@@ -971,8 +1010,11 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
             'Groups': self.group_id,
             'SubnetId': self.network.subnet.id,
         })
+        # https://aws.amazon.com/blogs/aws/new-amazon-ec2-p5en-instances-with-nvidia-h200-tensor-core-gpus-and-efav3-networking/
+        if self.machine_type in _EFA_V3_MACHINE_TYPES and device_index % 4:
+          efa_params['InterfaceType'] = 'efa-only'
         if (
-            self.machine_type in _EFA_V2_MACHINE_TYPES
+            self.machine_type in _EFA_V2_MACHINE_TYPES + _EFA_V3_MACHINE_TYPES
             and efa_params['DeviceIndex']
         ):
           efa_params['DeviceIndex'] = 1
@@ -1067,13 +1109,14 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
   def _DeleteDependencies(self):
     """Delete VM dependencies."""
     AwsKeyFileManager.DeleteKeyfile(self.region)
-    if self.host:
-      with self._lock:
-        if self.host in self.host_list:
-          self.host_list.remove(self.host)
-        if self.host not in self.deleted_hosts:
-          self.host.Delete()
-          self.deleted_hosts.add(self.host)
+    if not self.host:
+      return
+    with self._lock:
+      if self.host in self.host_list:
+        self.host_list.remove(self.host)
+      if self.host not in self.deleted_hosts:
+        self.host.Delete()  # pytype: disable=attribute-error
+        self.deleted_hosts.add(self.host)
 
   def _Create(self):
     """Create a VM instance."""
@@ -1251,7 +1294,7 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
           '--region=%s' % self.region,
           'ec2',
           'cancel-spot-instance-requests',
-          '--spot-instance-request-ids=%s' % self.spot_instance_request_id,
+          '--spot-instance-request-ids=%s' % self.spot_instance_request_id,  # pytype: disable=attribute-error
       ]
       vm_util.IssueCommand(cancel_cmd, raise_on_failure=False)
 
@@ -1483,7 +1526,7 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
     """Adds metadata to the VM."""
     util.AddTags(self.id, self.region, **kwargs)
     if self.use_spot_instance:
-      util.AddDefaultTags(self.spot_instance_request_id, self.region)
+      util.AddDefaultTags(self.spot_instance_request_id, self.region)  # pytype: disable=attribute-error
 
   def InstallCli(self):
     """Installs the AWS cli and credentials on this AWS vm."""
@@ -1681,9 +1724,7 @@ class Ubuntu2004DeepLearningAMIBasedAWSVirtualMachine(
     Raises:
       ValueError: If an incompatible vm_spec is passed.
     """
-    super().__init__(
-        vm_spec
-    )
+    super().__init__(vm_spec)
     # Add preinstalled packages for Deep Learning AMI
     self._installed_packages.add('nccl')
     self._installed_packages.add('cuda_toolkit')
@@ -1697,12 +1738,13 @@ class Ubuntu2004DeepLearningAMIBasedAWSVirtualMachine(
 
   def UpdateDockerfile(self, dockerfile):
     """Add provider specific instructions to a docker file."""
-    installation_script = r"""RUN curl -O https://efa-installer.amazonaws.com/aws-efa-installer-1.31.0.tar.gz
-RUN tar -xf aws-efa-installer-1.31.0.tar.gz && cd aws-efa-installer && ./efa_installer.sh --mpi=openmpi4 -y -g -d --skip-kmod --skip-limit-conf --no-verify
+    installation_script = r"""RUN apt-get update
+RUN curl -O https://efa-installer.amazonaws.com/aws-efa-installer-1.37.0.tar.gz
+RUN tar -xf aws-efa-installer-1.37.0.tar.gz && cd aws-efa-installer && ./efa_installer.sh --mpi=openmpi4 -y -g -d --skip-kmod --skip-limit-conf --no-verify
 RUN apt-get install libhwloc-dev -y
-RUN wget https://github.com/aws/aws-ofi-nccl/releases/download/v1.8.1-aws/aws-ofi-nccl-1.8.1-aws.tar.gz
+RUN wget https://github.com/aws/aws-ofi-nccl/releases/download/v1.13.0-aws/aws-ofi-nccl-1.13.0.tar.gz
 RUN export PATH=/opt/amazon/openmpi/bin/:\$PATH
-RUN tar -xf aws-ofi-nccl-1.8.1-aws.tar.gz && cd aws-ofi-nccl-1.8.1-aws && ./configure --prefix=/opt/aws-ofi-nccl --with-mpi=/opt/amazon/openmpi --with-libfabric=/opt/amazon/efa --with-cuda=/usr/local/cuda --enable-platform-aws && make && make install
+RUN tar -xf aws-ofi-nccl-1.13.0.tar.gz && cd aws-ofi-nccl-1.13.0 && ./configure --prefix=/opt/aws-ofi-nccl --with-mpi=/opt/amazon/openmpi --with-libfabric=/opt/amazon/efa --with-cuda=/usr/local/cuda --enable-platform-aws && make && make install
 ENV LD_LIBRARY_PATH=/opt/aws-ofi-nccl/lib:/opt/amazon/efa:\$LD_LIBRARY_PATH
 """
     for line in installation_script.splitlines():
@@ -2033,6 +2075,14 @@ class Windows2022CoreAwsVirtualMachine(
   )
 
 
+class Windows2025CoreAwsVirtualMachine(
+    BaseWindowsAwsVirtualMachine, windows_virtual_machine.Windows2025CoreMixin
+):
+  IMAGE_SSM_PATTERN = (
+      '/aws/service/ami-windows-latest/Windows_Server-2025-English-Core-Base'
+  )
+
+
 class Windows2016DesktopAwsVirtualMachine(
     BaseWindowsAwsVirtualMachine,
     windows_virtual_machine.Windows2016DesktopMixin,
@@ -2057,6 +2107,15 @@ class Windows2022DesktopAwsVirtualMachine(
 ):
   IMAGE_SSM_PATTERN = (
       '/aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base'
+  )
+
+
+class Windows2025DesktopAwsVirtualMachine(
+    BaseWindowsAwsVirtualMachine,
+    windows_virtual_machine.Windows2025DesktopMixin,
+):
+  IMAGE_SSM_PATTERN = (
+      '/aws/service/ami-windows-latest/Windows_Server-2025-English-Full-Base'
   )
 
 
@@ -2100,6 +2159,20 @@ class Windows2022DesktopSQLServer2022EnterpriseAwsVirtualMachine(
     windows_virtual_machine.Windows2022SQLServer2022Enterprise,
 ):
   IMAGE_SSM_PATTERN = '/aws/service/ami-windows-latest/Windows_Server-2022-English-Full-SQL_2022_Enterprise'
+
+
+class Windows2025DesktopSQLServer2022StandardAwsVirtualMachine(
+    BaseWindowsAwsVirtualMachine,
+    windows_virtual_machine.Windows2025SQLServer2022Standard,
+):
+  IMAGE_SSM_PATTERN = '/aws/service/ami-windows-latest/Windows_Server-2025-English-Full-SQL_2022_Standard'
+
+
+class Windows2025DesktopSQLServer2022EnterpriseAwsVirtualMachine(
+    BaseWindowsAwsVirtualMachine,
+    windows_virtual_machine.Windows2025SQLServer2022Enterprise,
+):
+  IMAGE_SSM_PATTERN = '/aws/service/ami-windows-latest/Windows_Server-2025-English-Full-SQL_2022_Enterprise'
 
 
 def GenerateDownloadPreprovisionedDataCommand(

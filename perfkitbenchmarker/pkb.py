@@ -144,8 +144,8 @@ DOCSTRING_REGEX = (  # Pattern that matches triple quoted comments.
 _TEARDOWN_EVENT = multiprocessing.Event()
 _ANY_ZONE = 'any'
 
-events.initialization_complete.connect(traces.RegisterAll)
-events.initialization_complete.connect(time_triggers.RegisterAll)
+events.register_tracers.connect(traces.RegisterAll)
+events.register_tracers.connect(time_triggers.RegisterAll)
 
 
 @flags.multi_flags_validator(
@@ -657,6 +657,8 @@ def DoProvisionPhase(
   # Pickle the spec before we try to create anything so we can clean
   # everything up on a second run if something goes wrong.
   spec.Pickle()
+
+  events.register_tracers.send(parsed_flags=FLAGS)
   events.benchmark_start.send(benchmark_spec=spec)
   try:
     with timer.Measure('Resource Provisioning'):
@@ -965,7 +967,13 @@ def _PublishRunStartedSample(spec):
   metadata = {'flags': str(flag_util.GetProvidedCommandLineFlags())}
   # Publish the path to this spec's PKB logs at the start of the runs.
   if log_util.PKB_LOG_BUCKET.value and FLAGS.run_uri:
-    metadata['pkb_log_path'] = log_util.GetPkbLogCloudPath(FLAGS.run_uri)
+    metadata['pkb_log_path'] = log_util.GetLogCloudPath(
+        log_util.PKB_LOG_BUCKET.value, f'{FLAGS.run_uri}-pkb.log'
+    )
+  if log_util.VM_LOG_BUCKET.value and FLAGS.run_uri:
+    metadata['vm_log_path'] = log_util.GetLogCloudPath(
+        log_util.VM_LOG_BUCKET.value, FLAGS.run_uri
+    )
 
   _PublishEventSample(spec, 'Run Started', metadata)
 
@@ -1161,6 +1169,10 @@ def RunBenchmark(
           spec.failed_substatus = (
               benchmark_status.FailedSubstatus.RETRIES_EXCEEDED
           )
+        elif _IsException(e, errors.Config.InvalidValue):
+          spec.failed_substatus = benchmark_status.FailedSubstatus.INVALID_VALUE
+        elif _IsException(e, vm_util.ImageNotFoundError):
+          spec.failed_substatus = benchmark_status.FailedSubstatus.UNSUPPORTED
         else:
           spec.failed_substatus = benchmark_status.FailedSubstatus.UNCATEGORIZED
         spec.status_detail = str(e)
@@ -1569,8 +1581,6 @@ def SetUpPKB():
       static_virtual_machine.StaticVirtualMachine.ReadStaticVirtualMachineFile(
           fp
       )
-
-  events.initialization_complete.send(parsed_flags=FLAGS)
 
   benchmark_lookup.SetBenchmarkModuleFunction(benchmark_sets.BenchmarkModule)
   package_lookup.SetPackageModuleFunction(benchmark_sets.PackageModule)

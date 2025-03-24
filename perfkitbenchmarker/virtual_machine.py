@@ -26,7 +26,7 @@ import logging
 import os.path
 import threading
 import typing
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from absl import flags
 from perfkitbenchmarker import benchmark_lookup
@@ -191,6 +191,11 @@ _VM_USER_NAME = flags.DEFINE_string(
     DEFAULT_USERNAME,
     'The user name to use for the VM. If not specified, the default user name'
     ' "perfkit" is used.',
+)
+SKIP_VM_PREPARATION = flags.DEFINE_bool(
+    'skip_vm_preparation',
+    False,
+    'Skips the PrepareAfterBoot step for VMs.',
 )
 
 
@@ -878,6 +883,10 @@ class BaseVirtualMachine(os_mixin.BaseOsMixin, resource.BaseResource):
       result['ip_address'] = self.ip_address
     if pkb_flags.RECORD_PROCCPU.value and self.cpu_version:
       result['cpu_version'] = self.cpu_version
+    if self.create_operation_name is not None:
+      result['create_operation_name'] = self.create_operation_name
+    if self.create_start_time:
+      result['create_start_time'] = self.create_start_time
     return result
 
   def SimulateMaintenanceEvent(self):
@@ -906,11 +915,11 @@ class BaseVirtualMachine(os_mixin.BaseOsMixin, resource.BaseResource):
 
   def _InstallData(
       self,
-      preprovisioned_data,
-      module_name,
-      filenames,
-      install_path,
-      fallback_url,
+      preprovisioned_data: Dict[str, str],
+      module_name: str,
+      filenames: List[str],
+      install_path: str,
+      fallback_url: Dict[str, str],
       timeout=PREPROVISIONED_DATA_TIMEOUT,
   ):
     """Installs preprovisioned_data on this VM.
@@ -936,10 +945,22 @@ class BaseVirtualMachine(os_mixin.BaseOsMixin, resource.BaseResource):
         continue
       url = fallback_url.get(filename)
       sha256sum = preprovisioned_data.get(filename)
+      chunked = False
       try:
+        # For extremely large files, we chunk into multiple files of 5GB each.
+        # Named with [original_filename]_[index]].part, index starting at 000.
+        # On Linux, run:
+        # split -b 5G [filename] -d -a 3 --additional-suffix=.part filename_
+        # Recovery is done during checksum verification.
         preprovisioned = self.ShouldDownloadPreprovisionedData(
             module_name, filename
         )
+        if not preprovisioned:
+          preprovisioned = self.ShouldDownloadPreprovisionedData(
+              module_name, f'{filename}_000.part'
+          )
+          if preprovisioned:
+            chunked = True
       except NotImplementedError:
         logging.info(
             'The provider does not implement '
@@ -955,11 +976,28 @@ class BaseVirtualMachine(os_mixin.BaseOsMixin, resource.BaseResource):
             'Cannot find file in /data directory either, fail to upload from '
             'local directory.' % (filename, module_name)
         )
-
+      # TODO(yuyanting): Cleanup the logic, extract chunked download to a
+      # separate function.
       if preprovisioned:
-        self.DownloadPreprovisionedData(
-            install_path, module_name, filename, timeout
-        )
+        if not chunked:
+          self.DownloadPreprovisionedData(
+              install_path, module_name, filename, timeout
+          )
+        else:
+          file_index = 0
+          while True:
+            chunked_filename = f'{filename}_{file_index:03d}.part'
+            # TODO(yuyanting): Use list + parallel download is probably faser.
+            # But in case we do not have list permission.
+            if not self.ShouldDownloadPreprovisionedData(
+                module_name, chunked_filename
+            ):
+              break
+            self.DownloadPreprovisionedData(
+                install_path, module_name, chunked_filename, timeout
+            )
+            file_index += 1
+          self.RecoverChunkedPreprovisionedData(install_path, filename)
       elif url:
         self.Install('wget')
         file_name = os.path.basename(url)

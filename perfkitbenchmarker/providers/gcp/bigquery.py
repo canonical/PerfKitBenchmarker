@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+from typing import Any
 
 from absl import flags
 from perfkitbenchmarker import data
@@ -36,29 +37,40 @@ BQ_PYTHON_CLIENT_FILE = 'bq_python_driver.py'
 BQ_PYTHON_CLIENT_DIR = 'edw/bigquery/clients/python'
 DEFAULT_TABLE_EXPIRATION = 3600 * 24 * 365  # seconds
 
-BQ_JDBC_INTERFACES = [
-    'SIMBA_JDBC_1_2_4_1007',
-    'SIMBA_JDBC_1_3_3_1004',
-    'SIMBA_JDBC_1_5_0_1001',
-    'SIMBA_JDBC_1_5_2_1005',
-]
+BQ_JDBC_INTERFACES = ['SIMBA_JDBC_1_6_2_1003', 'GOOGLE_JDBC']
 BQ_JDBC_CLIENT_FILE = {
-    'SIMBA_JDBC_1_2_4_1007': 'bq-jdbc-client-1.0.jar',
-    'SIMBA_JDBC_1_3_3_1004': 'bq-jdbc-client-2.0.jar',
-    'SIMBA_JDBC_1_5_0_1001': 'bq-jdbc-client-2.1.jar',
-    'SIMBA_JDBC_1_5_2_1005': 'bq-jdbc-client-2.2.jar',
+    'SIMBA_JDBC_1_6_2_1003': 'bq-jdbc-client-2.3.jar',
+    'GOOGLE_JDBC': 'bq-google-jdbc-client-1.0.jar',
 }
 BQ_JDBC_JAR_FILE = {
-    'SIMBA_JDBC_1_2_4_1007': 'GoogleBigQueryJDBC42.jar',
-    'SIMBA_JDBC_1_3_3_1004': 'GoogleBigQueryJDBC42-1.3.3.1004.jar',
-    'SIMBA_JDBC_1_5_0_1001': 'GoogleBigQueryJDBC42-1.5.0.1001.jar',
-    'SIMBA_JDBC_1_5_2_1005': 'GoogleBigQueryJDBC42-1.5.2.1005.jar',
+    'SIMBA_JDBC_1_6_2_1003': 'GoogleBigQueryJDBC42_1_6_2.jar',
+    'GOOGLE_JDBC': 'jdbc-jar-with-dependencies-20250129.jar',
 }
+
+
+class GenericClientInterface(edw_service.EdwClientInterface):
+  """Generic Client Interface class for BigQuery.
+
+  Attributes:
+    project_id: String name of the BigQuery project to benchmark
+    dataset_id: String name of the BigQuery dataset to benchmark
+  """
+
+  def __init__(self, project_id: str, dataset_id: str):
+    self.project_id = project_id
+    self.dataset_id = dataset_id
+
+  def GetMetadata(self) -> dict[str, str]:
+    """Gets the Metadata attributes for the Client Interface."""
+    return {'client': FLAGS.bq_client_interface}
+
+  def RunQueryWithResults(self, query_name: str) -> str:
+    raise NotImplementedError
 
 
 def GetBigQueryClientInterface(
     project_id: str, dataset_id: str
-) -> edw_service.EdwClientInterface:
+) -> GenericClientInterface:
   """Builds and Returns the requested BigQuery client Interface.
 
   Args:
@@ -80,23 +92,6 @@ def GetBigQueryClientInterface(
   if FLAGS.bq_client_interface == 'PYTHON':
     return PythonClientInterface(project_id, dataset_id)
   raise RuntimeError('Unknown BigQuery Client Interface requested.')
-
-
-class GenericClientInterface(edw_service.EdwClientInterface):
-  """Generic Client Interface class for BigQuery.
-
-  Attributes:
-    project_id: String name of the BigQuery project to benchmark
-    dataset_id: String name of the BigQuery dataset to benchmark
-  """
-
-  def __init__(self, project_id: str, dataset_id: str):
-    self.project_id = project_id
-    self.dataset_id = dataset_id
-
-  def GetMetadata(self) -> dict[str, str]:
-    """Gets the Metadata attributes for the Client Interface."""
-    return {'client': FLAGS.bq_client_interface}
 
 
 class CliClientInterface(GenericClientInterface):
@@ -155,11 +150,14 @@ class CliClientInterface(GenericClientInterface):
         )
     )
 
-  def ExecuteQuery(self, query_name: str) -> tuple[float, dict[str, str]]:
+  def ExecuteQuery(
+      self, query_name: str, print_results: bool = False
+  ) -> tuple[float, dict[str, Any]]:
     """Executes a query and returns performance details.
 
     Args:
       query_name: String name of the query to execute
+      print_results: Whether to include query results in execution details.
 
     Returns:
       A tuple of (execution_time, execution details)
@@ -172,6 +170,8 @@ class CliClientInterface(GenericClientInterface):
         'python script_driver.py --script={} --bq_project_id={} '
         '--bq_dataset_id={}'
     ).format(query_name, self.project_id, self.dataset_id)
+    if print_results:
+      query_command += ' --print_results=true'
     stdout, _ = self.client_vm.RemoteCommand(query_command)
     performance = json.loads(stdout)
     details = copy.copy(self.GetMetadata())  # Copy the base metadata
@@ -225,11 +225,14 @@ class JdbcClientInterface(GenericClientInterface):
         '',
     )
 
-  def ExecuteQuery(self, query_name: str) -> tuple[float, dict[str, str]]:
+  def ExecuteQuery(
+      self, query_name: str, print_results: bool = False
+  ) -> tuple[float, dict[str, Any]]:
     """Executes a query and returns performance details.
 
     Args:
       query_name: String name of the query to execute
+      print_results: Whether to include query results in execution details.
 
     Returns:
       A tuple of (execution_time, execution details)
@@ -251,6 +254,8 @@ class JdbcClientInterface(GenericClientInterface):
             query_name,
         )
     )
+    if print_results:
+      query_command += ' --print_results true'
     stdout, _ = self.client_vm.RemoteCommand(query_command)
     details = copy.copy(self.GetMetadata())  # Copy the base metadata
     details.update(json.loads(stdout)['details'])
@@ -289,11 +294,14 @@ class JavaClientInterface(GenericClientInterface):
         package_name, [BQ_CLIENT_FILE], ''
     )
 
-  def ExecuteQuery(self, query_name: str) -> tuple[float, dict[str, str]]:
+  def ExecuteQuery(
+      self, query_name: str, print_results: bool = False
+  ) -> tuple[float, dict[str, Any]]:
     """Executes a query and returns performance details.
 
     Args:
       query_name: String name of the query to execute.
+      print_results: Whether to include query results in execution details.
 
     Returns:
       A tuple of (execution_time, execution details)
@@ -318,6 +326,8 @@ class JavaClientInterface(GenericClientInterface):
         self.dataset_id,
         query_name,
     )
+    if print_results:
+      query_command += ' --print_results true'
     stdout, _ = self.client_vm.RemoteCommand(query_command)
     details = copy.copy(self.GetMetadata())  # Copy the base metadata
     details.update(json.loads(stdout)['details'])
@@ -390,6 +400,7 @@ class PythonClientInterface(GenericClientInterface):
 
   def __init__(self, *args, **kwargs):
     super().__init__(*args, **kwargs)
+    self.destination: str | None = None
     self.key_file_name = FLAGS.gcp_service_account_key_file
     if '/' in FLAGS.gcp_service_account_key_file:
       self.key_file_name = os.path.basename(FLAGS.gcp_service_account_key_file)
@@ -417,7 +428,9 @@ class PythonClientInterface(GenericClientInterface):
         os.path.join(BQ_PYTHON_CLIENT_DIR, BQ_PYTHON_CLIENT_FILE)
     )
 
-  def ExecuteQuery(self, query_name: str) -> tuple[float, dict[str, str]]:
+  def ExecuteQuery(
+      self, query_name: str, print_results: bool = False
+  ) -> tuple[float, dict[str, Any]]:
     """Executes a query and returns performance details."""
     cmd = (
         f'python3 {BQ_PYTHON_CLIENT_FILE} single --project'
@@ -425,6 +438,10 @@ class PythonClientInterface(GenericClientInterface):
         f' {self.dataset_id} --query_file {query_name} --feature_config'
         f' {FLAGS.edw_bq_feature_config}'
     )
+    if print_results:
+      cmd += ' --print_results'
+    if self.destination:
+      cmd += f' --destination {self.destination}'
     stdout, _ = self.client_vm.RemoteCommand(cmd)
     details = copy.copy(self.GetMetadata())
     details.update(json.loads(stdout)['details'])
@@ -446,6 +463,16 @@ class PythonClientInterface(GenericClientInterface):
     stdout, _ = self.client_vm.RemoteCommand(cmd)
     return stdout
 
+  def RunQueryWithResults(self, query_name: str) -> str:
+    """Executes a query and returns performance details and query output."""
+    cmd = (
+        f'python3 {BQ_PYTHON_CLIENT_FILE} single --project'
+        f' {self.project_id} --credentials_file {self.key_file_name} --dataset'
+        f' {self.dataset_id} --query_file {query_name} --print_results'
+    )
+    stdout, _ = self.client_vm.RemoteCommand(cmd)
+    return stdout
+
 
 class Bigquery(edw_service.EdwService):
   """Object representing a Bigquery cluster.
@@ -456,6 +483,8 @@ class Bigquery(edw_service.EdwService):
 
   CLOUD = provider_info.GCP
   SERVICE_TYPE = 'bigquery'
+  RUN_COST_QUERY_TEMPLATE = 'edw/bigquery/run_cost_query.sql.j2'
+  client_interface: GenericClientInterface
 
   def __init__(self, edw_service_spec):
     super().__init__(edw_service_spec)
@@ -672,6 +701,18 @@ class Bigquery(edw_service.EdwService):
       cmd.append(f'{project_dataset}.{table}')
       vm_util.IssueCommand(cmd)
 
+  def GetDatasetRegion(self, dataset=None):
+    """Get the region that a dataset resides in."""
+    cmd = [
+        'bq',
+        'show',
+        '--format=prettyjson',
+        self.FormatProjectAndDatasetForCommand(dataset),
+    ]
+    dataset_metadata, _, _ = vm_util.IssueCommand(cmd)
+    metadata_json = json.loads(str(dataset_metadata))
+    return str(metadata_json['location']).lower()
+
   def OpenDataset(self, dataset: str):
     self.client_interface.dataset_id = dataset
 
@@ -681,6 +722,37 @@ class Bigquery(edw_service.EdwService):
 
     cmd = ['bq', 'cp', source, dest]
     vm_util.IssueCommand(cmd)
+
+  def GetAutoscaleSlotSeconds(self, run_iter_id: str) -> int:
+    query_file_name = f'cost_query_{run_iter_id}'
+    context = {
+        'run_identifier': run_iter_id,
+        'project_dot_region': (
+            f'{self.client_interface.project_id}.region-{self.GetDatasetRegion()}'
+        ),
+    }
+    self.client_interface.client_vm.RenderTemplate(
+        data.ResourcePath(self.RUN_COST_QUERY_TEMPLATE),
+        query_file_name,
+        context,
+    )
+    output = json.loads(
+        self.client_interface.RunQueryWithResults(query_file_name)
+    )
+    run_cost = output['details']['query_results']['billed_slot_seconds'][0]
+    return run_cost
+
+  def GetIterationAuxiliaryMetrics(self, iter_run_key: str) -> dict[str, Any]:
+    service_auxiliary_metrics = {}
+    try:
+      run_cost = self.GetAutoscaleSlotSeconds(iter_run_key)
+      service_auxiliary_metrics['edw_bq_autoscale_slot_seconds'] = {
+          'value': run_cost,
+          'unit': 'slot-seconds',
+      }
+      return service_auxiliary_metrics
+    except NotImplementedError:  # No metrics support in client interface.
+      return {}
 
 
 class Endor(Bigquery):

@@ -108,6 +108,12 @@ NETPERF_NUMACTL_PHYSCPUBIND = flags.DEFINE_string(
     'Sets the cpus to run netperf. Please see --physcpubind on'
     ' https://linux.die.net/man/8/numactl for format.',
 )
+NETPERF_NUMACTL_CPUNODEBIND = flags.DEFINE_string(
+    'netperf_numactl_cpunodebind',
+    None,
+    'Sets the cpu nodes to run netperf. Please see --cpunodebind on'
+    ' https://linux.die.net/man/8/numactl for format.',
+)
 NETPERF_NUMACTL_MEMBIND = flags.DEFINE_string(
     'netperf_numactl_membind',
     None,
@@ -548,12 +554,21 @@ def RunNetperf(vm, benchmark_name, server_ips, num_streams, client_ips):
         f'--num_streams={num_streams} --port_start={PORT_START+(server_ip_idx*2*num_streams)}'
     )
 
-    if NETPERF_NUMACTL_MEMBIND.value or NETPERF_NUMACTL_PHYSCPUBIND.value:
+    if (
+        NETPERF_NUMACTL_MEMBIND.value
+        or NETPERF_NUMACTL_PHYSCPUBIND.value
+        or NETPERF_NUMACTL_CPUNODEBIND.value
+    ):
       numactl_prefix = 'numactl '
       if NETPERF_NUMACTL_PHYSCPUBIND.value:
         numactl_prefix += f'--physcpubind {NETPERF_NUMACTL_PHYSCPUBIND.value} '
+        metadata['netperf_physcpubind'] = NETPERF_NUMACTL_PHYSCPUBIND.value
+      if NETPERF_NUMACTL_CPUNODEBIND.value:
+        numactl_prefix += f'--cpunodebind {NETPERF_NUMACTL_CPUNODEBIND.value} '
+        metadata['netperf_cpunodebind'] = NETPERF_NUMACTL_CPUNODEBIND.value
       if NETPERF_NUMACTL_MEMBIND.value:
         numactl_prefix += f'--membind {NETPERF_NUMACTL_MEMBIND.value} '
+        metadata['netperf_membind'] = NETPERF_NUMACTL_MEMBIND.value
       remote_cmd = f'{numactl_prefix} {remote_cmd}'
 
     if FLAG_NETPERF_PERF_RECORD.value:
@@ -654,6 +669,16 @@ def RunNetperf(vm, benchmark_name, server_ips, num_streams, client_ips):
     # Create formatted output, following {benchmark_name}_Throughput_Xstream(s)
     # for TCP stream throughput metrics
     if benchmark_name.upper() == 'TCP_STREAM':
+      netperf_mss = None
+      for throughput_sample in throughput_samples:
+        sample_netperf_mss = throughput_sample.metadata['netperf_mss']
+        if netperf_mss is None:
+          netperf_mss = sample_netperf_mss
+        elif netperf_mss != sample_netperf_mss:
+          raise ValueError(
+              'Netperf MSS values do not match for multiple netperf threads.'
+          )
+      metadata['netperf_mss'] = netperf_mss if netperf_mss else 'unknown'
       samples.append(
           sample.Sample(
               f'{benchmark_name}_Throughput_{len(parsed_output)}streams',

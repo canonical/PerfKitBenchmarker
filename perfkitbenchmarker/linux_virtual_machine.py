@@ -1524,6 +1524,17 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
         self.ssh_private_key if self.is_static else vm_util.GetPrivateKeyPath()
     )
     ssh_cmd.extend(vm_util.GetSshOptions(ssh_private_key))
+    # TODO(yuyanting): Revisit implementing with "-o ProxyJump".
+    # Current proxy implementation relies on ssh_config file being generated,
+    # which happens at the end of the Provision stage. This causes circular
+    # depencency for regular VM (and thus only used in cluster provisioned VMs).
+    if self.proxy_jump:
+      ssh_cmd = [
+          'ssh',
+          '-F',
+          os.path.join(vm_util.GetTempDir(), 'ssh_config'),
+          self.name,
+      ]
 
     if should_pre_log:
       logger.info(
@@ -2068,6 +2079,13 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
         )
     )
 
+  def RecoverChunkedPreprovisionedData(self, path, filename):
+    """Recover chunked preprovisioned data."""
+    self.RemoteCommand(
+        f'cd {path} && cat {filename}_*.part > {filename} && '
+        f'rm {filename}_*.part'
+    )
+
   def GetSha256sum(self, path, filename):
     """Gets the sha256sum hash for a filename in a path on the VM.
 
@@ -2168,7 +2186,13 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
     self.InstallPackages('nvme-cli')
     version_str, _ = self.RemoteCommand('sudo nvme --version')
     version_num = version_str.split()[2]
-    if packaging_version.parse(version_num) >= packaging_version.parse('1.5'):
+    # TODO(arushigaur): Version check can be removed and we can just parse
+    # the raw output.
+    if packaging_version.parse(version_num) >= packaging_version.parse(
+        '1.5'
+    ) and packaging_version.parse(version_num) < packaging_version.parse(
+        '2.11'
+    ):
       stdout, _ = self.RemoteCommand('sudo nvme list --output-format json')
       if not stdout:
         return []
@@ -2218,9 +2242,8 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
     # journalctl
     try:
       journalctl_path = vm_util.PrependTempDir('journalctl')
-      journalctl, _ = self.RemoteCommand('sudo journalctl --no-pager')
-      with open(journalctl_path, 'w') as f:
-        f.write(journalctl)
+      self.RemoteCommand('sudo journalctl --no-pager > /tmp/journalctl.tmp')
+      self.PullFile(journalctl_path, '/tmp/journalctl.tmp')
       log_files.append(journalctl_path)
     except errors.VirtualMachine.RemoteCommandError:
       logging.warning('Failed to capture VM journalctl on %s', self.name)
@@ -2228,6 +2251,10 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
     sosreport_local_path = vm_util.PrependTempDir('sosreport.tar.xz')
     if self.GenerateAndCaptureSosReport(sosreport_local_path):
       log_files.append(sosreport_local_path)
+    # Serial port 1 (console)
+    serial_port_1_path = vm_util.PrependTempDir('serial_port_1')
+    if self.GenerateAndCaptureSerialPortOutput(serial_port_1_path):
+      log_files.append(serial_port_1_path)
     return log_files
 
   def GenerateAndCaptureSosReport(self, local_path: str) -> bool:
@@ -2258,6 +2285,24 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
     )
     self.RemoteCopy(local_path, sosreport_path, copy_to=False)
     return True
+
+  def GenerateAndCaptureSerialPortOutput(self, local_path: str) -> bool:
+    """Generates and captures the serial port output for the remote VM.
+
+    Implemented per-provider
+
+    Args:
+      local_path: The path to store the serial port output on the caller's
+        machine.
+
+    Returns:
+      True if the serial port output was successfully generated and captured;
+      False otherwise.
+    """
+    logging.warning(
+        'Capturing serial port output is not implemented for this VM.'
+    )
+    return False
 
 
 def _IncrementStackLevel(**kwargs: Any) -> Any:

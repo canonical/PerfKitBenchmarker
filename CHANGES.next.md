@@ -88,6 +88,9 @@
 -   Remove Broken Juju and Ubuntu Container OS types.
 -   Remove support for installing Python 2 in VMs.
 -   Make Ubuntu 24 the default os_type.
+-   Merged redundant `--runspec_build_tool_version` with `--gcc_version`.
+-   Create new flag `--azure_blob_storage_type` that defaults to `Standard_ZRS`
+    instead of former default `--azure_storage_type=Standard_LRS`.
 
 ### New features:
 
@@ -198,7 +201,7 @@
     alive if any metrics satisfy the criteria passed into the flag.
 -   Add unmanaged_mysql_sysbench benchmark.
 -   Refactor nginx_benchmark to use reverse_proxy or api_gateway configurations.
--   Add support for simple Vertex AI & AWS Sagemaker managed models.
+-   Add support for managed Llama 2 & 3 models in Vertex AI & AWS Sagemaker.
 -   Add new pressure_stall trace.
 -   Add `--skip_teardown_on_command_timeout` flag to skip teardown if the
     failure substatus is COMMAND_TIMEOUT.
@@ -209,6 +212,9 @@
     captured via the `--capture_vm_logs` flag to a GCS bucket.
 -   Add chromium_compile_benchmark.
 -   Add unmanaged_postgresql_sysbench benchmark.
+-   Add new vmstat trace.
+-   Add support for customizing Hadoop jobs scheduling
+-   Add support for GKE Autopilot & EKS Auto, which don't require nodepools.
 
 ### Enhancements:
 
@@ -369,7 +375,11 @@
     (requires `--cluster_boot_linux_boot_metrics` flag).
 -   Publish a `Host Create Latency` metric in the Cluster Boot benchmark
 -   Added `ss` switch to gather TCP/UDP socket perf stats
-
+-   Add support for Windows 2025 on AWS, Azure, and GCP.
+-   Add support for Redis Cluster mode on VMs.
+-   Add support for multiload as part of Multichase benchmark.
+-   Add support for GPU and task count parameters as part of cloud run job
+    resource.
 ### Bug fixes and maintenance updates:
 
 -   Add 'runcpu --update' and 'runcpu --version' commands to install phase.
@@ -530,3 +540,5 @@
 -   Update bigtable_walkthrough/README.md to help reduce the user frictions.
 -   Remove default boot_disk_type in GCP.
 -   Update AWS and Azure default disks to gp3 and PremiumV2_LRS respectively.
+-   When `--ycsb_commit` is set, YCSB at the given commit can be pulled into
+    `YCSB_DIR` even if the directory already exists.

@@ -29,6 +29,7 @@ from perfkitbenchmarker import background_tasks
 from perfkitbenchmarker import benchmark_status
 from perfkitbenchmarker import capacity_reservation
 from perfkitbenchmarker import cloud_tpu
+from perfkitbenchmarker import cluster
 from perfkitbenchmarker import container_service
 from perfkitbenchmarker import context
 from perfkitbenchmarker import data_discovery_service
@@ -179,7 +180,8 @@ class BenchmarkSpec:
     self.uuid = '%s-%s' % (FLAGS.run_uri, uuid.uuid4())
     self.always_call_cleanup = pkb_flags.ALWAYS_CALL_CLEANUP.value
     self.dpb_service: dpb_service.BaseDpbService = None
-    self.container_cluster = None
+    self.container_cluster: container_service.BaseContainerCluster = None
+    self.cluster: cluster.BaseCluster = None
     self.key = None
     self.relational_db = None
     self.non_relational_db = None
@@ -294,6 +296,7 @@ class BenchmarkSpec:
     self.ConstructContainerRegistry()
     # dpb service needs to go first, because it adds some vms.
     self.ConstructDpbService()
+    self.ConstructCluster()
     self.ConstructVirtualMachines()
     self.ConstructRelationalDb()
     self.ConstructNonRelationalDb()
@@ -331,6 +334,18 @@ class BenchmarkSpec:
         self.config.container_cluster
     )
     self.resources.append(self.container_cluster)
+
+  def ConstructCluster(self):
+    """Create the cluster."""
+    if self.config.cluster is None:
+      return
+    cloud = self.config.cluster.cloud
+    providers.LoadProvider(cloud)
+    cluster_class = cluster.GetClusterClass(cloud)
+    self.cluster = cluster_class(self.config.cluster)
+    self.resources.append(self.cluster)
+    self.vms_to_boot.update(
+        self.cluster.ExportVmGroupsForUnmanagedProvision())
 
   def ConstructContainerRegistry(self):
     """Create the container registry."""
@@ -405,6 +420,7 @@ class BenchmarkSpec:
           relational_db_class.GetDefaultEngineVersion(engine)
       )
     self.relational_db = relational_db_class(self.config.relational_db)
+    self.resources.append(self.relational_db)
 
   def ConstructNonRelationalDb(self) -> None:
     """Initializes the non_relational db."""
@@ -758,7 +774,7 @@ class BenchmarkSpec:
         for vm in vms:
           vm.controller = clouds[group_spec.cloud]
 
-        jujuvm.units.extend(vms)
+        jujuvm.units.extend(vms)  # pytype: disable=attribute-error
         if jujuvm and jujuvm not in self.vms:
           self.vms.extend([jujuvm])
           self.vm_groups['%s_juju_controller' % group_spec.cloud] = [jujuvm]
@@ -899,7 +915,10 @@ class BenchmarkSpec:
       )
       if self.nfs_service and self.nfs_service.CLOUD == nfs_service.UNMANAGED:
         self.nfs_service.Create()
-      background_tasks.RunThreaded(lambda vm: vm.PrepareAfterBoot(), self.vms)
+      if not FLAGS.skip_vm_preparation:
+        background_tasks.RunThreaded(lambda vm: vm.PrepareAfterBoot(), self.vms)
+      else:
+        logging.info('Skipping VM preparation.')
 
       sshable_vms = [
           vm for vm in self.vms if vm.OS_TYPE not in os_types.WINDOWS_OS_TYPES
@@ -912,6 +931,12 @@ class BenchmarkSpec:
             if vm.OS_TYPE not in os_types.WINDOWS_OS_TYPES
         ]
       vm_util.GenerateSSHConfig(sshable_vms, sshable_vm_groups)
+    if self.cluster:
+      if self.cluster.unmanaged:
+        self.cluster.ImportVmGroups(
+            self.vm_groups['headnode'][0],
+            self.vm_groups['workers'])
+      self.cluster.Create()
     if self.dpb_service:
       self.dpb_service.Create()
     if hasattr(self, 'relational_db') and self.relational_db:
@@ -1042,6 +1067,9 @@ class BenchmarkSpec:
       self.container_cluster.DeleteContainers()
       self.container_cluster.Delete()
 
+    if self.cluster:
+      self.cluster.Delete()
+
     for net in self.networks.values():
       try:
         net.Delete()
@@ -1164,7 +1192,7 @@ class BenchmarkSpec:
           % (os_type, cloud)
       )
 
-    return vm_class(vm_spec)
+    return vm_class(vm_spec)  # pytype: disable=not-instantiable
 
   def DeleteVm(self, vm):
     """Deletes a single vm and scratch disk if required.

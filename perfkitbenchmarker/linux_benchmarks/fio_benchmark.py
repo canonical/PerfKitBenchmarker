@@ -951,7 +951,13 @@ def RunFioOnVMs(vms):
     return samples
 
 
-def RunWithExec(vm, exec_path, remote_job_file_path, job_file_contents):
+def RunWithExec(
+    vm,
+    exec_path,
+    remote_job_file_path,
+    job_file_contents,
+    fio_generate_scenarios=None,
+):
     """Spawn fio and gather the results. Used by Windows FIO as well.
 
     Args:
@@ -959,18 +965,20 @@ def RunWithExec(vm, exec_path, remote_job_file_path, job_file_contents):
       exec_path: string path to the fio executable.
       remote_job_file_path: path, on the vm, to the location of the job file.
       job_file_contents: string contents of the fio job file.
+      fio_generate_scenarios: list of strings with scenrios to benchmark.
 
     Returns:
       A list of sample.Sample objects.
     """
     logging.info("FIO running on %s", vm)
-
+    if not fio_generate_scenarios:
+        fio_generate_scenarios = FLAGS.fio_generate_scenarios
     disks = vm.scratch_disks
     require_merge = len(disks) > 1
 
     job_file_string = GetOrGenerateJobFileString(
         FLAGS.fio_jobfile,
-        FLAGS.fio_generate_scenarios,
+        fio_generate_scenarios,
         AgainstDevice(),
         disks,
         FLAGS.fio_io_depths,
@@ -990,82 +998,84 @@ def RunWithExec(vm, exec_path, remote_job_file_path, job_file_contents):
         logging.info("Wrote fio job file at %s", job_file_path)
         logging.info(job_file_string)
 
-    vm.PushFile(job_file_path, remote_job_file_path)
+        vm.PushFile(job_file_path, remote_job_file_path)
 
-    if AgainstDevice():
-        if "filename" in job_file_string:
-            filename_parameter = ""
-        else:
-            filenames = ":".join([disk.GetDevicePath() for disk in disks])
-            filename_parameter = f"--filename={filenames}"
-        fio_command = (
-            f"{exec_path} --output-format=json "
-            f"--random_generator={FLAGS.fio_rng} "
-            f"{filename_parameter} {remote_job_file_path}"
-        )
-    else:
-        assert len(disks) == 1
-        fio_command = (
-            f"{exec_path} --output-format=json "
-            f"--random_generator={FLAGS.fio_rng} "
-            f"--directory={disks[0].mount_point} {remote_job_file_path}"
-        )
-
-    collect_logs = any(
-        [
-            FLAGS.fio_lat_log,
-            FLAGS.fio_bw_log,
-            FLAGS.fio_iops_log,
-            FLAGS.fio_hist_log,
-        ]
-    )
-
-    log_file_base = ""
-    if collect_logs:
-        log_file_base = "%s_%s" % (PKB_FIO_LOG_FILE_NAME, str(time.time()))
-        fio_command = " ".join([fio_command, GetLogFlags(log_file_base)])
-
-    # TODO(user): This only gives results at the end of a job run
-    #      so the program pauses here with no feedback to the user.
-    #      This is a pretty lousy experience.
-    logging.info("FIO Results:")
-    start_time = time.time()
-    stdout, _ = vm.RobustRemoteCommand(
-        fio_command, timeout=FLAGS.fio_command_timeout_sec
-    )
-    end_time = time.time()
-    bin_vals = []
-    if collect_logs:
-        vm.PullFile(vm_util.GetTempDir(), "%s*.log" % log_file_base)
-        if FLAGS.fio_hist_log:
-            num_logs = int(
-                vm.RemoteCommand("ls %s_clat_hist.*.log | wc -l" % log_file_base)[0]
+        if AgainstDevice():
+            if "filename" in job_file_string:
+                filename_parameter = ""
+            else:
+                filenames = ":".join([disk.GetDevicePath() for disk in disks])
+                filename_parameter = f"--filename={filenames}"
+            fio_command = (
+                f"{exec_path} --output-format=json "
+                f"--random_generator={FLAGS.fio_rng} "
+                f"{filename_parameter} {remote_job_file_path}"
             )
-            bin_vals += [
-                fio.ComputeHistogramBinVals(
-                    vm, "%s_clat_hist.%s.log" % (log_file_base, idx + 1)
-                )
-                for idx in range(num_logs)
+        else:
+            assert len(disks) == 1
+            fio_command = (
+                f"{exec_path} --output-format=json "
+                f"--random_generator={FLAGS.fio_rng} "
+                f"--directory={disks[0].mount_point} {remote_job_file_path}"
+            )
+
+        collect_logs = any(
+            [
+                FLAGS.fio_lat_log,
+                FLAGS.fio_bw_log,
+                FLAGS.fio_iops_log,
+                FLAGS.fio_hist_log,
             ]
-    samples = fio.ParseResults(
-        job_file_string,
-        json.loads(stdout),
-        log_file_base=log_file_base,
-        bin_vals=bin_vals,
-        skip_latency_individual_stats=(not _FIO_INCLUDE_LATENCY_PERCENTILES.value),
-        require_merge=require_merge,
-    )
+        )
 
-    samples.append(sample.Sample("start_time", start_time, "sec", samples[0].metadata))
-    samples.append(sample.Sample("end_time", end_time, "sec", samples[0].metadata))
+        log_file_base = ""
+        if collect_logs:
+            log_file_base = "%s_%s" % (PKB_FIO_LOG_FILE_NAME, str(time.time()))
+            fio_command = " ".join([fio_command, GetLogFlags(log_file_base)])
 
-    for item in samples:
-        item.metadata["fio_target_mode"] = FLAGS.fio_target_mode
-        item.metadata["fio_fill_size"] = FLAGS.fio_fill_size
-        item.metadata["fio_fill_block_size"] = FLAGS.fio_fill_block_size
-        item.metadata["fio_rng"] = FLAGS.fio_rng
+        # TODO(user): This only gives results at the end of a job run
+        #      so the program pauses here with no feedback to the user.
+        #      This is a pretty lousy experience.
+        logging.info("FIO Results:")
+        start_time = time.time()
+        stdout, _ = vm.RobustRemoteCommand(
+            fio_command, timeout=FLAGS.fio_command_timeout_sec
+        )
+        end_time = time.time()
+        bin_vals = []
+        if collect_logs:
+            vm.PullFile(vm_util.GetTempDir(), "%s*.log" % log_file_base)
+            if FLAGS.fio_hist_log:
+                num_logs = int(
+                    vm.RemoteCommand("ls %s_clat_hist.*.log | wc -l" % log_file_base)[0]
+                )
+                bin_vals += [
+                    fio.ComputeHistogramBinVals(
+                        vm, "%s_clat_hist.%s.log" % (log_file_base, idx + 1)
+                    )
+                    for idx in range(num_logs)
+                ]
+        samples = fio.ParseResults(
+            job_file_string,
+            json.loads(stdout),
+            log_file_base=log_file_base,
+            bin_vals=bin_vals,
+            skip_latency_individual_stats=(not _FIO_INCLUDE_LATENCY_PERCENTILES.value),
+            require_merge=require_merge,
+        )
 
-    return samples
+        samples.append(
+            sample.Sample("start_time", start_time, "sec", samples[0].metadata)
+        )
+        samples.append(sample.Sample("end_time", end_time, "sec", samples[0].metadata))
+
+        for item in samples:
+            item.metadata["fio_target_mode"] = FLAGS.fio_target_mode
+            item.metadata["fio_fill_size"] = FLAGS.fio_fill_size
+            item.metadata["fio_fill_block_size"] = FLAGS.fio_fill_block_size
+            item.metadata["fio_rng"] = FLAGS.fio_rng
+
+        return samples
 
 
 def Cleanup(benchmark_spec):

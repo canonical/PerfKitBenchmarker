@@ -72,6 +72,7 @@ class BaseOsMixin(command_interface.CommandInterface, metaclass=abc.ABCMeta):
   scratch_disks: List[disk.BaseDisk]  # mixed from BaseVirtualMachine
   name: str  # mixed from BaseVirtualMachine
   ssh_private_key: str  # mixed from BaseVirtualMachine
+  proxy_jump: str  # mixed from BaseVirtualMachine
   user_name: str  # mixed from BaseVirtualMachine
   disable_interrupt_moderation: str  # mixed from BaseVirtualMachine
   disable_rss: str  # mixed from BaseVirtualMachine
@@ -93,6 +94,7 @@ class BaseOsMixin(command_interface.CommandInterface, metaclass=abc.ABCMeta):
     self.bootable_time = None
     self.port_listening_time = None
     self.hostname = None
+    self.proxy_jump = None
 
     # Ports that will be opened by benchmark_spec to permit access to the VM.
     self.remote_access_ports = []
@@ -187,6 +189,24 @@ class BaseOsMixin(command_interface.CommandInterface, metaclass=abc.ABCMeta):
 
     Raises:
       RemoteCommandError: If there was a problem issuing the command.
+    """
+    raise NotImplementedError()
+
+  def RemoteCommandWithReturnCode(
+      self, *args, **kwargs
+  ) -> Tuple[str, str, int]:
+    """Runs a command on the VM & returns error code.
+
+    Args:
+      *args: Generic arguments, lining up with RemoteCommand.
+      **kwargs: Additional arguments, including anything additional from child
+        implementations.
+
+    Returns:
+      A tuple of stdout, stderr, return_code from running the command.
+
+    Raises:
+      RemoteCommandError: If there was a problem establishing the connection.
     """
     raise NotImplementedError()
 
@@ -445,6 +465,10 @@ class BaseOsMixin(command_interface.CommandInterface, metaclass=abc.ABCMeta):
   def Install(self, package_name):
     """Installs a PerfKit package on the VM."""
     raise NotImplementedError()
+
+  def InstallPackages(self, packages: str) -> None:
+    """Installs packages using the OS's package manager."""
+    pass
 
   def Uninstall(self, package_name):
     """Uninstalls a PerfKit package on the VM."""
@@ -758,6 +782,10 @@ class BaseOsMixin(command_interface.CommandInterface, metaclass=abc.ABCMeta):
     Returns:
       string; The sha256sum hash.
     """
+    raise NotImplementedError()
+
+  def RecoverChunkedPreprovisionedData(self, path, filename):
+    """Recover chunked preprovisioned data."""
     raise NotImplementedError()
 
   def CheckPreprovisionedData(

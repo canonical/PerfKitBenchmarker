@@ -31,12 +31,18 @@ flags.DEFINE_enum(
 LRS = 'Standard_LRS'
 ULRS = 'UltraSSD_LRS'
 PLRS = 'Premium_LRS'
+PZRS = 'Premium_ZRS'
 ZRS = 'Standard_ZRS'
 GRS = 'Standard_GRS'
+GZRS = 'Standard_GZRS'
 RAGRS = 'Standard_RAGRS'
+RAGZRS = 'Standard_RAGZRS'
 
+STORAGE_V2 = 'StorageV2'
+# These are deprecated in favor of StorageV2
 STORAGE = 'Storage'
 BLOB_STORAGE = 'BlobStorage'
+BLOCK_BLOB_STORAGE = 'BlockBlobStorage'
 VALID_TIERS = ['Basic', 'Standard', 'Premium']
 
 # Azure redis cache tiers. See
@@ -67,13 +73,23 @@ flags.DEFINE_enum(
     'VM creation will fail.',
 )
 
-flags.DEFINE_enum(
+AZURE_BLOB_STORAGE_ACCOUNT_KIND = flags.DEFINE_enum(
     'azure_blob_account_kind',
-    BLOB_STORAGE,
-    [STORAGE, BLOB_STORAGE],
-    'The type of storage account to use for blob storage. Choosing Storage '
-    'will let you use ZRS storage. Choosing BlobStorage will give you access '
-    'to Hot and Cold storage tiers.',
+    STORAGE_V2,
+    [STORAGE_V2, BLOCK_BLOB_STORAGE, BLOB_STORAGE, STORAGE],
+    'Type of Azure storage account to create for blob storage. Defaults to'
+    ' StorageV2. BlockBlobStorage is required for Premium block blobs. See'
+    ' https://learn.microsoft.com/en-us/azure/storage/common/storage-account-overview#types-of-storage-accounts'
+    ' for more information.',
+)
+AZURE_BLOB_STORAGE_TYPE = flags.DEFINE_enum(
+    'azure_blob_storage_type',
+    ZRS,
+    [ZRS, LRS, PLRS, PZRS, GRS, RAGRS, GZRS, RAGZRS],
+    'Azure storage Account SKU to use for blob storage. Defaults to '
+    "'Standard_ZRS' unlike --azure_storage_type which defaults to "
+    "'Standard_LRS'. This is consistent with other clouds that default to "
+    'zonal disks, but regional object storage buckets.',
 )
 flags.DEFINE_string(
     'azure_preprovisioned_data_account',
@@ -153,4 +169,10 @@ AZURE_ATTACH_DISK_WITH_CREATE = flags.DEFINE_boolean(
     'azure_attach_disk_with_create',
     True,
     'Whether to create PD disks at VM creation time. Defaults to True.',
+)
+AZURE_SECURE_BOOT = flags.DEFINE_bool(
+    'azure_secure_boot',
+    None,
+    'Enable/Disable secure boot of the VM to allow unsigned operating systems'
+    ' and drivers. Defaults to None to fallback to Azure default behavior',
 )

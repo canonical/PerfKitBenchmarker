@@ -73,7 +73,7 @@ class AwsAuroraRelationalDb(aws_relational_db.BaseAwsRelationalDb):
           'should be specified.   '
           'db_high_availability: {}  '
           'zone count: {} '.format(
-              zones_needed_for_high_availability, len(self.zones)
+              self.spec.high_availability, len(self.zones)
           )
       )
 
@@ -93,6 +93,7 @@ class AwsAuroraRelationalDb(aws_relational_db.BaseAwsRelationalDb):
             '--vpc-security-group-ids=%s' % self.security_group_id,
             '--availability-zones=%s' % self.spec.zones[0],
             '--storage-type=%s' % self.storage_type,
+            '--backup-retention-period=1',  # backups cannot be disabled
             '--tags',
         ]
         + util.MakeFormattedDefaultTags()

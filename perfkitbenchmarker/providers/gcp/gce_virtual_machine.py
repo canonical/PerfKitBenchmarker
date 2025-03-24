@@ -331,9 +331,7 @@ class GceVmSpec(virtual_machine.BaseVmSpec):
             {'default': None},
         ),
         'threads_per_core': (option_decoders.IntDecoder, {'default': None}),
-        'visible_core_count': (option_decoders.IntDecoder, {
-            'default': None
-        }),
+        'visible_core_count': (option_decoders.IntDecoder, {'default': None}),
         'gce_tags': (
             option_decoders.ListDecoder,
             {
@@ -649,6 +647,9 @@ class GceVirtualMachine(virtual_machine.BaseVirtualMachine):
     if gcp_flags.GCE_CREATE_LOG_HTTP.value:
       cmd.flags['log-http'] = True
 
+    if gcp_flags.GCE_NODE_GROUP.value:
+      cmd.flags['node-group'] = gcp_flags.GCE_NODE_GROUP.value
+
     # Compute all flags requiring alpha first. Then if any flags are different
     # between alpha and GA, we can set the appropriate ones.
     if self.gce_egress_bandwidth_tier:
@@ -663,7 +664,7 @@ class GceVirtualMachine(virtual_machine.BaseVirtualMachine):
       # TODO(pclay): remove when on-host-maintenance gets promoted to GA
       cmd.use_alpha_gcloud = True
       if gcp_flags.GCE_CONFIDENTIAL_COMPUTE_TYPE.value == 'sev':
-        cmd.flags.update({'confidential-compute': True})
+        cmd.flags.update({'confidential-compute-type': 'SEV'})
       cmd.flags.update({'on-host-maintenance': 'TERMINATE'})
 
     elif self.on_host_maintenance:
@@ -702,7 +703,8 @@ class GceVirtualMachine(virtual_machine.BaseVirtualMachine):
                   f'nic-type={gce_nic_type}',
                   f'network-tier={self.gce_network_tier.upper()}',
               ]
-              + gce_nic_queue_count_arg + no_address_arg
+              + gce_nic_queue_count_arg
+              + no_address_arg
           ),
       ]
 
@@ -726,7 +728,8 @@ class GceVirtualMachine(virtual_machine.BaseVirtualMachine):
     if self.min_cpu_platform:
       cmd.flags['min-cpu-platform'] = self.min_cpu_platform
 
-    if self.threads_per_core:
+    # metal instances do not support disable SMT.
+    if self.threads_per_core and 'metal' not in self.machine_type:
       cmd.flags['threads-per-core'] = self.threads_per_core
       self.metadata['threads_per_core'] = self.threads_per_core
 
@@ -825,8 +828,13 @@ class GceVirtualMachine(virtual_machine.BaseVirtualMachine):
 
     cmd.flags.update(self.create_disk_strategy.GetCreationCommand())
 
-    if FLAGS.gcloud_scopes:
-      cmd.flags['scopes'] = ','.join(re.split(r'[,; ]', FLAGS.gcloud_scopes))
+    if gcp_flags.GCE_VM_SERVICE_ACCOUNT.value:
+      cmd.flags['service-account'] = gcp_flags.GCE_VM_SERVICE_ACCOUNT.value
+    if gcp_flags.GCLOUD_SCOPES.value:
+      cmd.flags['scopes'] = ','.join(
+          re.split(r'[,; ]', gcp_flags.GCLOUD_SCOPES.value)
+      )
+
     cmd.flags['labels'] = util.MakeFormattedDefaultTags()
 
     return cmd
@@ -1002,7 +1010,9 @@ class GceVirtualMachine(virtual_machine.BaseVirtualMachine):
         ):
           host = GceSoleTenantNodeGroup(self.node_type, self.zone, self.project)
           self.host_list.append(host)
-          host.Create()
+          if gcp_flags.GCE_NODE_GROUP.value is None:
+            # GCE_NODE_GROUP is used to identify an existing node group.
+            host.Create()
         self.host = self.host_list[-1]
         if self.num_vms_per_host:
           self.host.fill_fraction += 1.0 / self.num_vms_per_host
@@ -1411,6 +1421,7 @@ class GceVirtualMachine(virtual_machine.BaseVirtualMachine):
 
   def ShouldDownloadPreprovisionedData(self, module_name, filename):
     """Returns whether or not preprovisioned data is available."""
+    logging.info('Testing if preprovisioned data is available %s', filename)
     return FLAGS.gcp_preprovisioned_data_bucket and self.TryRemoteCommand(
         GenerateStatPreprovisionedDataCommand(module_name, filename)
     )
@@ -1574,9 +1585,7 @@ class BaseLinuxGceVirtualMachine(GceVirtualMachine, linux_vm.BaseLinuxMixin):
 
   def GetResourceMetadata(self):
     """See base class."""
-    metadata = (
-        super().GetResourceMetadata().copy()
-    )
+    metadata = super().GetResourceMetadata().copy()
     if self._gvnic_version:
       metadata['gvnic_version'] = self._gvnic_version
 
@@ -1661,9 +1670,34 @@ class BaseLinuxGceVirtualMachine(GceVirtualMachine, linux_vm.BaseLinuxMixin):
       raise ValueError('DEFAULT_IMAGE_PROJECT can not be None')
     return self.DEFAULT_IMAGE_PROJECT
 
+  def GenerateAndCaptureSerialPortOutput(self, local_path: str) -> bool:
+    """Generates and captures the serial port output for the remote VM.
+
+    Args:
+      local_path: The path to store the serial port output on the caller's
+        machine.
+
+    Returns:
+      True if the serial port output was successfully generated and captured;
+      False otherwise.
+    """
+    cmd = util.GcloudCommand(
+        self, 'compute', 'instances', 'get-serial-port-output', self.name,
+    )
+    cmd.flags['zone'] = self.zone
+    cmd.flags['port'] = 1
+    stdout, _, retcode = cmd.Issue(raise_on_failure=False)
+    if retcode != 0:
+      logging.error('Failed to get serial port 1 output')
+      return False
+    with open(local_path, 'w') as f:
+      f.write(stdout)
+    return True
+
 
 class Debian11BasedGceVirtualMachine(
-    BaseLinuxGceVirtualMachine, linux_vm.Debian11Mixin,
+    BaseLinuxGceVirtualMachine,
+    linux_vm.Debian11Mixin,
 ):
   DEFAULT_X86_IMAGE_FAMILY = 'debian-11'
   DEFAULT_IMAGE_PROJECT = 'debian-cloud'

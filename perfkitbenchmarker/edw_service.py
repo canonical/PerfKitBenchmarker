@@ -18,7 +18,7 @@ directory as a subclass of BaseEdwService.
 """
 import logging
 import os
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Union
 
 from absl import flags
 from perfkitbenchmarker import resource
@@ -125,12 +125,19 @@ flags.DEFINE_enum(
     ['JDBC'],
     'The Runtime Interface used when interacting with Snowflake.',
 )
+flags.DEFINE_boolean(
+    'edw_get_service_auxiliary_metrics',
+    'False',
+    'If set, the benchmark will collect service-specific metrics from the'
+    ' remote service after the benchmark has completed. Additional delay may be'
+    ' incurred due to the need to wait for metadata propogation.',
+)
 flags.DEFINE_enum(
     'edw_bq_feature_config',
     'default',
-    ['default', 'smallquery'],
+    ['default', 'job_optional'],
     'Selects from among various BigQuery feature configurations. '
-    'Currently supported: default (no special features), smallquery '
+    'Currently supported: default (no special features), job_optional '
     '(enables job_creation_optional query preview feature). '
     'Only supported for Python client.',
 )
@@ -233,11 +240,14 @@ class EdwClientInterface:
     """
     raise NotImplementedError
 
-  def ExecuteQuery(self, query_name: str) -> Tuple[float, Dict[str, str]]:
+  def ExecuteQuery(
+      self, query_name: str, print_results: bool = False
+  ) -> tuple[float, dict[str, Any]]:
     """Executes a query and returns performance details.
 
     Args:
       query_name: String name of the query to execute
+      print_results: Whether to include query results in execution details.
 
     Returns:
       A tuple of (execution_time, execution details)
@@ -354,6 +364,8 @@ class EdwClientInterface:
 class EdwService(resource.BaseResource):
   """Object representing a EDW Service."""
 
+  SERVICE_TYPE = 'abstract'
+
   def __init__(self, edw_service_spec):
     """Initialize the edw service object.
 
@@ -457,6 +469,9 @@ class EdwService(resource.BaseResource):
     """Get the formatted last modified timestamp of the dataset."""
     raise NotImplementedError
 
+  def SetDestinationTable(self, dataset: str):
+    pass
+
   def ExtractDataset(
       self, dest_bucket, dataset=None, tables=None, dest_format='CSV'
   ):
@@ -538,3 +553,20 @@ class EdwService(resource.BaseResource):
       A boolean value (True) if the warm suite is recommended.
     """
     return True
+
+  def GetIterationAuxiliaryMetrics(self, iter_run_key: str) -> Dict[str, Any]:
+    """Returns service-specific metrics derived from server-side metadata.
+
+      Must be run after the benchmark has completed.
+
+    Args:
+      iter_run_key: The unique identifier of the run and iteration to fetch
+        metrics for.
+
+    Returns:
+      A dictionary of the following format:
+        { 'metric_1': { 'value': 1, 'unit': 'imperial femtoseconds' },
+          'metric_2': { 'value': 2, 'unit': 'metric dollars' }
+        ...}
+    """
+    raise NotImplementedError

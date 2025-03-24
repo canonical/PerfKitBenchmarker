@@ -153,8 +153,8 @@ class AksCluster(container_service.KubernetesCluster):
       vm_config: virtual_machine.BaseVirtualMachine,
       nodepool_config: container_service.BaseNodePoolConfig,
   ):
-    nodepool_config.disk_type = vm_config.create_os_disk_strategy.disk.disk_type
-    nodepool_config.disk_size = vm_config.create_os_disk_strategy.disk.disk_size
+    nodepool_config.disk_type = vm_config.create_os_disk_strategy.disk.disk_type  # pytype: disable=attribute-error
+    nodepool_config.disk_size = vm_config.create_os_disk_strategy.disk.disk_size  # pytype: disable=attribute-error
 
   def GetResourceMetadata(self):
     """Returns a dict containing metadata about the cluster.
@@ -166,6 +166,13 @@ class AksCluster(container_service.KubernetesCluster):
     result['boot_disk_type'] = self.default_nodepool.disk_type
     result['boot_disk_size'] = self.default_nodepool.disk_size
     return result
+
+  def _IsAutoscalerEnabled(self):
+    """Returns True if the cluster autoscaler is enabled."""
+    return (
+        self.min_nodes != self.default_nodepool.num_nodes
+        or self.max_nodes != self.default_nodepool.num_nodes
+    )
 
   def _Create(self):
     """Creates the AKS cluster."""
@@ -189,6 +196,12 @@ class AksCluster(container_service.KubernetesCluster):
         '--nodepool-labels',
         f'pkb_nodepool={container_service.DEFAULT_NODEPOOL}',
     ] + self._GetNodeFlags(self.default_nodepool)
+    if self._IsAutoscalerEnabled():
+      cmd += [
+          '--enable-cluster-autoscaler',
+          f'--min-count={self.min_nodes}',
+          f'--max-count={self.max_nodes}',
+      ]
 
     # TODO(pclay): expose quota and capacity errors
     # Creating an AKS cluster with a fresh service principal usually fails due
@@ -229,9 +242,12 @@ class AksCluster(container_service.KubernetesCluster):
     args = [
         '--node-vm-size',
         nodepool_config.machine_type,
-        '--node-count',
-        str(nodepool_config.num_nodes),
     ] + self.resource_group.args
+    node_count = nodepool_config.num_nodes
+    if self._IsAutoscalerEnabled():
+      node_count = max(self.min_nodes, node_count)
+      node_count = min(self.max_nodes, node_count)
+    args += [f'--node-count={node_count}']
     if self.default_nodepool.zone and self.default_nodepool.zone != self.region:
       zones = ' '.join(
           zone[-1] for zone in self.default_nodepool.zone.split(',')
@@ -281,6 +297,8 @@ class AksCluster(container_service.KubernetesCluster):
     #
     # If it has not yet been deleted it will be deleted along with the resource
     # group.
+    if self.event_poller:
+      self.event_poller.StopPolling()
     self._deleted = True
 
   def _PostCreate(self):
@@ -335,6 +353,7 @@ class AksCluster(container_service.KubernetesCluster):
   def _DeleteDependencies(self):
     """Deletes the resource group."""
     self.service_principal.Delete()
+    super()._DeleteDependencies()
 
   def GetDefaultStorageClass(self) -> str:
     """Get the default storage class for the provider."""

@@ -74,7 +74,15 @@ class VertexAiTest(pkb_common_test_case.PkbCommonTestCase):
     self.assertIsNotNone(ai_spec)
     self.assertEqual(ai_spec.__name__, 'VertexAiLlama2Spec')
 
-  def test_model_create(self):
+  def test_model_spec_found_llama3(self):
+    ai_spec = managed_ai_model_spec.GetManagedAiModelSpecClass(
+        'GCP', 'llama3', '8b'
+    )
+    self.assertIsNotNone(ai_spec)
+    self.assertEqual(ai_spec.__name__, 'VertexAiLlama3Spec')
+
+  @flagsaver.flagsaver(use_ai_sdk=True)
+  def test_model_create_via_sdk(self):
     self.MockRunCommand(
         {
             'gcloud ai endpoints create': [(
@@ -97,6 +105,7 @@ class VertexAiTest(pkb_common_test_case.PkbCommonTestCase):
     self.assertIn('Model Deploy Time', sampled_metrics)
 
   @flagsaver.flagsaver(ai_bucket_uri=None)
+  @flagsaver.flagsaver(use_ai_sdk=True)
   def test_model_create_with_gcs_copy(self):
     self.pkb_ai = vertex_ai.VertexAiModelInRegistry(
         mock.create_autospec(virtual_machine.BaseVirtualMachine), self.ai_spec
@@ -132,6 +141,7 @@ class VertexAiTest(pkb_common_test_case.PkbCommonTestCase):
         'gs://my-project-us-west-tmp-pkb123/llama2/llama2-7b-hf',
     )
 
+  @flagsaver.flagsaver(use_ai_sdk=True)
   @flagsaver.flagsaver(ai_bucket_uri=None)
   def test_model_create_with_reuse_gcs_bucket(self):
     self.pkb_ai = vertex_ai.VertexAiModelInRegistry(
@@ -169,6 +179,7 @@ class VertexAiTest(pkb_common_test_case.PkbCommonTestCase):
         'gs://my-project-us-west-tmp-pkb123/llama2/llama2-7b-hf',
     )
 
+  @flagsaver.flagsaver(use_ai_sdk=True)
   def test_model_quota_error(self):
     self.MockRunCommand(
         {
@@ -192,6 +203,95 @@ class VertexAiTest(pkb_common_test_case.PkbCommonTestCase):
     )
     with self.assertRaises(errors.Benchmarks.QuotaFailure):
       self.pkb_ai.Create()
+
+  def test_model_create_via_gcloud(self):
+    cli = self.MockRunCommand(
+        {
+            'gcloud ai models upload': [(
+                'uploaded',
+                '',
+                0,
+            )],
+            'gcloud ai models list': [(
+                'MODEL_ID             DISPLAY_NAME\n1234  pkb123',
+                '',
+                0,
+            )],
+            'gcloud ai endpoints deploy-model': [(
+                'Model deployed',
+                '',
+                0,
+            )],
+        },
+        self.pkb_ai.vm,
+    )
+    self.pkb_ai._Create()
+    cli.RunCommand.assert_has_calls([
+        mock.call(
+            'gcloud ai models upload --display-name=pkb123 --project=my-project'
+            ' --region=us-west'
+            ' --artifact-uri=gs://my-bucket/llama2/llama2-7b-hf'
+            ' --container-image-uri=us-docker.pkg.dev/vertex-ai/vertex-vision-model-garden-dockers/pytorch-vllm-serve:20240222_0916_RC00'
+            ' --container-command=python,-m,vllm.entrypoints.api_server'
+            ' --container-args=--host=0.0.0.0,--port=7080,--swap-space=16,--gpu-memory-utilization=0.9,--max-model-len=1024,--max-num-batched-tokens=4096,--tensor-parallel-size=1'
+            ' --container-ports=7080 --container-predict-route=/generate'
+            ' --container-health-route=/ping'
+            ' --container-env-vars=MODEL_ID=gs://my-bucket/llama2/llama2-7b-hf,DEPLOY_SOURCE=pkb'
+        ),
+        mock.call(
+            'gcloud ai models list --project=my-project --region=us-west'
+        ),
+        mock.call(
+            'gcloud ai endpoints deploy-model None --model=1234'
+            ' --region=us-west --project=my-project --display-name=pkb123'
+            ' --machine-type=g2-standard-8 --accelerator=type=nvidia-l4,count=1'
+            ' --service-account=123-compute@developer.gserviceaccount.com'
+            ' --max-replica-count=1', ignore_failure=True,
+        ),
+    ])  # pytype: disable=attribute-error
+
+  def test_model_create_via_gcloud_waits_until_ready(self):
+    self.pkb_ai.endpoint.endpoint_name = (
+        'projects/6789/locations/us-east1/endpoints/1234'
+    )
+    cli = self.MockRunCommand(
+        {
+            'gcloud ai models upload': [(
+                'uploaded',
+                '',
+                0,
+            )],
+            'gcloud ai models list': [(
+                'MODEL_ID             DISPLAY_NAME\n1234  pkb123',
+                '',
+                0,
+            )],
+            'gcloud ai endpoints deploy-model': [(
+                '',
+                (
+                    '(gcloud.ai.endpoints.deploy-model) Operation'
+                    ' https://us-central1-aiplatform.googleapis.com/v1beta1/projects/123/locations/us-central1/endpoints/123/operations/123'
+                    ' has not finished in 1800 seconds. The operations may'
+                    ' still be underway remotely and may still succeed; use'
+                    ' gcloud list and describe commands or'
+                    ' https://console.developers.google.com/ to check resource'
+                    ' state.'
+                ),
+                1,
+            )],
+            'gcloud ai endpoints predict': [
+                ('', 'No endpoint', 1),
+                (
+                    '[Prompt:What is crab?\nOutput:Crabs are tasty.\n]',
+                    '',
+                    0,
+                ),
+            ],
+        },
+        self.pkb_ai.vm,
+    )
+    self.pkb_ai._Create()
+    self.assertEqual(cli.RunCommand.mock_command.progress_through_calls['gcloud ai endpoints predict'], 2)  # pytype: disable=attribute-error
 
   def test_model_inited(self):
     # Assert on values from setup
@@ -344,7 +444,7 @@ deployedModels:
     self.endpoint.endpoint_name = (
         'projects/6789/locations/us-east1/endpoints/1234'
     )
-    self.MockRunCommand(
+    cli = self.MockRunCommand(
         {
             'gcloud ai endpoints describe': [(
                 ("""Using endpoint [https://us-east1-aiplatform.googleapis.com/]
@@ -362,6 +462,42 @@ deployedModels:
         self.endpoint.vm,
     )
     self.endpoint._Delete()
+    self.assertLen(cli.RunCommand.call_args_list, 3)  # pytype: disable=attribute-error
+    mock_cmd = cli.RunCommand.mock_command  # pytype: disable=attribute-error
+    self.assertEqual(
+        mock_cmd.progress_through_calls['gcloud ai endpoints delete'], 1
+    )
+    self.assertEqual(
+        mock_cmd.progress_through_calls['gcloud ai endpoints undeploy-model'], 1
+    )
+
+  def test_endpoint_delete_no_deployed_models(self):
+    self.endpoint.endpoint_name = (
+        'projects/6789/locations/us-east1/endpoints/1234'
+    )
+    cli = self.MockRunCommand(
+        {
+            'gcloud ai endpoints describe': [(
+                ("""Using endpoint [https://us-east1-aiplatform.googleapis.com/]
+createTime: '2024-09-26T21:51:53.955656Z'
+"""),
+                '',
+                0,
+            )],
+            'gcloud ai endpoints undeploy-model': [('', '', 0)],
+            'gcloud ai endpoints delete': [('', '', 0)],
+        },
+        self.endpoint.vm,
+    )
+    self.endpoint._Delete()
+    self.assertLen(cli.RunCommand.call_args_list, 2)  # pytype: disable=attribute-error
+    mock_cmd = cli.RunCommand.mock_command  # pytype: disable=attribute-error
+    self.assertEqual(
+        mock_cmd.progress_through_calls['gcloud ai endpoints delete'], 1
+    )
+    self.assertEqual(
+        mock_cmd.progress_through_calls['gcloud ai endpoints undeploy-model'], 0
+    )
 
 
 if __name__ == '__main__':

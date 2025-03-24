@@ -45,11 +45,17 @@ class BaseJob(resource.BaseResource):
     self.backend: str = base_job_spec.job_backend
     self.container_registry = container_registry
     self.job_spec = base_job_spec
+    self.job_gpu_type: str = base_job_spec.job_gpu_type
+    self.job_gpu_count: int = base_job_spec.job_gpu_count
+    self.task_count: int = base_job_spec.task_count
 
     # update metadata
     self.metadata.update({
         'backend': self.backend,
         'region': self.region,
+        'job_gpu_type': self.job_gpu_type,
+        'job_gpu_count': self.job_gpu_count,
+        'task_count': self.task_count,
         # 'concurrency': 'default',
     })
     self.samples: List[sample.Sample] = []

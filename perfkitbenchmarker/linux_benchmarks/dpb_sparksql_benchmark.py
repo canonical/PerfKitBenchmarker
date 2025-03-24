@@ -48,8 +48,9 @@ from collections.abc import MutableMapping
 import json
 import logging
 import os
+import re
 import time
-from typing import List
+from typing import Any, List
 
 from absl import flags
 from perfkitbenchmarker import configs
@@ -60,6 +61,7 @@ from perfkitbenchmarker import errors
 from perfkitbenchmarker import object_storage_service
 from perfkitbenchmarker import sample
 from perfkitbenchmarker import temp_dir
+from perfkitbenchmarker import vm_util
 
 BENCHMARK_NAME = 'dpb_sparksql_benchmark'
 
@@ -94,11 +96,17 @@ dpb_sparksql_benchmark:
     worker_count: 2
 """
 
-flags.DEFINE_list(
-    'bigquery_tables',
-    [],
-    'A list of BigQuery tables to load as Temporary Spark SQL views instead '
-    'of reading from external Hive tables.',
+_BIGQUERY_DATASET = flags.DEFINE_string(
+    'dpb_sparksql_bigquery_dataset',
+    None,
+    'BigQuery dataset with the tables to load as Temporary Spark SQL views'
+    ' instead of reading from external Hive tables.',
+)
+_BIGQUERY_TABLES = flags.DEFINE_list(
+    'dpb_sparksql_bigquery_tables',
+    None,
+    'BigQuery table names (unqualified) to load as Temporary Spark SQL views'
+    ' instead of reading from external Hive tables.',
 )
 flags.DEFINE_string(
     'bigquery_record_format',
@@ -106,8 +114,33 @@ flags.DEFINE_string(
     'The record format to use when connecting to BigQuery storage. See: '
     'https://github.com/GoogleCloudDataproc/spark-bigquery-connector#properties',
 )
+_FETCH_RESULTS_FROM_LOGS = flags.DEFINE_bool(
+    'dpb_sparksql_fetch_results_from_logs',
+    False,
+    'Make the query runner script to log query timings to stdout/stderr '
+    ' instead of writing them to some object storage location. Reduces runner '
+    ' latency (and hence its total wall time), but it is not supported by all '
+    ' DPB services.',
+)
 
 FLAGS = flags.FLAGS
+
+LOG_RESULTS_PATTERN = (
+    r'----@spark_sql_runner:results_start@----'
+    r'(.*)'
+    r'----@spark_sql_runner:results_end@----'
+)
+POLL_LOGS_INTERVAL = 60
+POLL_LOGS_TIMEOUT = 6 * 60
+RESULTS_FROM_LOGS_SUPPORTED_DPB_SERVICES = (
+    dpb_constants.DATAPROC_SERVERLESS,
+    dpb_constants.EMR_SERVERLESS,
+    dpb_constants.GLUE,
+)
+
+
+class QueryResultsNotReadyError(Exception):
+  """Used to signal a job is still running."""
 
 
 def GetConfig(user_config):
@@ -123,7 +156,6 @@ def CheckPrerequisites(benchmark_config):
   Raises:
     Config.InvalidValue: On encountering invalid configuration.
   """
-  del benchmark_config  # unused
   if not FLAGS.dpb_sparksql_data and FLAGS.dpb_sparksql_create_hive_tables:
     raise errors.Config.InvalidValue(
         'You must pass dpb_sparksql_data with dpb_sparksql_create_hive_tables'
@@ -132,15 +164,33 @@ def CheckPrerequisites(benchmark_config):
     raise errors.Config.InvalidValue(
         'You cannot create hive tables in a custom database.'
     )
+  if bool(_BIGQUERY_DATASET.value) != bool(_BIGQUERY_TABLES.value):
+    raise errors.Config.InvalidValue(
+        '--dpb_sparksql_bigquery_dataset and '
+        '--dpb_sparksql_bigquery_tables must be passed together.'
+    )
   if not (
       FLAGS.dpb_sparksql_data
-      or FLAGS.bigquery_tables
+      or _BIGQUERY_TABLES.value
       or FLAGS.dpb_sparksql_database
   ):
     # In the case of a static dpb_service, data could pre-exist
     logging.warning(
-        'You did not specify --dpb_sparksql_data, --bigquery_tables, '
-        'or dpb_sparksql_database. You will probably not have data to query!'
+        'You did not specify --dpb_sparksql_data,'
+        ' --dpb_sparksql_bigquery_tables, or dpb_sparksql_database. You will'
+        ' probably not have data to query!'
+    )
+  if (
+      sum([
+          bool(FLAGS.dpb_sparksql_data),
+          bool(_BIGQUERY_TABLES.value),
+          bool(FLAGS.dpb_sparksql_database),
+      ])
+      > 1
+  ):
+    logging.warning(
+        'You should only pass one of them: --dpb_sparksql_data,'
+        ' --dpb_sparksql_bigquery_tables, or --dpb_sparksql_database.'
     )
   if bool(FLAGS.dpb_sparksql_order) == bool(FLAGS.dpb_sparksql_streams):
     raise errors.Config.InvalidValue(
@@ -151,6 +201,16 @@ def CheckPrerequisites(benchmark_config):
     raise errors.Config.InvalidValue(
         '--dpb_sparksql_simultaneous is not compatible with '
         '--dpb_sparksql_streams.'
+    )
+  if (
+      _FETCH_RESULTS_FROM_LOGS.value
+      and benchmark_config.dpb_service.service_type
+      not in RESULTS_FROM_LOGS_SUPPORTED_DPB_SERVICES
+  ):
+    raise errors.Config.InvalidValue(
+        f'Current dpb service {benchmark_config.dpb_service.service_type!r} is'
+        ' not supported for --dpb_sparksql_fetch_results_from_logs. Supported'
+        f' dpb services are: {RESULTS_FROM_LOGS_SUPPORTED_DPB_SERVICES!r}'
     )
 
 
@@ -251,7 +311,7 @@ def Run(benchmark_spec):
   # Run PySpark Spark SQL Runner
   report_dir, job_result = _RunQueries(benchmark_spec)
 
-  results = _GetQuerySamples(storage_service, report_dir, metadata)
+  results = _GetQuerySamples(storage_service, report_dir, job_result, metadata)
   results += _GetGlobalSamples(results, cluster, job_result, metadata)
   results += _GetPrepareSamples(benchmark_spec, metadata)
   return results
@@ -284,33 +344,46 @@ def _GetSampleMetadata(benchmark_spec):
 def _RunQueries(benchmark_spec) -> tuple[str, dpb_service.JobResult]:
   """Runs queries. Returns storage path with metrics and JobResult object."""
   cluster = benchmark_spec.dpb_service
-  storage_service = cluster.storage_service
   report_dir = '/'.join([cluster.base_dir, f'report-{int(time.time()*1000)}'])
-  args = ['--sql-scripts-dir', benchmark_spec.query_dir]
+  args = []
   if FLAGS.dpb_sparksql_simultaneous:
     # Assertion true bc of --dpb_sparksql_simultaneous and
     # --dpb_sparksql_streams being mutually exclusive.
     assert len(benchmark_spec.query_streams) == 1
     for query in benchmark_spec.query_streams[0]:
-      args += ['--sql-scripts', query]
+      args += ['--sql-queries', query]
   else:
     for stream in benchmark_spec.query_streams:
-      args += ['--sql-scripts', ','.join(stream)]
-  args += ['--report-dir', report_dir]
+      args += ['--sql-queries', ','.join(stream)]
+  if _FETCH_RESULTS_FROM_LOGS.value:
+    args += ['--log-results', 'True']
+  else:
+    args += ['--report-dir', report_dir]
   if FLAGS.dpb_sparksql_database:
     args += ['--database', FLAGS.dpb_sparksql_database]
-  table_metadata = _GetTableMetadata(benchmark_spec)
-  if table_metadata:
-    table_metadata_file = '/'.join([cluster.base_dir, 'metadata.json'])
-    dpb_sparksql_benchmark_helper.StageMetadata(
-        table_metadata, storage_service, table_metadata_file
-    )
-    args += ['--table-metadata', table_metadata_file]
-  else:
-    # If we don't pass in tables, we must be reading from hive.
+  if FLAGS.dpb_sparksql_create_hive_tables:
     # Note you can even read from Hive without --create_hive_tables if they
     # were precreated.
     args += ['--enable-hive', 'True']
+  else:
+    table_names = []
+    if _BIGQUERY_DATASET.value:
+      args += ['--bigquery-dataset', _BIGQUERY_DATASET.value]
+      table_names = _BIGQUERY_TABLES.value
+    elif benchmark_spec.data_dir:
+      args += ['--table-base-dir', benchmark_spec.data_dir]
+      table_names = benchmark_spec.table_subdirs or []
+    if table_names:
+      args += ['--table-names', *table_names]
+    if FLAGS.dpb_sparksql_data_format:
+      args += ['--table-format', FLAGS.dpb_sparksql_data_format]
+    if (
+        FLAGS.dpb_sparksql_data_format == 'csv'
+        and FLAGS.dpb_sparksql_csv_delimiter
+    ):
+      args += ['--csv-delim', FLAGS.dpb_sparksql_csv_delimiter]
+    if FLAGS.bigquery_record_format:
+      args += ['--bigquery-read-data-format', FLAGS.bigquery_record_format]
   if FLAGS.dpb_sparksql_table_cache:
     args += ['--table-cache', FLAGS.dpb_sparksql_table_cache]
   if dpb_sparksql_benchmark_helper.DUMP_SPARK_CONF.value:
@@ -331,46 +404,33 @@ def _RunQueries(benchmark_spec) -> tuple[str, dpb_service.JobResult]:
 def _GetQuerySamples(
     storage_service: object_storage_service.ObjectStorageService,
     report_dir: str,
+    job_result: dpb_service.JobResult,
     base_metadata: MutableMapping[str, str],
 ) -> list[sample.Sample]:
-  """Get Sample objects from metrics storage path."""
-  # Spark can only write data to directories not files. So do a recursive copy
-  # of that directory and then search it for the collection of JSON files with
-  # the results.
-  temp_run_dir = temp_dir.GetRunDirPath()
-  storage_service.Copy(report_dir, temp_run_dir, recursive=True)
-  report_files = []
-  for dir_name, _, files in os.walk(
-      os.path.join(temp_run_dir, os.path.basename(report_dir))
-  ):
-    for filename in files:
-      if filename.endswith('.json'):
-        report_file = os.path.join(dir_name, filename)
-        report_files.append(report_file)
-        logging.info("Found report file '%s'.", report_file)
-  if not report_files:
-    raise errors.Benchmarks.RunError('Job report not found.')
+  """Get Sample objects from job's logs."""
+
+  if _FETCH_RESULTS_FROM_LOGS.value:
+    query_results = _FetchResultsFromLogs(job_result)
+  else:
+    query_results = _FetchResultsFromStorage(storage_service, report_dir)
 
   samples = []
-  for report_file in report_files:
-    with open(report_file) as file:
-      for line in file:
-        result = json.loads(line)
-        logging.info('Timing: %s', result)
-        query_id = dpb_sparksql_benchmark_helper.GetQueryId(result['script'])
-        assert query_id
-        metadata_copy = base_metadata.copy()
-        metadata_copy['query'] = query_id
-        if FLAGS.dpb_sparksql_streams:
-          metadata_copy['stream'] = result['stream']
-        samples.append(
-            sample.Sample(
-                'sparksql_run_time',
-                result['duration'],
-                'seconds',
-                metadata_copy,
-            )
+  for result in query_results:
+    logging.info('Timing: %s', result)
+    query_id = result['query_id']
+    assert query_id
+    metadata_copy = dict(base_metadata)
+    metadata_copy['query'] = query_id
+    if FLAGS.dpb_sparksql_streams:
+      metadata_copy['stream'] = result['stream']
+    samples.append(
+        sample.Sample(
+            'sparksql_run_time',
+            result['duration'],
+            'seconds',
+            metadata_copy,
         )
+    )
   return samples
 
 
@@ -490,6 +550,64 @@ def _GetPrepareSamples(
   return samples
 
 
+def _FetchResultsFromStorage(
+    storage_service: object_storage_service.ObjectStorageService,
+    report_dir: str,
+) -> list[dict[str, Any]]:
+  """Get Sample objects from metrics storage path."""
+  # Spark can only write data to directories not files. So do a recursive copy
+  # of that directory and then search it for the collection of JSON files with
+  # the results.
+  temp_run_dir = temp_dir.GetRunDirPath()
+  storage_service.Copy(report_dir, temp_run_dir, recursive=True)
+  report_files = []
+  for dir_name, _, files in os.walk(
+      os.path.join(temp_run_dir, os.path.basename(report_dir))
+  ):
+    for filename in files:
+      if filename.endswith('.json'):
+        report_file = os.path.join(dir_name, filename)
+        report_files.append(report_file)
+        logging.info("Found report file '%s'.", report_file)
+  if not report_files:
+    raise errors.Benchmarks.RunError('Job report not found.')
+  results = []
+  for report_file in report_files:
+    with open(report_file) as file:
+      for line in file:
+        results.append(json.loads(line))
+  return results
+
+
+@vm_util.Retry(
+    timeout=POLL_LOGS_TIMEOUT,
+    poll_interval=POLL_LOGS_INTERVAL,
+    fuzz=0,
+    retryable_exceptions=(QueryResultsNotReadyError,),
+)
+def _FetchResultsFromLogs(job_result: dpb_service.JobResult):
+  """Get samples from job results logs."""
+  job_result.FetchOutput()
+  logs = '\n'.join([job_result.stdout or '', job_result.stderr])
+  query_results = _ParseResultsFromLogs(logs)
+  if query_results is None:
+    raise QueryResultsNotReadyError
+  return query_results
+
+
+def _ParseResultsFromLogs(logs: str) -> list[dict[str, Any]] | None:
+  json_str_match = re.search(LOG_RESULTS_PATTERN, logs, re.DOTALL)
+  if not json_str_match:
+    return None
+  try:
+    results = json.loads(json_str_match.group(1))
+  except ValueError as e:
+    raise errors.Benchmarks.RunError(
+        'Corrupted results from logs cannot be deserialized.'
+    ) from e
+  return results
+
+
 def _GetDistCpMetadata(base_dir: str, subdirs: List[str], extra_metadata=None):
   """Compute list of table metadata for spark_sql_distcp metadata flags."""
   metadata = []
@@ -500,17 +618,6 @@ def _GetDistCpMetadata(base_dir: str, subdirs: List[str], extra_metadata=None):
         FLAGS.dpb_sparksql_data_format or 'parquet',
         {'path': '/'.join([base_dir, subdir]), **extra_metadata},
     )]
-  return metadata
-
-
-def _GetTableMetadata(benchmark_spec):
-  metadata = dpb_sparksql_benchmark_helper.GetTableMetadata(benchmark_spec)
-  for table in FLAGS.bigquery_tables:
-    name = table.split('.')[-1]
-    bq_options = {'table': table}
-    if FLAGS.bigquery_record_format:
-      bq_options['readDataFormat'] = FLAGS.bigquery_record_format
-    metadata[name] = (FLAGS.dpb_sparksql_data_format or 'bigquery', bq_options)
   return metadata
 
 

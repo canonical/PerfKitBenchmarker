@@ -21,6 +21,7 @@ import contextlib
 import os
 
 from perfkitbenchmarker import app_service
+from perfkitbenchmarker import cluster
 from perfkitbenchmarker import data_discovery_service
 from perfkitbenchmarker import dpb_constants
 from perfkitbenchmarker import edw_service
@@ -213,6 +214,13 @@ class _DpbServiceSpec(spec.BaseSpec):
             option_decoders.IntDecoder,
             {'default': None, 'none_ok': True},
         ),
+        'dataproc_serverless_runtime_engine': (
+            option_decoders.EnumDecoder,
+            {
+                'valid_values': ('default', 'native'),
+                'default': 'default',
+            },
+        ),
         'dataproc_serverless_memory_overhead': (
             option_decoders.IntDecoder,
             {'default': None, 'none_ok': True},
@@ -290,6 +298,35 @@ class _ExampleResourceDecoder(option_decoders.TypeVerifier):
         self._GetOptionFullName(component_full_name),
         flag_values,
         **example_config,
+    )
+
+
+class _ClusterDecoder(option_decoders.TypeVerifier):
+  """Validate the cluster dictionary of a benchmark config object."""
+
+  def Decode(self, value, component_full_name, flag_values):
+    """Verify example_resource dict of a benchmark config object.
+
+    Args:
+      value: dict. Config dictionary
+      component_full_name: string.  Fully qualified name of the configurable
+        component containing the config option.
+      flag_values: flags.FlagValues.  Runtime flag values to be propagated to
+        BaseSpec constructors.
+
+    Returns:
+      ExampleResourceSpec built from the config passed in value.
+
+    Raises:
+      errors.Config.InvalidValue upon invalid input value.
+    """
+    cluster_config = super().Decode(value, component_full_name, flag_values)
+    cloud = flag_values['cloud'].value
+    spec_class = cluster.GetClusterSpecClass(cloud)
+    return spec_class(
+        self._GetOptionFullName(component_full_name),
+        flag_values,
+        **cluster_config,
     )
 
 
@@ -1397,6 +1434,7 @@ class BenchmarkConfigSpec(spec.BaseSpec):
             container_spec.ContainerSpecsDecoder,
             {'default': None},
         ),
+        'cluster': (_ClusterDecoder, {'default': None}),
         'dpb_service': (_DpbServiceDecoder, {'default': None}),
         'relational_db': (_RelationalDbDecoder, {'default': None}),
         'tpu_groups': (_TpuGroupsDecoder, {'default': {}}),

@@ -33,7 +33,6 @@ RELATIONAL_DB_FLAGS_TO_TRANSLATE = {
     'managed_db_high_availability': 'db_high_availability',
     'managed_db_high_availability_type': 'db_high_availability_type',
     'managed_db_backup_enabled': 'db_backup_enabled',
-    'managed_db_backup_start_time': 'db_backup_start_time',
     'managed_db_zone': 'db_zone',
     'managed_db_machine_type': 'db_machine_type',
     'managed_db_cpus': 'db_cpus',
@@ -45,13 +44,16 @@ RELATIONAL_DB_FLAGS_TO_TRANSLATE = {
 
 LIST_TO_MULTISTRING_TRANSLATIONS = {'zones': 'zone', 'extra_zones': 'zone'}
 
-SYSBENCH_TRANSLATIONS = {'sysbench_thread_counts': 'sysbench_run_threads'}
+MISC_TRANSLATIONS = {
+    'sysbench_thread_counts': 'sysbench_run_threads',
+    'runspec_build_tool_version': 'gcc_version',
+}
 
 ALL_TRANSLATIONS = [
     DISK_FLAGS_TO_TRANSLATE,
     RELATIONAL_DB_FLAGS_TO_TRANSLATE,
     LIST_TO_MULTISTRING_TRANSLATIONS,
-    SYSBENCH_TRANSLATIONS,
+    MISC_TRANSLATIONS,
 ]
 
 # Make sure the regex only matches the argument instead of value

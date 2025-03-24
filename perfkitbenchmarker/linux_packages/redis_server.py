@@ -17,6 +17,7 @@ import logging
 from typing import Any, Dict, List
 
 from absl import flags
+from perfkitbenchmarker import errors
 from perfkitbenchmarker import linux_packages
 from perfkitbenchmarker import os_types
 
@@ -35,9 +36,12 @@ class RedisEvictionPolicy:
 _VERSION = flags.DEFINE_string(
     'redis_server_version', '6.2.1', 'Version of redis server to use.'
 )
-_IO_THREADS = flags.DEFINE_integer(
+CLUSTER_MODE = flags.DEFINE_bool(
+    'redis_server_cluster_mode', False, 'Whether to use cluster mode.'
+)
+IO_THREADS = flags.DEFINE_list(
     'redis_server_io_threads',
-    4,
+    None,
     'Only supported for redis version >= 6, the '
     'number of redis server IO threads to use.',
 )
@@ -57,7 +61,7 @@ _ENABLE_SNAPSHOTS = flags.DEFINE_bool(
     False,
     'If true, uses the default redis snapshot policy.',
 )
-_NUM_PROCESSES = flags.DEFINE_integer(
+NUM_PROCESSES = flags.DEFINE_integer(
     'redis_total_num_processes',
     1,
     'Total number of redis server processes. Useful when running with a redis '
@@ -78,11 +82,12 @@ _EVICTION_POLICY = flags.DEFINE_enum(
     'Redis eviction policy when maxmemory limit is reached. This requires '
     'running clients with larger amounts of data than Redis can hold.',
 )
-REDIS_SIMULATE_AOF = flags.DEFINE_bool(
-    'redis_simulate_aof',
+REDIS_AOF = flags.DEFINE_bool(
+    'redis_aof',
     False,
-    'If true, simulate usage of disks on the server for aof backups. ',
+    'If true, use disks on the server for aof backups.',
 )
+
 
 # Default port for Redis
 DEFAULT_PORT = 6379
@@ -90,6 +95,7 @@ REDIS_PID_FILE = 'redis.pid'
 FLAGS = flags.FLAGS
 REDIS_GIT = 'https://github.com/antirez/redis.git'
 REDIS_BACKUP = 'scratch'
+CURRENT_IO_THREADS = None
 
 
 def _GetRedisTarName() -> str:
@@ -101,7 +107,7 @@ def GetRedisDir() -> str:
 
 
 def _GetNumProcesses(vm) -> int:
-  num_processes = _NUM_PROCESSES.value
+  num_processes = NUM_PROCESSES.value
   if num_processes == 0 and vm is not None:
     num_processes = vm.NumCpusForBenchmark()
   assert num_processes >= 0, 'num_processes must be >=0.'
@@ -109,8 +115,35 @@ def _GetNumProcesses(vm) -> int:
   return num_processes
 
 
+def CheckPrerequisites():
+  """Verifies if the flags are valid."""
+  values = IO_THREADS.value
+
+  try:
+    int_values = [int(v) for v in values] if values is not None else []
+  except ValueError as e:
+    raise errors.Setup.InvalidFlagConfigurationError(
+        'redis_server_io_threads must be a list of valid integers.'
+    ) from e
+
+  if not all(1 <= v <= 128 for v in int_values):
+    raise errors.Setup.InvalidFlagConfigurationError(
+        'redis_server_io_threads must be a list of integers between 1 and 128.'
+    )
+
+  # TODO(user): Add support for cluster mode and session storage.
+  if (CLUSTER_MODE.value or REDIS_AOF.value) and len(int_values) > 1:
+    raise errors.Setup.InvalidFlagConfigurationError(
+        'Sweeping redis_server_io_threads is not supported for cluster mode or'
+        ' session storage configurations.'
+    )
+
+  return True
+
+
 def _Install(vm) -> None:
   """Installs the redis package on the VM."""
+  CheckPrerequisites()
   vm.Install('build_tools')
   vm.Install('wget')
   vm.RemoteCommand(f'cd {linux_packages.INSTALL_DIR}; git clone {REDIS_GIT}')
@@ -150,9 +183,15 @@ def AptInstall(vm) -> None:
 
 
 def _GetIOThreads(vm) -> int:
-  if _IO_THREADS.value:
-    return _IO_THREADS.value
-  return vm.NumCpusForBenchmark() // 2
+  if CURRENT_IO_THREADS is not None:
+    return CURRENT_IO_THREADS
+  # Redis docs suggests that i/o threads should not exceed number of cores.
+  nthreads_per_core = vm.CheckLsCpu().threads_per_core
+  num_cpus = vm.NumCpusForBenchmark()
+  if nthreads_per_core == 1:
+    return max(num_cpus - 1, 1)
+  else:
+    return num_cpus // 2
 
 
 def _BuildStartCommand(vm, port: int) -> str:
@@ -174,7 +213,11 @@ def _BuildStartCommand(vm, port: int) -> str:
       f'--port {port}',
       '--protected-mode no',
   ]
-  if REDIS_SIMULATE_AOF.value:
+  if CLUSTER_MODE.value:
+    cmd_args += [
+        '--cluster-enabled yes',
+    ]
+  if REDIS_AOF.value:
     cmd_args += [
         '--appendonly yes',
         f'--appendfilename backup_{port}',
@@ -199,10 +242,17 @@ def _BuildStartCommand(vm, port: int) -> str:
   if _EVICTION_POLICY.value:
     cmd_args.append(f'--maxmemory-policy {_EVICTION_POLICY.value}')
 
-  # Set maxmemory flag for each redis instance. Total memory for all of the
-  # server instances combined should be 90% of server VM's total memory.
+  # If aof is not enabled, set maxmemory to 70% of server VM's total memory
+  # divided by the number of processes. This is to ensure that the redis
+  # instances don't consume too much memory and cause the server VM to become
+  # unresponsive.
+  # If aof is enabled, deduct 10.5GB from the maxmemory to account
+  # for the AOF and OS overheads.
   num_processes = _GetNumProcesses(vm)
-  max_memory_per_instance = int(vm.total_memory_kb * 0.9 / num_processes)
+  if REDIS_AOF.value:
+    max_memory_per_instance = int(vm.total_memory_kb - 11024384)
+  else:
+    max_memory_per_instance = int(vm.total_memory_kb * 0.7 / num_processes)
   cmd_args.append(f'--maxmemory {max_memory_per_instance}kb')
   return cmd.format(redis_dir=redis_dir, args=' '.join(cmd_args))
 
@@ -234,10 +284,38 @@ def Start(vm) -> None:
     vm.RemoteCommand(_BuildStartCommand(vm, port))
 
 
+def Stop(vm) -> None:
+  """Stops redis server processes, flushes all keys, and resets the cluster."""
+  redis_dir = GetRedisDir()
+  ports = GetRedisPorts(vm)
+
+  for port in ports:
+    vm.TryRemoteCommand(f'sudo {redis_dir}/src/redis-cli -p {port} flushall')
+
+  for port in ports:
+    vm.TryRemoteCommand(
+        f'sudo {redis_dir}/src/redis-cli -p {port} cluster reset hard'
+    )
+
+  vm.TryRemoteCommand(
+      'sudo pkill -f redis-server || echo "No Redis server processes found"'
+  )
+
+
+def StartCluster(server_vms) -> None:
+  """Start redis cluster; assumes redis shards started with cluster mode."""
+  cluster_create_cmd = f'sudo {GetRedisDir()}/src/redis-cli --cluster create '
+  for server_vm in server_vms:
+    cluster_create_cmd += f' {server_vm.internal_ip}:{DEFAULT_PORT}'
+  stdout, _ = server_vms[0].RemoteCommand(f'echo "yes" | {cluster_create_cmd}')
+  assert 'All 16384 slots covered' in stdout, 'incorrect redis cluster output'
+
+
 def GetMetadata(vm) -> Dict[str, Any]:
   num_processes = _GetNumProcesses(vm)
   return {
       'redis_server_version': _VERSION.value,
+      'redis_server_cluster_mode': CLUSTER_MODE.value,
       'redis_server_io_threads': (
           _GetIOThreads(vm) if _VERSION.value >= '6.2.1' else 0
       ),
@@ -245,6 +323,7 @@ def GetMetadata(vm) -> Dict[str, Any]:
       'redis_server_io_threads_cpu_affinity': _IO_THREAD_AFFINITY.value,
       'redis_server_enable_snapshots': _ENABLE_SNAPSHOTS.value,
       'redis_server_num_processes': num_processes,
+      'redis_aof': REDIS_AOF.value,
   }
 
 

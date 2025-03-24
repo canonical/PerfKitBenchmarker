@@ -7,8 +7,11 @@ https://cloud.google.com/run/docs/quickstarts/jobs/create-execute
 
 import logging
 import time
+
+from absl import flags
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import vm_util
+from perfkitbenchmarker.providers.gcp import util
 from perfkitbenchmarker.resources import base_job
 from perfkitbenchmarker.resources import jobs_setter
 
@@ -18,8 +21,6 @@ _JOB_SPEC = jobs_setter.BaseJobSpec
 # For more info, see:
 # https://cloud.google.com/blog/products/serverless/cloud-run-gets-always-on-cpu-allocation
 _TWO_HOURS = 60 * 60 * 2  # Two hours in seconds
-# The p3rf-serverless-gcf2 project number.
-_P3RF_PROJECT_NUMBER = '89953586185'
 
 
 class GoogleCloudRunJobsSpec(_JOB_SPEC):
@@ -27,6 +28,8 @@ class GoogleCloudRunJobsSpec(_JOB_SPEC):
 
   SERVICE = CLOUD_RUN_PRODUCT
   CLOUD = 'GCP'
+
+FLAGS = flags.FLAGS
 
 
 class GoogleCloudRunJob(base_job.BaseJob):
@@ -39,17 +42,23 @@ class GoogleCloudRunJob(base_job.BaseJob):
     super().__init__(job_spec, container_registry)
     self.region = self.region or self._default_region
     self.user_managed = False
+    self.project = FLAGS.project or util.GetDefaultProject()
     self.metadata.update({
         'Product_ID': self.SERVICE,
         'region': self.region,
         'Run_Environment': 'gen2',
     })
+    self.project_number = util.GetProjectNumber(self.project)
 
   def _Create(self) -> None:
     """Creates the underlying resource."""
     # https://cloud.google.com/sdk/gcloud/reference/run/jobs/create
-    cmd = [
-        'gcloud',
+    cmd = ['gcloud']
+    # TODO(user): Remove alpha once the feature is GA.
+    if self.job_gpu_type or self.job_gpu_count:
+      cmd.append('alpha')
+
+    cmd.extend([
         'run',
         'jobs',
         'create',
@@ -57,8 +66,15 @@ class GoogleCloudRunJob(base_job.BaseJob):
         '--image=%s' % self.container_image,
         '--region=%s' % self.region,
         '--memory=%s' % self.backend,
-        '--project=p3rf-serverless-gcf2',
-    ]
+        '--project=%s' % self.project,
+        '--tasks=%s' % self.task_count,
+    ])
+
+    if self.job_gpu_type:
+      cmd.append('--gpu-type=%s' % self.job_gpu_type)
+    if self.job_gpu_count:
+      cmd.append('--gpu=%s' % self.job_gpu_count)
+
     self.metadata.update({
         'container_image': self.container_image,
     })
@@ -78,7 +94,7 @@ class GoogleCloudRunJob(base_job.BaseJob):
         'delete',
         self.name,
         '--region=%s' % self.region,
-        '--project=p3rf-serverless-gcf2',
+        '--project=%s' % self.project,
         '--quiet',
     ]
 
@@ -92,7 +108,7 @@ class GoogleCloudRunJob(base_job.BaseJob):
         'describe',
         self.name,
         '--region=%s' % self.region,
-        '--project=p3rf-serverless-gcf2',
+        '--project=%s' % self.project,
     ]
     try:
       out = vm_util.IssueCommand(cmd)
@@ -118,7 +134,7 @@ class GoogleCloudRunJob(base_job.BaseJob):
         self.name,
         '--wait',  # wait for the execution to complete.
         '--region=%s' % self.region,
-        '--project=p3rf-serverless-gcf2',
+        '--project=%s' % self.project,
     ]
     vm_util.IssueCommand(cmd)
     self.last_execution_end_time = time.time()
@@ -130,6 +146,6 @@ class GoogleCloudRunJob(base_job.BaseJob):
 
     return (
         'https://monitoring.corp.google.com/dashboard/run/jobs%2Finstances?'
-        f'scope=cloud_project_number%3D{_P3RF_PROJECT_NUMBER}&'
+        f'scope=cloud_project_number%3D{self.project_number}&'
         f'duration={_TWO_HOURS}&filters=module%3D{self.name}&utc_end={utc_end}'
     )

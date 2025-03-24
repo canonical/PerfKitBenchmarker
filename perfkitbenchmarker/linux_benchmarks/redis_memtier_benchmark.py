@@ -69,15 +69,13 @@ BENCHMARK_CONFIG = """
 redis_memtier:
   description: >
       Run memtier_benchmark against Redis.
-      Specify the number of client VMs with --redis_clients.
   flags:
     memtier_protocol: redis
     create_and_boot_post_task_delay: 5
     memtier_data_size: 1024
     memtier_pipeline: 1
     placement_group_style: none
-    redis_simulate_aof: False
-    redis_server_io_threads: 0
+    redis_aof: False
   vm_groups:
     servers:
       vm_spec: *default_dual_core
@@ -93,6 +91,10 @@ _BenchmarkSpec = benchmark_spec.BenchmarkSpec
 
 def CheckPrerequisites(_):
   """Verifies that benchmark setup is correct."""
+  if FLAGS.redis_server_cluster_mode and not FLAGS.memtier_cluster_mode:
+    raise errors.Setup.InvalidFlagConfigurationError(
+        '--redis_server_cluster_mode must be used with --memtier_cluster_mode'
+    )
   if len(redis_server.GetRedisPorts()) >= 0 and (
       len(FLAGS.memtier_pipeline) > 1
       or len(FLAGS.memtier_threads) > 1
@@ -122,7 +124,7 @@ def GetConfig(user_config: Dict[str, Any]) -> Dict[str, Any]:
     vm_spec = config['vm_groups']['servers']['vm_spec']
     for cloud in vm_spec:
       vm_spec[cloud]['machine_type'] = FLAGS.redis_memtier_server_machine_type
-  if not redis_server.REDIS_SIMULATE_AOF.value:
+  if not redis_server.REDIS_AOF.value:
     config['vm_groups']['servers']['disk_count'] = 0
   return config
 
@@ -130,21 +132,28 @@ def GetConfig(user_config: Dict[str, Any]) -> Dict[str, Any]:
 def Prepare(bm_spec: _BenchmarkSpec) -> None:
   """Install Redis on one VM and memtier_benchmark on another."""
   server_count = len(bm_spec.vm_groups['servers'])
-  if server_count != 1:
+  if server_count != 1 and not redis_server.CLUSTER_MODE.value:
     raise errors.Benchmarks.PrepareException(
         f'Expected servers vm count to be 1, got {server_count}'
     )
   client_vms = bm_spec.vm_groups['clients']
   server_vm = bm_spec.vm_groups['servers'][0]
+  all_server_vms = bm_spec.vm_groups['servers']  # for cluster mode
 
   # Install memtier
   background_tasks.RunThreaded(
       lambda client: client.Install('memtier'), client_vms
   )
 
-  # Install redis on the 1st machine.
-  server_vm.Install('redis_server')
-  redis_server.Start(server_vm)
+  # Install and start redis on the server machine(s).
+  background_tasks.RunThreaded(
+      lambda vm: vm.Install('redis_server'), all_server_vms
+    )
+  for vm in all_server_vms:
+    redis_server.Start(vm)
+
+  if redis_server.CLUSTER_MODE.value:
+    redis_server.StartCluster(all_server_vms)
 
   # Load the redis server with preexisting data.
   # Run 4 at a time with only the first client VM to reduce memory
@@ -184,26 +193,73 @@ def Run(bm_spec: _BenchmarkSpec) -> List[sample.Sample]:
     server_vm.RemoteCommand(f'bash {_TOP_SCRIPT}')
 
   assert bm_spec.redis_endpoint_ip
-  raw_results = memtier.RunOverAllThreadsPipelinesAndClients(
-      client_vms,
-      bm_spec.redis_endpoint_ip,
-      redis_server.GetRedisPorts(server_vm),
+
+  # Sweep the number of IO threads to find the optimal value.
+  io_threads_to_sweep = (
+      [int(io_threads) for io_threads in redis_server.IO_THREADS.value]
+      if redis_server.IO_THREADS.value
+      else [None]
   )
-  redis_metadata = redis_server.GetMetadata(server_vm)
+
+  maximum_total_ops_throughput = 0.0
+  result_with_maximum_total_ops_throughput = None
+  all_results = []
+
+  for io_threads in io_threads_to_sweep:
+    # Override the io_threads and restart the server if io_threads is not None
+    if io_threads is not None:
+      _UpdateIOThreadsForRedisServer(bm_spec.vm_groups['servers'], io_threads)
+
+    raw_results = memtier.RunOverAllThreadsPipelinesAndClients(
+        client_vms,
+        bm_spec.redis_endpoint_ip,
+        redis_server.GetRedisPorts(server_vm),
+    )
+    redis_metadata = redis_server.GetMetadata(server_vm)
+
+    total_ops_throughput = 0.0
+    for server_result in raw_results:
+      if server_result.metric == 'Total Ops Throughput':
+        total_ops_throughput = server_result.value
+      server_result.metadata.update(redis_metadata)
+      server_result.metadata.update(benchmark_metadata)
+
+    if total_ops_throughput > maximum_total_ops_throughput:
+      maximum_total_ops_throughput = total_ops_throughput
+      result_with_maximum_total_ops_throughput = raw_results
+
+    # Add the results with the current io_threads value
+    if io_threads is not None:
+      for server_result in raw_results:
+        # Cannot assign to metric directly because it is an immutable namedtuple
+        server_result = server_result._replace(
+            metric=f'{server_result.metric} (io_threads={io_threads})'
+        )
+        all_results.append(server_result)
 
   top_results = []
   if measure_cpu_on_server_vm:
     top_results = _GetTopResults(server_vm)
 
-  for server_result in raw_results:
-    server_result.metadata.update(redis_metadata)
-    server_result.metadata.update(benchmark_metadata)
-
-  return raw_results + top_results
+  return result_with_maximum_total_ops_throughput + all_results + top_results
 
 
 def Cleanup(bm_spec: _BenchmarkSpec) -> None:
   del bm_spec
+
+
+def _UpdateIOThreadsForRedisServer(
+    server_vms: List[virtual_machine.BaseVirtualMachine], io_threads: int
+) -> None:
+  for server_vm in server_vms:
+    redis_server.Stop(server_vm)
+
+  for server_vm in server_vms:
+    redis_server.CURRENT_IO_THREADS = io_threads
+    redis_server.Start(server_vm)
+
+  if redis_server.CLUSTER_MODE.value:
+    redis_server.StartCluster(server_vms)
 
 
 def _GetTopResults(server_vm) -> List[sample.Sample]:

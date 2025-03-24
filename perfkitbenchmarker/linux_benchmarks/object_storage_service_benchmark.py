@@ -98,15 +98,9 @@ OBJECT_STORAGE_GCS_MULTIREGION = flags.DEFINE_string(
     'Storage multiregion for GCS in object storage benchmark.',
 )
 
-flags.DEFINE_string(
-    'object_storage_storage_class',
-    None,
-    'Storage class to use in object storage benchmark.',
-)
-
 flags.DEFINE_enum(
     'object_storage_scenario',
-    'all',
+    'api_multistream',
     [
         'all',
         'cli',
@@ -412,14 +406,15 @@ STORAGE_TO_API_SCRIPT_DICT = {
 _SECONDS_PER_HOUR = 60 * 60
 
 
-class MultistreamOperationType(enum.Enum):
+class MultistreamOperationType(enum.StrEnum):
   """MultiStream Operations supported by object_storage_api_tests script."""
 
-  download = 1
-  upload = 2
-  delete = 3
-  bulk_delete = 4
-  redownload = 5
+  # pylint: disable=invalid-name
+  download = enum.auto()
+  upload = enum.auto()
+  delete = enum.auto()
+  bulk_delete = enum.auto()
+  redownload = enum.auto()
 
 
 def GetConfig(user_config):
@@ -1378,6 +1373,17 @@ def MultiStreamRWBenchmark(
     )
     logging.info('Finished multi-stream re-read test.')
 
+  # Pre-cleanup here, whre we know what the files are.
+  # Also records delete latencies, even though that's not really documented.
+  keep_bucket = (
+      FLAGS.object_storage_objects_written_file_prefix is not None
+      or FLAGS.object_storage_dont_delete_bucket
+  )
+  if not keep_bucket:
+    MultiStreamDelete(
+        results, metadata, vms, command_builder, service, bucket_name
+    )
+
 
 def MultiStreamWriteBenchmark(
     results, metadata, vms, command_builder, service, bucket_name
@@ -1940,6 +1946,11 @@ def Run(benchmark_spec):
 
   metadata.update(service.Metadata(vms[0]))
 
+  if object_storage_service.STORAGE_CLASS.value:
+    metadata['object_storage_class'] = (
+        object_storage_service.STORAGE_CLASS.value
+    )
+
   results = []
   test_script_path = '/tmp/run/%s' % API_TEST_SCRIPT
   try:
@@ -1984,16 +1995,12 @@ def Run(benchmark_spec):
     )
 
   # Clear the bucket if we're not saving the objects for later
-  # This is needed for long running tests, or else the objects would just pile
-  # up after each run.
   keep_bucket = (
       FLAGS.object_storage_objects_written_file_prefix is not None
       or FLAGS.object_storage_dont_delete_bucket
   )
   if not keep_bucket:
-    MultiStreamDelete(
-        results, metadata, vms, command_builder, service, bucket_name
-    )
+    service.EmptyBucket(bucket_name)
 
   service.UpdateSampleMetadata(results)
 
