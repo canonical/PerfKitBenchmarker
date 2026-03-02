@@ -14,6 +14,7 @@
 """Module containing the spec for relational database services."""
 
 import copy
+import json
 
 from absl import logging
 from perfkitbenchmarker import db_util
@@ -22,7 +23,7 @@ from perfkitbenchmarker import errors
 from perfkitbenchmarker import provider_info
 from perfkitbenchmarker import providers
 from perfkitbenchmarker import sql_engine_utils
-from perfkitbenchmarker import virtual_machine
+from perfkitbenchmarker import virtual_machine_spec
 from perfkitbenchmarker.configs import freeze_restore_spec
 from perfkitbenchmarker.configs import option_decoders
 from perfkitbenchmarker.configs import spec
@@ -39,6 +40,8 @@ def GetRelationalDbSpecClass(engine):
       sql_engine_utils.SPANNER_POSTGRES,
   ]:
     return spec.GetSpecClass(RelationalDbSpec, SERVICE_TYPE='spanner')
+  if engine == sql_engine_utils.AURORA_DSQL_POSTGRES:
+    return spec.GetSpecClass(RelationalDbSpec, SERVICE_TYPE='aurora-dsql')
   return RelationalDbSpec
 
 
@@ -56,7 +59,7 @@ class RelationalDbSpec(freeze_restore_spec.FreezeRestoreSpec):
       opposed to unmanaged (installed on infrastructure).
     db_tier: Specifies what tier the database is in.
     db_disk_spec: disk.BaseDiskSpec: Configurable disk options.
-    db_spec: virtual_machine.BaseVmSpec: Configurable VM options.
+    db_spec: virtual_machine_spec.BaseVmSpec: Configurable VM options.
   """
 
   SPEC_TYPE = 'RelationalDbSpec'
@@ -71,13 +74,12 @@ class RelationalDbSpec(freeze_restore_spec.FreezeRestoreSpec):
   is_managed_db: bool
   db_tier: str
   db_disk_spec: disk.BaseDiskSpec
-  db_spec: virtual_machine.BaseVmSpec
+  db_spec: virtual_machine_spec.BaseVmSpec
   load_machine_type: str
+  family: str
 
   def __init__(self, component_full_name, flag_values=None, **kwargs):
-    super().__init__(
-        component_full_name, flag_values=flag_values, **kwargs
-    )
+    super().__init__(component_full_name, flag_values=flag_values, **kwargs)
     # TODO(user): This is a lot of boilerplate, and is repeated
     # below in VmGroupSpec. See if some can be consolidated. Maybe we can
     # specify a VmGroupSpec instead of both vm_spec and disk_spec.
@@ -111,7 +113,7 @@ class RelationalDbSpec(freeze_restore_spec.FreezeRestoreSpec):
             '{0}.cloud is "{1}", but {0}.db_spec does not contain a '
             'configuration for "{1}".'.format(component_full_name, self.cloud)
         )
-      db_vm_spec_class = virtual_machine.GetVmSpecClass(self.cloud)
+      db_vm_spec_class = virtual_machine_spec.GetVmSpecClass(self.cloud)
       self.db_spec = db_vm_spec_class(
           '{}.db_spec.{}'.format(component_full_name, self.cloud),
           flag_values=flag_values,
@@ -166,6 +168,7 @@ class RelationalDbSpec(freeze_restore_spec.FreezeRestoreSpec):
         ),
         'backup_enabled': (option_decoders.BooleanDecoder, {'default': True}),
         'is_managed_db': (option_decoders.BooleanDecoder, {'default': True}),
+        'family': (option_decoders.StringDecoder, {'default': None}),
         'db_tier': (option_decoders.StringDecoder, {'default': None}),
         'db_spec': (spec.PerCloudConfigDecoder, {}),
         'db_disk_spec': (spec.PerCloudConfigDecoder, {}),
@@ -200,7 +203,7 @@ class RelationalDbSpec(freeze_restore_spec.FreezeRestoreSpec):
     has_db_machine_type = flag_values['db_machine_type'].present
     has_db_cpus = flag_values['db_cpus'].present
     has_db_memory = flag_values['db_memory'].present
-    has_custom_machine_type = has_db_cpus and has_db_memory
+    has_custom_machine_type = has_db_cpus or has_db_memory
     has_client_machine_type = flag_values['client_vm_machine_type'].present
     has_client_vm_cpus = flag_values['client_vm_cpus'].present
     has_client_vm_memory = flag_values['client_vm_memory'].present
@@ -211,12 +214,6 @@ class RelationalDbSpec(freeze_restore_spec.FreezeRestoreSpec):
           'db_cpus/db_memory can not be specified with '
           'db_machine_type.   Either specify a custom machine '
           'with cpus and memory or specify a predefined machine type.'
-      )
-
-    if not has_custom_machine_type and (has_db_cpus or has_db_memory):
-      raise errors.Config.MissingOption(
-          'To specify a custom database machine instance, both db_cpus '
-          'and db_memory must be specified.'
       )
 
     if has_client_custom_machine_type and has_client_machine_type:
@@ -343,6 +340,8 @@ class RelationalDbSpec(freeze_restore_spec.FreezeRestoreSpec):
       ] = flag_values.managed_db_azure_compute_units
     if flag_values['managed_db_tier'].present:
       config_values['db_tier'] = flag_values.managed_db_tier
+    if flag_values['db_family'].present:
+      config_values['family'] = flag_values.db_family
     if has_client_machine_type:
       config_values['vm_groups']['clients']['vm_spec'][cloud][
           'machine_type'
@@ -463,4 +462,6 @@ class RelationalDbSpec(freeze_restore_spec.FreezeRestoreSpec):
       if flag_values['zone'].present:
         flag_values.zone.clear()
 
-    logging.warning('Relational db config values: %s', config_values)
+    logging.warning(
+        'Relational db config values: %s', json.dumps(config_values, indent=2)
+    )

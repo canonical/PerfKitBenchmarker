@@ -110,6 +110,20 @@ _ycsb_tar_url = None
 _INCREMENTAL_STARTING_QPS = 500
 _INCREMENTAL_TIMELIMIT_SEC = 60 * 5
 
+# Taken from
+# https://github.com/brianfrankcooper/YCSB/blob/9858c4dab6dc45991871c9f137bd011752d9c21b/core/src/main/java/site/ycsb/Status.java#L98
+_OK_STATUSES = ['OK', 'BATCHED_OK']
+_FAILED_STATUSES = [
+    'ERROR',
+    'NOT_FOUND',
+    'NOT_IMPLEMENTED',
+    'UNEXPECTED_STATE',
+    'BAD_REQUEST',
+    'FORBIDDEN',
+    'SERVICE_UNAVAILABLE',
+]
+
+
 _ThroughputTimeSeries = dict[int, float]
 # Tuple of (percentile, latency, count)
 _HdrHistogramTuple = tuple[float, float, int]
@@ -319,7 +333,11 @@ def _ParseStatusLine(line: str) -> Iterator[_OpResult]:
   return (_OpResult.FromStatusLine(match) for match in matches)
 
 
-def _ValidateErrorRate(result: YcsbResult, threshold: float) -> None:
+def _ValidateErrorRate(
+    result: YcsbResult,
+    default_threshold: float,
+    per_op_thresholds: dict[str, float] | None = None,
+) -> None:
   """Raises an error if results contains entries with too high error rate.
 
   Computes the error rate for each operation, example output looks like:
@@ -337,23 +355,32 @@ def _ValidateErrorRate(result: YcsbResult, threshold: float) -> None:
 
   Args:
     result: The result of running ParseResults()
-    threshold: The error rate before throwing an exception. 1.0 means no
-      exception will be thrown, 0.0 means an exception is always thrown.
+    default_threshold: The error rate before throwing an exception. 1.0 means no
+      exception will be thrown, 0.0 means an exception is thrown for any error.
+    per_op_thresholds: A dict of operation name to error rate threshold. If
+      set, these thresholds will take precedence over the default_threshold.
 
   Raises:
     errors.Benchmarks.RunError: If the computed error rate is higher than the
       threshold.
   """
+  if per_op_thresholds is None:
+    per_op_thresholds = {}
+
   for operation in result.groups.values():
     name, stats = operation.group, operation.statistics
     # The operation count can be 0 or keys may be missing from the output
-    ok_count = stats.get('Return=OK', 0.0)
-    error_count = stats.get('Return=ERROR', 0.0)
-    count = ok_count + error_count
+    ok_count = sum(
+        stats.get(f'Return={status}', 0.0) for status in _OK_STATUSES
+    )
+    failed_count = sum(
+        stats.get(f'Return={status}', 0.0) for status in _FAILED_STATUSES
+    )
+    count = ok_count + failed_count
     if count == 0:
       continue
-    # These keys may be missing from the output.
-    error_rate = error_count / count
+    error_rate = failed_count / count
+    threshold = per_op_thresholds.get(name, default_threshold)
     if error_rate > threshold:
       raise errors.Benchmarks.RunError(
           f'YCSB had a {error_rate} error rate for {name}, higher than '
@@ -364,8 +391,10 @@ def _ValidateErrorRate(result: YcsbResult, threshold: float) -> None:
 def ParseResults(
     ycsb_result_string: str,
     data_type: str = 'histogram',
-    error_rate_threshold: float = 1.0,
+    default_error_rate_threshold: float = 1.0,
+    per_op_error_rate_thresholds: dict[str, float] | None = None,
     timestamp_offset_sec: int = 0,
+    epoch_start_time: int = 0,
 ) -> 'YcsbResult':
   """Parse YCSB results.
 
@@ -446,17 +475,23 @@ def ParseResults(
       and 'hdrhistogram' datasets are in the same format, with the difference
       being lacking the (millisec, count) histogram component. Hence are parsed
       similarly.
-    error_rate_threshold: Error statistics in the output should not exceed this
-      ratio.
+    default_error_rate_threshold: Error statistics in the output should not
+      exceed this ratio.
+    per_op_error_rate_thresholds: A dict of operation name to error rate
+      threshold. If set, these thresholds will take precedence over the
+      default_error_rate_threshold.
     timestamp_offset_sec: The number of seconds to offset the timestamp by for
       runs measuring the status time series. Useful for if there are multiple
       runs back-to-back.
+    epoch_start_time: The epoch start time of the YCSB run, in seconds. Used to
+      convert the timestamp in the output to the epoch time.
 
   Returns:
     A YcsbResult object that contains the results from parsing YCSB output.
   Raises:
     IOError: If the results contained unexpected lines.
   """
+
   if (
       'redis.clients.jedis.exceptions.JedisConnectionException'
       in ycsb_result_string
@@ -486,7 +521,7 @@ def ParseResults(
     match = re.search(_STATUS_PATTERN, result_string)
     if match is not None:
       timestamp, qps = int(match.group(1)), float(match.group(2))
-      timestamp += timestamp_offset_sec
+      timestamp += timestamp_offset_sec + epoch_start_time
       # Repeats in the printed status are erroneous, ignore.
       if timestamp not in status_time_series:
         status_time_series[timestamp] = _StatusResult(
@@ -530,7 +565,9 @@ def ParseResults(
     result.groups[operation] = _OpResult.FromSummaryLines(
         lines, operation, data_type
     )
-  _ValidateErrorRate(result, error_rate_threshold)
+  _ValidateErrorRate(
+      result, default_error_rate_threshold, per_op_error_rate_thresholds
+  )
   return result
 
 
@@ -866,7 +903,9 @@ def CombineResults(
 
   result_list = list(result_list)
   result = copy.deepcopy(result_list[0])
-  DropUnaggregated(result)
+
+  if len(result_list) > 1:
+    DropUnaggregated(result)
 
   for indiv in result_list[1:]:
     for group_name, group in indiv.groups.items():

@@ -13,6 +13,7 @@
 # limitations under the License.
 """Managed relational database provisioning and teardown for AWS Aurora."""
 
+import datetime
 import json
 import time
 from typing import Any
@@ -20,6 +21,8 @@ from typing import Any
 from absl import flags
 from absl import logging
 from perfkitbenchmarker import errors
+from perfkitbenchmarker import relational_db
+from perfkitbenchmarker import sample
 from perfkitbenchmarker import sql_engine_utils
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.providers.aws import aws_relational_db
@@ -29,7 +32,7 @@ from perfkitbenchmarker.providers.aws import util
 FLAGS = flags.FLAGS
 
 DEFAULT_MYSQL_AURORA_VERSION = '8.0'
-DEFAULT_POSTGRES_AURORA_VERSION = '13'
+DEFAULT_POSTGRES_AURORA_VERSION = '17'
 
 _MAP_ENGINE_TO_DEFAULT_VERSION = {
     sql_engine_utils.AURORA_MYSQL: DEFAULT_MYSQL_AURORA_VERSION,
@@ -41,6 +44,27 @@ _AURORA_ENGINES = [
     sql_engine_utils.AURORA_POSTGRES,
 ]
 
+_STATUS_WAIT_TIMEOUT_SECONDS = 30 * 60
+
+# Before adding other DBClusterIdentifier metrics, check _CollectProviderMetric
+# to make sure it is supported. Note that VolumeBytesUsed is polled very
+# infrequently, and requires a 2-hour sleep to get a reliable number.
+_AURORA_ONLY_METRICS = [
+    aws_relational_db.AwsMetricSpec(
+        provider_name='VolumeBytesUsed',
+        sample_name='disk_bytes_used',
+        unit='GB',
+        conversion_func=lambda x: x / (1024 * 1024 * 1024),
+        dimensions={'DBClusterIdentifier': ''},
+        time_period=3600,
+        time_period_padding=datetime.timedelta(hours=12),
+    ),
+]
+
+
+class AuroraStatusChangeError(Exception):
+  """Error raised when the Aurora cluster status is not the expected one."""
+
 
 class AwsAuroraRelationalDb(aws_relational_db.BaseAwsRelationalDb):
   """Implements the aurora database for AWS."""
@@ -48,7 +72,6 @@ class AwsAuroraRelationalDb(aws_relational_db.BaseAwsRelationalDb):
   CLOUD = 'AWS'
   IS_MANAGED = True
   ENGINE = _AURORA_ENGINES
-  REQUIRED_ATTRS = ['CLOUD', 'IS_MANAGED', 'ENGINE']
 
   def __init__(self, relational_db_spec):
     super().__init__(relational_db_spec)
@@ -72,9 +95,7 @@ class AwsAuroraRelationalDb(aws_relational_db.BaseAwsRelationalDb):
           'db_high_availability is false, one zone '
           'should be specified.   '
           'db_high_availability: {}  '
-          'zone count: {} '.format(
-              self.spec.high_availability, len(self.zones)
-          )
+          'zone count: {} '.format(self.spec.high_availability, len(self.zones))
       )
 
     # Create the cluster.
@@ -218,6 +239,48 @@ class AwsAuroraRelationalDb(aws_relational_db.BaseAwsRelationalDb):
     ]
     vm_util.IssueCommand(cmd)
 
+  @vm_util.Retry(
+      timeout=_STATUS_WAIT_TIMEOUT_SECONDS,
+      poll_interval=10,
+      retryable_exceptions=(AuroraStatusChangeError,),
+  )
+  def _WaitForStatus(self, target_status: str) -> None:
+    """Waits for the Aurora cluster to reach a target status."""
+    json_output = self._DescribeCluster()
+    status = json_output['DBClusters'][0]['Status']
+    if status != target_status:
+      raise AuroraStatusChangeError(
+          f'Cluster {self.cluster_id} is {status}. Waiting for {target_status}.'
+      )
+
+  def Stop(self):
+    """Stops the Aurora cluster."""
+    if not self.cluster_id:
+      return
+    logging.info('Stopping Aurora cluster %s', self.cluster_id)
+    cmd = util.AWS_PREFIX + [
+        'rds',
+        'stop-db-cluster',
+        '--db-cluster-identifier=%s' % self.cluster_id,
+        '--region=%s' % self.region,
+    ]
+    vm_util.IssueCommand(cmd, raise_on_failure=False)
+    self._WaitForStatus('stopped')
+
+  def Start(self):
+    """Starts the Aurora cluster."""
+    if not self.cluster_id:
+      return
+    logging.info('Starting Aurora cluster %s', self.cluster_id)
+    cmd = util.AWS_PREFIX + [
+        'rds',
+        'start-db-cluster',
+        '--db-cluster-identifier=%s' % self.cluster_id,
+        '--region=%s' % self.region,
+    ]
+    vm_util.IssueCommand(cmd, raise_on_failure=False)
+    self._WaitForStatus('available')
+
   def _Delete(self):
     """Deletes the aurora cluster."""
     super()._Delete()
@@ -265,3 +328,47 @@ class AwsAuroraRelationalDb(aws_relational_db.BaseAwsRelationalDb):
     metadata = super().GetResourceMetadata()
     metadata['aurora_storage_type'] = self.storage_type
     return metadata
+
+  def _GetMetricsToCollect(self) -> list[relational_db.MetricSpec]:
+    """Returns a list of metrics to collect."""
+    metrics = aws_relational_db.RDS_COMMON_METRICS + _AURORA_ONLY_METRICS
+    for metric in metrics:
+      if 'DBClusterIdentifier' in metric.dimensions:
+        metric.dimensions['DBClusterIdentifier'] = self.cluster_id
+      elif 'DBInstanceIdentifier' in metric.dimensions:
+        metric.dimensions['DBInstanceIdentifier'] = self.instance_id
+    return metrics
+
+  def CollectMetrics(
+      self, start_time: datetime.datetime, end_time: datetime.datetime
+  ) -> list[sample.Sample]:
+    """Collects and returns performance metrics after the run phase.
+
+    Note that this method is overridden to stop the DB and downgrade VMs before
+    waiting for cost saving measures and assumes that no further tests will be
+    run on the DB or the clients. This is needed since the volume size
+    metrics are polled very infrequently.
+
+    Args:
+      start_time: The start time of the run phase.
+      end_time: The end time of the run phase.
+
+    Returns:
+      A list of sample.Sample instances containing the collected metrics.
+    """
+    self.Stop()
+    for vm in self.client_vms:
+      if hasattr(vm, 'DowngradeToCheapInstance'):
+        vm.DowngradeToCheapInstance()
+
+    logging.info(
+        'Sleeping for %d seconds to allow volume stats to be collected.',
+        aws_flags.AURORA_METRICS_COLLECTION_SLEEP_SECONDS.value,
+    )
+    time.sleep(aws_flags.AURORA_METRICS_COLLECTION_SLEEP_SECONDS.value)
+
+    results = super().CollectMetrics(start_time, end_time)
+
+    self.Start()
+
+    return results

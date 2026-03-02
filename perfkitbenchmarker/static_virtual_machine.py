@@ -35,6 +35,7 @@ from perfkitbenchmarker import disk
 from perfkitbenchmarker import linux_virtual_machine
 from perfkitbenchmarker import os_types
 from perfkitbenchmarker import virtual_machine
+from perfkitbenchmarker import virtual_machine_spec
 from perfkitbenchmarker import windows_virtual_machine
 
 FLAGS = flags.FLAGS
@@ -55,7 +56,7 @@ flags.DEFINE_bool(
 )
 
 
-class StaticVmSpec(virtual_machine.BaseVmSpec):
+class StaticVmSpec(virtual_machine_spec.BaseVmSpec):
   """Object containing all info needed to create a Static VM."""
 
   CLOUD = 'Static'
@@ -67,6 +68,7 @@ class StaticVmSpec(virtual_machine.BaseVmSpec):
       user_name=None,
       ssh_private_key=None,
       internal_ip=None,
+      internal_ips=None,
       ssh_port=22,
       password=None,
       disk_specs=None,
@@ -85,6 +87,7 @@ class StaticVmSpec(virtual_machine.BaseVmSpec):
       ssh_private_key: The absolute path to the private keyfile to use to ssh to
         the VM.
       internal_ip: The internal ip address of the VM.
+      internal_ips: The internal ip addresses of the VMs.
       ssh_port: The port number to use for SSH and SCP commands.
       password: The password used to log into the VM (Windows Only).
       disk_specs: None or a list of dictionaries containing kwargs used to
@@ -101,6 +104,7 @@ class StaticVmSpec(virtual_machine.BaseVmSpec):
     self.user_name = user_name
     self.ssh_private_key = ssh_private_key
     self.internal_ip = internal_ip
+    self.internal_ips = internal_ips
     self.ssh_port = ssh_port
     self.password = password
     self.os_type = os_type
@@ -155,6 +159,7 @@ class StaticVirtualMachine(virtual_machine.BaseVirtualMachine):
     self.user_name = vm_spec.user_name
     self.ssh_private_key = vm_spec.ssh_private_key
     self.internal_ip = vm_spec.internal_ip
+    self.internal_ips = vm_spec.internal_ips
     self.zone = self.zone or (
         'Static - %s@%s' % (self.user_name, self.ip_address)
     )
@@ -163,6 +168,17 @@ class StaticVirtualMachine(virtual_machine.BaseVirtualMachine):
     self.disk_specs = vm_spec.disk_specs
     self.from_pool = False
     self.preemptible = False
+
+  def __eq__(self, other):
+    if not isinstance(other, StaticVirtualMachine):
+      return False
+    # If two VMs have the same IP address and SSH port, then they're the same
+    # because any command we run on one will be sent the same place as commands
+    # to the other.
+    return (
+        self.ssh_port == other.ssh_port
+        and self.GetConnectionIp() == other.GetConnectionIp()
+    )
 
   def _Suspend(self):
     """Suspends VM."""
@@ -218,6 +234,7 @@ class StaticVirtualMachine(virtual_machine.BaseVirtualMachine):
       keyfile_path: string.
       ssh_port: integer, optional. Default 22
       internal_ip: string, optional.
+      internal_ips: list of strings, optional.
       zone: string, optional.
       local_disks: array of strings, optional.
       scratch_disk_mountpoints: array of strings, optional
@@ -237,22 +254,16 @@ class StaticVirtualMachine(virtual_machine.BaseVirtualMachine):
           'Invalid static VM file. Expected array, got: %s.' % type(vm_arr)
       )
 
-    required_keys = frozenset(['ip_address', 'user_name'])
-
-    linux_required_keys = required_keys | frozenset(['keyfile_path'])
-
-    required_keys_by_os = {
-        os_types.WINDOWS: required_keys | frozenset(['password']),
-        os_types.DEBIAN: linux_required_keys,
-        os_types.RHEL: linux_required_keys,
-        os_types.CLEAR: linux_required_keys,
-    }
-
+    required_keys = set(['ip_address', 'user_name'])
     # assume linux_required_keys for unknown os_type
-    required_keys = required_keys_by_os.get(FLAGS.os_type, linux_required_keys)
+    if FLAGS.os_type in os_types.WINDOWS_OS_TYPES:
+      required_keys.add('password')
+    else:
+      required_keys.add('keyfile_path')
 
     optional_keys = frozenset([
         'internal_ip',
+        'internal_ips',
         'zone',
         'local_disks',
         'scratch_disk_mountpoints',
@@ -260,7 +271,7 @@ class StaticVirtualMachine(virtual_machine.BaseVirtualMachine):
         'ssh_port',
         'install_packages',
     ])
-    allowed_keys = required_keys | optional_keys
+    allowed_keys = frozenset(required_keys) | optional_keys
 
     def VerifyItemFormat(item):
       """Verify that the decoded JSON object matches the required schema."""
@@ -281,6 +292,7 @@ class StaticVirtualMachine(virtual_machine.BaseVirtualMachine):
       user_name = item['user_name']
       keyfile_path = item.get('keyfile_path')
       internal_ip = item.get('internal_ip')
+      internal_ips = item.get('internal_ips')
       zone = item.get('zone')
       local_disks = item.get('local_disks', [])
       password = item.get('password')
@@ -322,6 +334,7 @@ class StaticVirtualMachine(virtual_machine.BaseVirtualMachine):
           install_packages=install_packages,
           ssh_private_key=keyfile_path,
           internal_ip=internal_ip,
+          internal_ips=internal_ips,
           zone=zone,
           disk_specs=disk_kwargs_list,
           password=password,
@@ -398,6 +411,12 @@ class Rhel9BasedStaticVirtualMachine(
   pass
 
 
+class Rhel10BasedStaticVirtualMachine(
+    StaticVirtualMachine, linux_virtual_machine.Rhel10Mixin
+):
+  pass
+
+
 class Fedora36BasedStaticVirtualMachine(
     StaticVirtualMachine, linux_virtual_machine.Fedora36Mixin
 ):
@@ -418,6 +437,12 @@ class Debian11BasedStaticVirtualMachine(
 
 class Debian12BasedStaticVirtualMachine(
     StaticVirtualMachine, linux_virtual_machine.Debian12Mixin
+):
+  pass
+
+
+class Debian13BasedStaticVirtualMachine(
+    StaticVirtualMachine, linux_virtual_machine.Debian13Mixin
 ):
   pass
 

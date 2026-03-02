@@ -9,9 +9,7 @@ from tests import pkb_common_test_case
 
 
 def _MockIssueCommand(file_name_text_response):
-  path = pkb_common_test_case.GetTestDir() / 'data' / file_name_text_response
-  with open(path) as f:
-    output = f.read()
+  output = pkb_common_test_case.ReadFile(file_name_text_response)
   return mock.patch.object(
       vm_util, 'IssueCommand', autospec=True, return_value=[output, None, None]
   )
@@ -65,6 +63,10 @@ class AwsUtilTest(pkb_common_test_case.PkbCommonTestCase):
     expected_regions = {'us-west-2'}
     self.assertEqual(expected_regions, actual_regions)
 
+  def testGetMachineFamily(self):
+    self.assertEqual(util.GetMachineFamily('r6gd.xlarge'), 'r6gd')
+    self.assertEqual(util.GetMachineFamily('m7i.2xlarge'), 'm7i')
+    self.assertIsNone(util.GetMachineFamily(None))
 
 if __name__ == '__main__':
   unittest.main()

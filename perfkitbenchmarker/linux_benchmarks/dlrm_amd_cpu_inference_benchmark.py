@@ -61,6 +61,7 @@ dlrm_amd_cpu_inference:
           boot_disk_size: 3000
   flags:
     disable_smt: True
+    sar: True
 """
 
 
@@ -111,8 +112,11 @@ def Prepare(bm_spec: benchmark_spec.BenchmarkSpec) -> None:
       'bash Miniconda3-latest-Linux-x86_64.sh -b'
   )
   vm.RemoteCommand(
-      './miniconda3/bin/conda create -n pace-env-py3.9 python=3.9 -y; '
-      './miniconda3/bin/conda init'
+      './miniconda3/bin/conda tos accept --override-channels --channel'
+      ' https://repo.anaconda.com/pkgs/main; ./miniconda3/bin/conda tos accept'
+      ' --override-channels --channel https://repo.anaconda.com/pkgs/r;'
+      ' ./miniconda3/bin/conda create -n pace-env-py3.9 python=3.9 -y;'
+      ' ./miniconda3/bin/conda init'
   )
   vm.RemoteCommand(f'{_SET_ENV} conda install -c conda-forge gcc=12.1.0 -y')
   vm.RemoteCommand(f'{_SET_ENV} bash prepare_env.sh')
@@ -140,7 +144,7 @@ def Run(bm_spec: benchmark_spec.BenchmarkSpec) -> list[sample.Sample]:
       'chmod 755 run_*.sh; '
       f'export DATA_DIR=/home/{vm.user_name}/mlcommons/data-terabyte; '
       f'export MODEL_DIR=/home/{vm.user_name}/mlcommons; '
-      f'export NUM_SOCKETS={vm.numa_node_count}; '
+      f'export NUM_SOCKETS={vm.CheckLsCpu().socket_count}; '
       f'export CPUS_PER_SOCKET={cpus_per_socket}; '
       f'export CPUS_PER_PROCESS={cpus_per_socket}; '
       'export CPUS_PER_INSTANCE=2; '

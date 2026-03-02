@@ -107,6 +107,13 @@ RAM = 'ram'
 NFS = 'nfs'
 SMB = 'smb'
 
+# Disks that live on a network and attaches to multiple VMs
+HYPERDISK_ML = 'hyperdisk-ml'
+MULTI_ATTACH_DISK_TYPES = [HYPERDISK_ML]
+
+# Lustre disks
+LUSTRE = 'lustre'
+
 # FUSE mounted object storage bucket
 OBJECT_STORAGE = 'object_storage'
 
@@ -123,6 +130,11 @@ REGION = 'region'
 DEFAULT_MOUNT_OPTIONS = 'discard'
 DEFAULT_FSTAB_OPTIONS = 'defaults'
 
+# Disk access modes
+READ_WRITE_SINGLE = 'READ_WRITE_SINGLE'
+READ_ONLY_MANY = 'READ_ONLY_MANY'
+READ_WRITE_MANY = 'READ_WRITE_MANY'
+
 
 def GetDiskSpecClass(cloud, disk_type):
   """Get the DiskSpec class corresponding to 'cloud'."""
@@ -131,6 +143,11 @@ def GetDiskSpecClass(cloud, disk_type):
   if spec_class is BaseDiskSpec:
     return spec.GetSpecClass(BaseDiskSpec, CLOUD=cloud)
   return spec_class
+
+
+def GetMultiAttachDiskClass(cloud: str):
+  """Get the Disk class corresponding to 'cloud'."""
+  return resource.GetResourceClass(MultiAttachDisk, CLOUD=cloud)
 
 
 def IsRemoteDisk(disk_type):
@@ -167,6 +184,8 @@ class BaseDiskSpec(spec.BaseSpec):
     self.provisioned_throughput = None
     self.multi_writer_mode: bool = False
     self.multi_writer_group_name: str = None
+    self.snapshot_name: str = None
+    self.snapshot_id: str = None
     super().__init__(*args, **kwargs)
 
   @classmethod
@@ -271,6 +290,18 @@ class BaseDiskSpec(spec.BaseSpec):
         ),
     })
     return result
+
+
+class BaseLustreDiskSpec(BaseDiskSpec):
+  """Stores the information needed to create a base Lustre disk."""
+
+  SPEC_TYPE = 'BaseLustreDiskSpec'
+  DISK_TYPE = LUSTRE
+
+  def __init__(self, *args, **kwargs):
+    super().__init__(*args, **kwargs)
+    self.device_path: str = None
+    self.disk_type = LUSTRE
 
 
 class BaseNFSDiskSpec(BaseDiskSpec):
@@ -420,13 +451,17 @@ class BaseDisk(resource.BaseResource):
 
   def __init__(self, disk_spec):
     super().__init__()
+    self.spec = disk_spec
     self.disk_size = disk_spec.disk_size
     self.disk_type = disk_spec.disk_type
     self.mount_point = disk_spec.mount_point
     self.num_striped_disks = disk_spec.num_striped_disks
     self.num_partitions = disk_spec.num_partitions
     self.partition_size = disk_spec.partition_size
-    self.multi_writer_disk: bool = disk_spec.multi_writer_mode
+    self.mode = None
+    if disk_spec.multi_writer_mode:
+      self.mode = READ_WRITE_MANY
+    self.snapshots = []
     self.metadata.update({
         'type': self.disk_type,
         'size': self.disk_size,
@@ -578,6 +613,14 @@ class BaseDisk(resource.BaseResource):
   def IsNvme(self):
     raise NotImplementedError()
 
+  def CreateSnapshot(self):
+    """Creates a snapshot of the disk."""
+    raise NotImplementedError()
+
+  def GetLastIncrementalSnapshotSize(self):
+    """Gets last incremental snapshot size."""
+    raise NotImplementedError()
+
 
 class StripedDisk(BaseDisk):
   """Object representing several disks striped together."""
@@ -710,6 +753,23 @@ class NetworkDisk(BaseDisk):
     pass
 
 
+class LustreDisk(NetworkDisk):
+  """Provides options for mounting Lustre drives.
+
+  Lustre disk should be ready to mount at the time of creation of this disk.
+
+  Attributes:
+    disk_spec: The disk spec.
+  """
+
+  def Attach(self, vm):
+    self.vm = vm
+
+  def _GetNetworkDiskMountOptionsDict(self):
+    """Default Lustre mount options as a dict."""
+    return {}
+
+
 class NfsDisk(NetworkDisk):
   """Provides options for mounting NFS drives.
 
@@ -811,3 +871,48 @@ class SmbDisk(NetworkDisk):
   def Attach(self, vm):
     self.vm = vm
     self.vm.InstallPackages('cifs-utils')
+
+
+class MultiAttachDisk(BaseDisk):
+  """Object representing a disk that can be attached to multiple VMs."""
+
+  REQUIRED_ATTRS = ['CLOUD']
+  RESOURCE_TYPE = 'MultiAttachDisk'
+
+  def __init__(self, disk_spec, name, zone, project):
+    super().__init__(disk_spec)
+    self.vms = []
+
+
+class DiskSnapshot(resource.BaseResource):
+  """Object representing a Disk Snapshot.
+
+  Attributes:
+    source_disk: The source disk of the snapshot.
+    storage_gb: The storage size of the snapshot in GB.
+    creation_start_time: The start time of snapshot creation.
+    creation_end_time: The end time of snapshot creation.
+    restore_disks: The disks restored from the snapshot.
+    num_restore_disks: The number of disks restored from the snapshot.
+    num_detached_restore_disks: The number of detached disks restored from the
+      snapshot.
+  """
+
+  def __init__(self):
+    super().__init__()
+    self.source_disk = None
+    self.storage_gb = None
+    self.creation_start_time = None
+    self.creation_end_time = None
+    self.restore_disks = []
+    self.num_restore_disks = 0
+    self.num_detached_restore_disks = 0
+
+  def _Create(self):
+    raise NotImplementedError()
+
+  def _Delete(self):
+    raise NotImplementedError()
+
+  def Restore(self):
+    raise NotImplementedError()

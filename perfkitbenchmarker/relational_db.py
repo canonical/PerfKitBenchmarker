@@ -18,11 +18,22 @@ This is the base implementation of all relational db.
 """
 
 import abc
+import dataclasses
+import datetime
+import logging
+import statistics
+import time
+from typing import Any
+
 from absl import flags
+import numpy as np
 from perfkitbenchmarker import background_tasks
+from perfkitbenchmarker import data
 from perfkitbenchmarker import errors
+from perfkitbenchmarker import log_util
 from perfkitbenchmarker import os_types
 from perfkitbenchmarker import resource
+from perfkitbenchmarker import sample
 from perfkitbenchmarker import sql_engine_utils
 
 # TODO(chunla): Move IAAS flag to file
@@ -114,6 +125,7 @@ flags.DEFINE_integer(
 flags.DEFINE_string(
     'managed_db_tier', None, 'Tier in azure. (Basic, Standard, Premium).'
 )
+flags.DEFINE_string('db_family', None, 'The database family to use.')
 flags.DEFINE_string('server_vm_os_type', None, 'OS type of the client vm.')
 flags.DEFINE_string('client_vm_os_type', None, 'OS type of the client vm.')
 flags.DEFINE_string(
@@ -218,6 +230,7 @@ SERVER_GCE_SSD_INTERFACE = flags.DEFINE_enum(
 ENABLE_DATA_CACHE = flags.DEFINE_bool(
     'gcp_db_enable_data_cache', False, 'Whether to enable data cache.'
 )
+METRICS_TIME_FORMAT = '%Y-%m-%dT%H:%M:%SZ'
 
 
 FLAGS = flags.FLAGS
@@ -232,6 +245,12 @@ DEFAULT_PORTS = {
     sql_engine_utils.POSTGRES: DEFAULT_POSTGRES_PORT,
     sql_engine_utils.SQLSERVER: DEFAULT_SQLSERVER_PORT,
 }
+
+CLEAR_WAIT_STATS_SQL = "DBCC SQLPERF ('sys.dm_os_wait_stats', CLEAR);"
+CAPTURE_IO_STATS_SQL = (
+    'select DB_NAME(database_id) as DBName,* from '
+    'sys.dm_io_virtual_file_stats(NULL,NULL)'
+)
 
 
 class RelationalDbPropertyNotSetError(Exception):
@@ -282,12 +301,21 @@ def VmsToBoot(vm_groups):
   }
 
 
+@dataclasses.dataclass
+class MetricSpec:
+  provider_name: str
+  sample_name: str
+  unit: str
+  conversion_func: Any
+
+
 class BaseRelationalDb(resource.BaseResource):
   """Object representing a relational database Service."""
 
   IS_MANAGED = True
   RESOURCE_TYPE = 'BaseRelationalDb'
   REQUIRED_ATTRS = ['CLOUD', 'IS_MANAGED']
+  METRICS_COLLECTION_DELAY_SECONDS = 0
 
   def __init__(self, relational_db_spec):
     """Initialize the managed relational database object.
@@ -383,6 +411,24 @@ class BaseRelationalDb(resource.BaseResource):
     # TODO(user): Remove this after moving to multiple client VMs.
     self.client_vm = self.client_vms[0]
 
+  def ClearWaitStats(self) -> None:
+    if self.engine_type == sql_engine_utils.SQLSERVER:
+      logging.info('Clearing wait stats')
+      self.client_vm_query_tools.IssueSqlCommand(CLEAR_WAIT_STATS_SQL)
+
+  def QueryIOStats(self) -> tuple[str, str]:
+    if self.engine_type == sql_engine_utils.SQLSERVER:
+      logging.info('Querying IO stats')
+      return self.client_vm_query_tools.IssueSqlCommand(CAPTURE_IO_STATS_SQL)
+    return ('', '')
+
+  def QueryWaitStats(self) -> tuple[str, str]:
+    if self.engine_type == sql_engine_utils.SQLSERVER:
+      logging.info('Querying wait stats')
+      with open(data.ResourcePath('capture_wait_stats.sql'), 'r') as f:
+        return self.client_vm_query_tools.IssueSqlCommand(f.read())
+    return ('', '')
+
   @property
   def port(self):
     """Port (int) on which the database server is listening."""
@@ -413,12 +459,12 @@ class BaseRelationalDb(resource.BaseResource):
         'client_vm_zone': self.spec.vm_groups['clients'].vm_spec.zone,
         'use_managed_db': self.is_managed_db,
         'instance_id': self.instance_id,
-        'client_vm_disk_type': self.spec.vm_groups[
-            'clients'
-        ].disk_spec.disk_type,
-        'client_vm_disk_size': self.spec.vm_groups[
-            'clients'
-        ].disk_spec.disk_size,
+        'client_vm_disk_type': (
+            self.spec.vm_groups['clients'].disk_spec.disk_type
+        ),
+        'client_vm_disk_size': (
+            self.spec.vm_groups['clients'].disk_spec.disk_size
+        ),
     }
 
     if (
@@ -456,9 +502,9 @@ class BaseRelationalDb(resource.BaseResource):
         and self.spec.vm_groups['clients'].vm_spec.machine_type
     ):
       metadata.update({
-          'client_vm_machine_type': self.spec.vm_groups[
-              'clients'
-          ].vm_spec.machine_type,
+          'client_vm_machine_type': (
+              self.spec.vm_groups['clients'].vm_spec.machine_type
+          ),
       })
     elif hasattr(self.spec.vm_groups['clients'].vm_spec, 'cpus') and (
         hasattr(self.spec.vm_groups['clients'].vm_spec, 'memory')
@@ -483,6 +529,13 @@ class BaseRelationalDb(resource.BaseResource):
       metadata.update({
           'db_tier': self.spec.db_tier,
       })
+
+    if hasattr(self.spec.db_disk_spec, 'provisioned_iops'):
+      metadata.update({'disk_iops': self.spec.db_disk_spec.provisioned_iops})
+    if hasattr(self.spec.db_disk_spec, 'provisioned_throughput'):
+      metadata.update(
+          {'disk_throughput_mb': self.spec.db_disk_spec.provisioned_throughput}
+      )
 
     return metadata
 
@@ -570,3 +623,132 @@ class BaseRelationalDb(resource.BaseResource):
     Returns: none
     """
     raise NotImplementedError('Restart database is not implemented.')
+
+  def _GetMetricsToCollect(self) -> list[MetricSpec]:
+    """Returns a list of metrics to collect.
+
+    Each element in the list is a tuple containing:
+      - metric_name: The name of the metric in the provider's monitoring system.
+      - metric_sample_name: The name to use for the metric in the samples.
+      - unit: The unit of the metric.
+      - conversion_func: A function to apply to the metric value (or None).
+    """
+    return []
+
+  def _CollectProviderMetric(
+      self,
+      metric: MetricSpec,
+      start_time: datetime.datetime,
+      end_time: datetime.datetime,
+      collect_percentiles: bool = False,
+  ) -> list[sample.Sample]:
+    """Collects a single metric from the provider's monitoring system.
+
+    Args:
+      metric: The metric to collect.
+      start_time: The start time of the query interval.
+      end_time: The end time of the query interval.
+      collect_percentiles: Whether to collect percentiles for the metric.
+
+    Returns:
+      A list of sample.Sample objects.
+    """
+    del self, metric, start_time, end_time, collect_percentiles
+    return []
+
+  def _CreateSamples(
+      self,
+      points: list[tuple[datetime.datetime, float]],
+      metric_sample_name: str,
+      unit: str,
+      collect_percentiles: bool = False,
+  ) -> list[sample.Sample]:
+    """Creates a list of samples from a list of (timestamp, value) points."""
+    if not points:
+      logging.warning('No values found for metric %s', metric_sample_name)
+      return []
+    points.sort(key=lambda x: x[0])
+    timestamps = [p[0] for p in points]
+    values = [p[1] for p in points]
+    avg_val = statistics.mean(values)
+    min_val = min(values)
+    max_val = max(values)
+    samples = []
+    samples.append(
+        sample.Sample(f'{metric_sample_name}_min', min_val, unit, metadata={})
+    )
+    samples.append(
+        sample.Sample(f'{metric_sample_name}_max', max_val, unit, metadata={})
+    )
+    samples.append(
+        sample.Sample(
+            f'{metric_sample_name}_average', avg_val, unit, metadata={}
+        )
+    )
+    if collect_percentiles:
+      percentiles_to_collect = [10, 20, 30, 40, 50, 60, 70, 80, 90]
+      # Note that this uses linear interpolation to calculate the percentiles.
+      percentile_values = np.percentile(values, percentiles_to_collect)
+      for percentile, value in zip(percentiles_to_collect, percentile_values):
+        name = f'p{percentile}'
+        samples.append(
+            sample.Sample(
+                f'{metric_sample_name}_{name}', value, unit, metadata={}
+            )
+        )
+    samples.append(
+        sample.CreateTimeSeriesSample(
+            values,
+            [t.timestamp() for t in timestamps],
+            f'{metric_sample_name}_time_series',
+            unit,
+            60,
+        )
+    )
+    log_util.LogToShortLogAndRoot(
+        f'{metric_sample_name}: average={avg_val:.2f}, min={min_val:.2f}, '
+        f'max={max_val:.2f}, count={len(values)}'
+    )
+    human_readable_ts = [f'{t}: {v:.2f} {unit}' for t, v in reversed(points)]
+    log_util.LogToShortLogAndRoot(
+        f'{metric_sample_name}_time_series:\n' + '\n'.join(human_readable_ts)
+    )
+    return samples
+
+  def CollectMetrics(
+      self, start_time: datetime.datetime, end_time: datetime.datetime
+  ) -> list[sample.Sample]:
+    """Collects and returns performance metrics after the run phase.
+
+    Args:
+      start_time: The start time of the run phase.
+      end_time: The end time of the run phase.
+
+    Returns:
+      A list of sample.Sample instances containing the collected metrics.
+    """
+    logging.info(
+        'Collecting metrics for time range: %s to %s',
+        start_time.strftime(METRICS_TIME_FORMAT),
+        end_time.strftime(METRICS_TIME_FORMAT),
+    )
+
+    time_to_wait = (
+        end_time
+        - datetime.datetime.now()
+        + datetime.timedelta(seconds=self.METRICS_COLLECTION_DELAY_SECONDS)
+    )
+    if time_to_wait.total_seconds() > 0:
+      logging.info(
+          'Waiting %s seconds for metrics to be available.',
+          int(time_to_wait.total_seconds()),
+      )
+      time.sleep(time_to_wait.total_seconds())
+
+    metrics_to_collect = self._GetMetricsToCollect()
+    all_samples = []
+    for metric in metrics_to_collect:
+      all_samples.extend(
+          self._CollectProviderMetric(metric, start_time, end_time)
+      )
+    return all_samples

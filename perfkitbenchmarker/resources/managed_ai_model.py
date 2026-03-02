@@ -46,7 +46,8 @@ class BaseManagedAiModel(resource.BaseResource):
   """
 
   RESOURCE_TYPE = 'BaseManagedAiModel'
-  REQUIRED_ATTRS = ['CLOUD']
+  REQUIRED_ATTRS = ['CLOUD', 'INTERFACE']
+  INTERFACE = ''
 
   region: str
   child_models: list['BaseManagedAiModel'] = []
@@ -77,6 +78,7 @@ class BaseManagedAiModel(resource.BaseResource):
         # Add these to general ResourceMetadata rather than just Create/Delete.
         'resource_type': self.RESOURCE_TYPE,
         'resource_class': self.__class__.__name__,
+        'interface': self.INTERFACE,
     })
     self.vm: virtual_machine.BaseVirtualMachine = vm
 
@@ -92,7 +94,14 @@ class BaseManagedAiModel(resource.BaseResource):
         'InitializeNewModel is not implemented for this model type.'
     )
 
+  def _CreateDependencies(self):
+    """Adds metadata about whether this is the first model in the region."""
+    num_endpoints = len(self.ListExistingEndpoints())
+    no_other_models = num_endpoints == 0
+    self.metadata.update({'First Model': no_other_models})
+
   def _DeleteDependencies(self):
+    """Deletes any child models, which are not otherwise tracked."""
     for child_model in self.child_models:
       child_model.Delete()
 
@@ -191,6 +200,9 @@ class BaseManagedAiModel(resource.BaseResource):
 
 def GetManagedAiModelClass(
     cloud: str,
+    interface: str,
 ) -> resource.AutoRegisterResourceMeta | None:
   """Gets the managed AI model class for the given cloud."""
-  return resource.GetResourceClass(BaseManagedAiModel, CLOUD=cloud)
+  return resource.GetResourceClass(
+      BaseManagedAiModel, CLOUD=cloud, INTERFACE=interface
+  )

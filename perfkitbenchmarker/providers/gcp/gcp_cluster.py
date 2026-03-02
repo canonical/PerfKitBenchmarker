@@ -31,6 +31,7 @@ from perfkitbenchmarker.providers.gcp import util
 
 FLAGS = absl_flags.FLAGS
 _CONFIG_FILE_NAME = 'cluster.yaml'
+_DEPLOY_TIMEOUT = 1800
 
 
 class GceClusterSpec(cluster.BaseClusterSpec):
@@ -82,6 +83,10 @@ class GceCluster(cluster.BaseCluster):
       template = jinja2.Template(
           content.read(), undefined=jinja2.StrictUndefined
       )
+      # Disable SMT when possible (default in cluster toolkit)
+      threads_per_core = 0
+      if FLAGS['disable_smt'].present:
+        threads_per_core = 1 if FLAGS.disable_smt else 2
       self._config = template.render(
           name=self.name,
           zone=self.zone,
@@ -97,7 +102,7 @@ class GceCluster(cluster.BaseCluster):
           compute_tags=compute_tags,
           controller_tags=controller_tags,
           enabe_spot_vm=FLAGS.gce_preemptible_vms,
-          enable_smt=not FLAGS.disable_smt,
+          threads_per_core=threads_per_core,
       )
 
   def _Create(self):
@@ -111,7 +116,9 @@ class GceCluster(cluster.BaseCluster):
         '--force',
         '--auto-approve',
         f'--out={vm_util.GetTempDir()}',
-    ])
+        '-l',
+        'IGNORE'
+    ], timeout=_DEPLOY_TIMEOUT)
 
   def _PostCreate(self):
     """Post create actions after GCP cluster is created.
@@ -121,11 +128,12 @@ class GceCluster(cluster.BaseCluster):
     2. Prepare VM environment.
     3. Configure SSH on both headnode and workers.
     """
-
     def _UpdateHeadNode(vm):
       vm.name = f'{self.name}-controller'
 
     self.headnode_vm = self.BackfillVm(self.headnode_spec, _UpdateHeadNode)
+    self._WaitForClusterReady()
+
     for i in range(self.num_workers):
 
       def _UpdateWorker(vm):
@@ -140,11 +148,12 @@ class GceCluster(cluster.BaseCluster):
               _UpdateWorker,
           )
       )
+    # The workers may provision as we issue this command for the first time.
     self.RemoteCommand(
         'sudo sed -i '
         '"s/PermitRootLogin no/PermitRootLogin yes/g" '
         '/etc/ssh/sshd_config',
-        timeout=120,
+        timeout=600,
     )
     self.RemoteCommand('sudo service sshd restart', timeout=120)
     self.headnode_vm.RemoteCommand(f'sudo chmod -R 755 {self.nfs_path}')
@@ -171,8 +180,8 @@ class GceCluster(cluster.BaseCluster):
         flags.GCLUSTER_PATH.value,
         'destroy',
         f'{vm_util.GetTempDir()}/{self.name}',
-        '--auto-approve',
-    ])
+        '--auto-approve'
+    ], timeout=600)
 
   def AuthenticateVM(self):
     """Authenticate all VMs in the cluster to access each other."""
@@ -188,3 +197,26 @@ class GceCluster(cluster.BaseCluster):
       )
       vm.RemoteCommand('chmod 600 ~/.ssh/config')
       vm.has_private_key: bool = True
+
+
+class H4dCluster(GceCluster):
+  """Class representing a H4D cluster."""
+
+  DEFAULT_TEMPLATE = 'cluster/h4d.yaml.j2'
+  TYPE = 'h4d'
+
+
+class A4Cluster(GceCluster):
+  """Class representing a A4 cluster."""
+
+  DEFAULT_TEMPLATE = 'cluster/a4.yaml.j2'
+  TYPE = 'a4'
+
+  def _PostCreate(self):
+    super()._PostCreate()
+
+    def _InstallNVContainerToolkit(vm):
+      vm.Install('nvidia_container_toolkit')
+      vm.RemoteCommand('sudo nvidia-smi -pm 1')
+
+    background_tasks.RunThreaded(_InstallNVContainerToolkit, self.worker_vms)

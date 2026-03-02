@@ -19,10 +19,13 @@ benchmarks.
 """
 
 import copy
+import datetime
 import json
 import logging
-from typing import Any, Union
+import os
+from typing import Any, Union, override
 from absl import flags
+from perfkitbenchmarker import data
 from perfkitbenchmarker import edw_service
 from perfkitbenchmarker import provider_info
 from perfkitbenchmarker import vm_util
@@ -30,18 +33,38 @@ from perfkitbenchmarker import vm_util
 FLAGS = flags.FLAGS
 
 JdbcClientDict = {
-    provider_info.AWS: 'snowflake-jdbc-client-2.13-enterprise.jar',
+    provider_info.AWS: 'snowflake-jdbc-client-2.14-enterprise.jar',
     provider_info.AZURE: 'snowflake-jdbc-client-azure-external-2.0.jar',
 }
+# The python client is developed internally as of now. This requires a client
+# library which should call into the DB. Contact p3rf-team [at] google [dot] com
+# if you would like to run this benchmark to get the file.
+SNOWFLAKE_PYTHON_CLIENT_FILE = 'sf_python_driver.py'
+SNOWFLAKE_PYTHON_CLIENT_DIR = 'edw/snowflake/clients/python'
 
 
-class JdbcClientInterface(edw_service.EdwClientInterface):
+class SnowflakeClientInterface(edw_service.EdwClientInterface):
+  """Base client interface for Snowflake."""
+
+  warehouse: str
+  database: str
+  schema: str
+
+  def __init__(self, warehouse: str, database: str, schema: str):
+    super().__init__()
+    self.warehouse = warehouse
+    self.database = database
+    self.schema = schema
+
+  def GetMetadata(self) -> dict[str, str]:
+    """Gets the Metadata attributes for the Client Interface."""
+    return {'client': FLAGS.snowflake_client_interface}
+
+
+class JdbcClientInterface(SnowflakeClientInterface):
   """Jdbc Client Interface class for Snowflake.
 
   Attributes:
-    warehouse: String name of the virtual warehouse used during benchmark
-    database: String name of the database to benchmark
-    schema: String name of the schema to benchmark
     jdbc_client: String filename of the JDBC client associated with the
       Snowflake backend being tested (AWS/Azure/etc.)
   """
@@ -49,9 +72,7 @@ class JdbcClientInterface(edw_service.EdwClientInterface):
   def __init__(
       self, warehouse: str, database: str, schema: str, jdbc_client: str
   ):
-    self.warehouse = warehouse
-    self.database = database
-    self.schema = schema
+    super().__init__(warehouse, database, schema)
     self.jdbc_client = jdbc_client
 
   def Prepare(self, package_name: str) -> None:
@@ -68,9 +89,20 @@ class JdbcClientInterface(edw_service.EdwClientInterface):
     self.client_vm.Install('openjdk')
 
     # Push the executable jar to the working directory on client vm
-    self.client_vm.InstallPreprovisionedPackageData(
-        package_name, [self.jdbc_client], ''
-    )
+    if FLAGS.snowflake_jdbc_client_jar:
+      self.client_vm.PushFile(FLAGS.snowflake_jdbc_client_jar)
+    else:
+      self.client_vm.InstallPreprovisionedPackageData(
+          package_name, [self.jdbc_client], ''
+      )
+
+    # Push the private key to the working directory on client vm
+    if FLAGS.snowflake_jdbc_key_file:
+      self.client_vm.PushFile(FLAGS.snowflake_jdbc_key_file)
+    else:
+      self.client_vm.InstallPreprovisionedPackageData(
+          package_name, ['snowflake_keyfile.p8'], ''
+      )
 
   def ExecuteQuery(
       self, query_name: str, print_results: bool = True
@@ -94,7 +126,8 @@ class JdbcClientInterface(edw_service.EdwClientInterface):
         f'--warehouse {self.warehouse} '
         f'--database {self.database} '
         f'--schema {self.schema} '
-        f'--query_file {query_name}'
+        f'--query_file {query_name} '
+        '--key_file snowflake_keyfile.p8'
     )
     if print_results:
       query_command += ' --print_results true'
@@ -102,35 +135,7 @@ class JdbcClientInterface(edw_service.EdwClientInterface):
     details = copy.copy(self.GetMetadata())  # Copy the base metadata
     details.update(json.loads(stdout)['details'])
     result = (json.loads(stdout)['query_wall_time_in_secs'], details)
-    self._LogAndStripQueryResults(result)
     return result
-
-  def ExecuteSimultaneous(
-      self, submission_interval: int, queries: list[str]
-  ) -> str:
-    """Executes queries simultaneously on client and return performance details.
-
-    Simultaneous app expects queries as white space separated query file names.
-
-    Args:
-      submission_interval: Simultaneous query submission interval in
-        milliseconds.
-      queries: List of strings (names) of queries to execute.
-
-    Returns:
-      A serialized dictionary of execution details.
-    """
-    query_command = (
-        f'java -cp {self.jdbc_client} '
-        'com.google.cloud.performance.edw.Simultaneous '
-        f'--warehouse {self.warehouse} '
-        f'--database {self.database} '
-        f'--schema {self.schema} '
-        f'--submission_interval {submission_interval} '
-        f'--query_files {" ".join(queries)}'
-    )
-    stdout, _ = self.client_vm.RemoteCommand(query_command)
-    return stdout
 
   def ExecuteThroughput(
       self,
@@ -154,20 +159,131 @@ class JdbcClientInterface(edw_service.EdwClientInterface):
         f'--warehouse {self.warehouse} '
         f'--database {self.database} '
         f'--schema {self.schema} '
+        '--key_file snowflake_keyfile.p8 '
         '--query_streams '
         f'{" ".join([",".join(stream) for stream in concurrency_streams])}'
     )
     stdout, _ = self.client_vm.RemoteCommand(query_command)
     return stdout
 
-  def GetMetadata(self) -> dict[str, str]:
-    """Gets the Metadata attributes for the Client Interface."""
-    return {'client': FLAGS.snowflake_client_interface}
+
+class PythonClientInterface(SnowflakeClientInterface):
+  """Python Client Interface class for Snowflake.
+
+  Attributes:
+    user: The user to connect to snowflake with.
+    account: The snowflake account.
+  """
+
+  def __init__(
+      self,
+      warehouse: str,
+      database: str,
+      schema: str,
+      user: str,
+      account: str,
+  ):
+    super().__init__(warehouse, database, schema)
+    self.user = user
+    self.account = account
+
+  def Prepare(self, package_name: str) -> None:
+    """Prepares the client vm to execute query."""
+
+    # Push the private key to the working directory on client vm
+    if FLAGS.snowflake_jdbc_key_file:
+      self.client_vm.PushFile(FLAGS.snowflake_jdbc_key_file)
+    else:
+      self.client_vm.InstallPreprovisionedPackageData(
+          package_name, ['snowflake_keyfile.p8'], ''
+      )
+
+    # Install dependencies for driver
+    self.client_vm.Install('pip')
+    self.client_vm.RemoteCommand(
+        'sudo apt-get -qq update && DEBIAN_FRONTEND=noninteractive sudo apt-get'
+        ' -qq install python3.12-venv'
+    )
+    self.client_vm.RemoteCommand('python3 -m venv .venv')
+    self.client_vm.RemoteCommand(
+        'source .venv/bin/activate && pip install snowflake-connector-python'
+        ' pyarrow absl-py pandas'
+    )
+
+    # Push driver script to client vm
+    self.client_vm.PushDataFile(
+        os.path.join(SNOWFLAKE_PYTHON_CLIENT_DIR, SNOWFLAKE_PYTHON_CLIENT_FILE)
+    )
+    self.client_vm.PushDataFile(
+        os.path.join(
+            edw_service.EDW_PYTHON_DRIVER_LIB_DIR,
+            edw_service.EDW_PYTHON_DRIVER_LIB_FILE,
+        )
+    )
+
+  def _RunPythonClientCommand(
+      self, command: str, additional_args: list[str]
+  ) -> str:
+    """Runs a command on the python client.
+
+    Args:
+      command: The command to run (e.g. 'single', 'throughput').
+      additional_args: A list of additional arguments for the command.
+
+    Returns:
+      The stdout from the command.
+    """
+    cmd_parts = [
+        f'.venv/bin/python {SNOWFLAKE_PYTHON_CLIENT_FILE}',
+        command,
+        f'--warehouse {self.warehouse}',
+        f'--database {self.database}',
+        f'--schema {self.schema}',
+        f'--user {self.user}',
+        f'--account {self.account}',
+        '--credentials_file snowflake_keyfile.p8',
+    ]
+    cmd_parts.extend(additional_args)
+    cmd = ' '.join(cmd_parts)
+    stdout, _ = self.client_vm.RobustRemoteCommand(cmd)
+    return stdout
+
+  def ExecuteQuery(
+      self, query_name: str, print_results: bool = False
+  ) -> tuple[float, dict[str, Any]]:
+    """Executes a query and returns performance details."""
+    args = [f'--query_file {query_name}']
+    if print_results:
+      args.append('--print_results')
+    stdout = self._RunPythonClientCommand('single', args)
+    details = copy.copy(self.GetMetadata())
+    details.update(json.loads(stdout)['details'])
+    return json.loads(stdout)['query_wall_time_in_secs'], details
+
+  def ExecuteThroughput(
+      self,
+      concurrency_streams: list[list[str]],
+      labels: dict[str, str] | None = None,
+  ) -> str:
+    """Executes queries simultaneously on client and return performance details."""
+    del labels  # Currently not supported by this implementation.
+    args = [f"--query_streams='{json.dumps(concurrency_streams)}'"]
+    return self._RunPythonClientCommand('throughput', args)
+
+  def RunQueryWithResults(self, query_name: str) -> str:
+    """Executes a query and returns performance details and query output."""
+    args = [f'--query_file {query_name}', '--print_results']
+    return self._RunPythonClientCommand('single', args)
 
 
 def GetSnowflakeClientInterface(
-    warehouse: str, database: str, schema: str, cloud: str
-) -> JdbcClientInterface:
+    warehouse: str,
+    database: str,
+    schema: str,
+    cloud: str,
+    user: str | None,
+    account: str | None,
+) -> SnowflakeClientInterface:
   """Builds and Returns the requested Snowflake client Interface.
 
   Args:
@@ -176,6 +292,8 @@ def GetSnowflakeClientInterface(
     database: String name of the Snowflake database to use during the  benchmark
     schema: String name of the Snowflake schema to use during the  benchmark
     cloud: String ID of the cloud service the client interface is for
+    user: The user to connect to snowflake with.
+    account: The snowflake account.
 
   Returns:
     A concrete Client Interface object (subclass of EdwClientInterface)
@@ -187,11 +305,56 @@ def GetSnowflakeClientInterface(
     return JdbcClientInterface(
         warehouse, database, schema, JdbcClientDict[cloud]
     )
+  elif FLAGS.snowflake_client_interface == 'PYTHON':
+    assert user and account
+    return PythonClientInterface(
+        warehouse,
+        database,
+        schema,
+        user,
+        account,
+    )
   raise RuntimeError('Unknown Snowflake Client Interface requested.')
 
 
 class Snowflake(edw_service.EdwService):
   """Object representing a Snowflake Data Warehouse Instance."""
+
+  SEARCH_QUERY_TEMPLATE_LOCATION = 'edw/snowflake_aws/search_index'
+
+  CREATE_INDEX_QUERY_TEMPLATE = (
+      f'{SEARCH_QUERY_TEMPLATE_LOCATION}/create_index_query.sql.j2'
+  )
+  DELETE_INDEX_QUERY_TEMPLATE = (
+      f'{SEARCH_QUERY_TEMPLATE_LOCATION}/delete_index_query.sql.j2'
+  )
+  GET_INDEX_STATUS_QUERY_TEMPLATE = (
+      f'{SEARCH_QUERY_TEMPLATE_LOCATION}/index_status.sql.j2'
+  )
+  INITIALIZE_SEARCH_TABLE_QUERY_TEMPLATE = (
+      f'{SEARCH_QUERY_TEMPLATE_LOCATION}/table_init.sql.j2'
+  )
+  LOAD_SEARCH_DATA_QUERY_TEMPLATE = (
+      f'{SEARCH_QUERY_TEMPLATE_LOCATION}/ingestion_query.sql.j2'
+  )
+  INDEX_SEARCH_QUERY_TEMPLATE = (
+      f'{SEARCH_QUERY_TEMPLATE_LOCATION}/search_query.sql.j2'
+  )
+  GET_ROW_COUNT_QUERY_TEMPLATE = (
+      f'{SEARCH_QUERY_TEMPLATE_LOCATION}/get_row_count.sql.j2'
+  )
+  TIME_BOUND_QUERY_HISTORY_TEMPLATE = (
+      'edw/snowflake_aws/metadata/time_bound_query_history.sql.j2'
+  )
+  INDIVIDUAL_QUERY_PLAN_TEMPLATE = (
+      'edw/snowflake_aws/metadata/individual_query_plan.sql.j2'
+  )
+  INDIVIDUAL_QUERY_STATS_TEMPLATE = (
+      'edw/snowflake_aws/metadata/individual_query_stats.sql.j2'
+  )
+  INJECT_TOKEN_INTO_TABLE = (
+      f'{SEARCH_QUERY_TEMPLATE_LOCATION}/inject_token_into_table.sql.j2'
+  )
 
   CLOUD: str = None
   SERVICE_TYPE = None
@@ -201,8 +364,15 @@ class Snowflake(edw_service.EdwService):
     self.warehouse = FLAGS.snowflake_warehouse
     self.database = FLAGS.snowflake_database
     self.schema = FLAGS.snowflake_schema
+    self.user = FLAGS.snowflake_user
+    self.account = FLAGS.snowflake_account
     self.client_interface = GetSnowflakeClientInterface(
-        self.warehouse, self.database, self.schema, self.CLOUD
+        self.warehouse,
+        self.database,
+        self.schema,
+        self.CLOUD,
+        self.user,
+        self.account,
     )
 
   def IsUserManaged(self, edw_service_spec):
@@ -375,5 +545,250 @@ class Snowflake(edw_service.EdwService):
     basic_data['warehouse'] = self.warehouse
     basic_data['database'] = self.database
     basic_data['schema'] = self.schema
+    if self.user:
+      basic_data['user'] = self.user
+    if self.account:
+      basic_data['account'] = self.account
     basic_data.update(self.client_interface.GetMetadata())
     return basic_data
+
+  def CreateSearchIndex(
+      self, table_path: str, index_name: str
+  ) -> tuple[float, dict[str, Any]]:
+    query_name = f'create_index_{index_name}'
+    context = {
+        'table_name': table_path,
+        'index_name': index_name,
+    }
+    self.client_interface.client_vm.RenderTemplate(
+        data.ResourcePath(self.CREATE_INDEX_QUERY_TEMPLATE),
+        query_name,
+        context,
+        should_log_file=True,
+    )
+    return self.client_interface.ExecuteQuery(query_name, print_results=True)
+
+  def DropSearchIndex(
+      self, table_path: str, index_name: str
+  ) -> tuple[float, dict[str, Any]]:
+    query_name = 'delete_index'
+    context = {
+        'table_name': table_path,
+        'index_name': index_name,
+    }
+    self.client_interface.client_vm.RenderTemplate(
+        data.ResourcePath(self.DELETE_INDEX_QUERY_TEMPLATE),
+        query_name,
+        context,
+        should_log_file=True,
+    )
+    return self.client_interface.ExecuteQuery(query_name, print_results=True)
+
+  def GetSearchIndexCompletionPercentage(
+      self, table_path: str, index_name: str
+  ) -> tuple[int, dict[str, Any]]:
+    query_name = 'get_index_status'
+    context = {
+        'table_name': table_path,
+        'index_name': index_name,
+    }
+    self.client_interface.client_vm.RenderTemplate(
+        data.ResourcePath(self.GET_INDEX_STATUS_QUERY_TEMPLATE),
+        query_name,
+        context,
+        should_log_file=True,
+    )
+    _, meta = self.client_interface.ExecuteQuery(query_name, print_results=True)
+    qres = int(meta['query_results']['COVERAGE_PERCENTAGE'][0])
+    return qres, meta
+
+  def InitializeSearchStarterTable(
+      self, table_path: str, storage_path: str
+  ) -> tuple[float, dict[str, Any]]:
+    query_name = 'initialize_search_table'
+    context = {
+        'table_name': table_path,
+    }
+    self.client_interface.client_vm.RenderTemplate(
+        data.ResourcePath(self.INITIALIZE_SEARCH_TABLE_QUERY_TEMPLATE),
+        query_name,
+        context,
+        should_log_file=True,
+    )
+    return self.client_interface.ExecuteQuery(query_name, print_results=True)
+
+  def InsertSearchData(
+      self, table_path: str, storage_path: str
+  ) -> tuple[float, dict[str, Any]]:
+    query_name = 'load_search_data'
+    context = {
+        'table_name': table_path,
+        'storage_path': storage_path,
+    }
+    self.client_interface.client_vm.RenderTemplate(
+        data.ResourcePath(self.LOAD_SEARCH_DATA_QUERY_TEMPLATE),
+        query_name,
+        context,
+        should_log_file=True,
+    )
+    # Snowflake returns info for each csv file processed, which pollutes logs
+    # and datapoints needlessly. So print_results=False.
+    return self.client_interface.ExecuteQuery(query_name, print_results=False)
+
+  def GetTableRowCount(self, table_path: str) -> tuple[int, dict[str, Any]]:
+    query_name = 'get_row_count'
+    context = {
+        'table_name': table_path,
+    }
+    self.client_interface.client_vm.RenderTemplate(
+        data.ResourcePath(self.GET_ROW_COUNT_QUERY_TEMPLATE),
+        query_name,
+        context,
+        should_log_file=True,
+    )
+    _, meta = self.client_interface.ExecuteQuery(query_name, print_results=True)
+    qres = int(meta['query_results']['TOTAL_ROW_COUNT'][0])
+    return qres, meta
+
+  def TextSearchQuery(
+      self,
+      table_path: str,
+      search_keyword: str,
+      order_by: str | None = None,
+      limit: int | None = None,
+      date_between: tuple[datetime.date, datetime.date] | None = None,
+  ) -> tuple[float, dict[str, Any]]:
+    query_name = 'text_search_query'
+    context = {
+        'table_name': table_path,
+        'search_text': search_keyword,
+        'order_by': order_by,
+        'limit': limit,
+        'date_between': date_between,
+    }
+    self.client_interface.client_vm.RenderTemplate(
+        data.ResourcePath(self.INDEX_SEARCH_QUERY_TEMPLATE),
+        query_name,
+        context,
+        should_log_file=True,
+    )
+    res, meta = self.client_interface.ExecuteQuery(
+        query_name, print_results=True
+    )
+    meta['edw_search_result_rows'] = len(
+        meta['query_results'].get('EVENT_TIMESTAMP', [])
+    )
+    return res, meta
+
+  def InjectTokenIntoTable(
+      self, table_path: str, token: str, token_count: int
+  ) -> tuple[float, dict[str, Any]]:
+    query_name = 'inject_token_into_table'
+    context = {
+        'table_name': table_path,
+        'token': token,
+        'token_count': token_count,
+    }
+    self.client_interface.client_vm.RenderTemplate(
+        data.ResourcePath(self.INJECT_TOKEN_INTO_TABLE),
+        query_name,
+        context,
+        should_log_file=True,
+    )
+    return self.client_interface.ExecuteQuery(query_name, print_results=True)
+
+  def SetWarehouse(self, warehouse: str):
+    """Switches Snowflake Warehouse."""
+    assert isinstance(
+        self.client_interface, (PythonClientInterface, JdbcClientInterface)
+    )
+    self.warehouse = warehouse
+    self.client_interface.warehouse = warehouse
+
+  def _RunMetadataQuery(
+      self, query_template: str, query_name: str, context: dict[str, Any]
+  ) -> dict[str, Any]:
+    self.client_interface.client_vm.RenderTemplate(
+        data.ResourcePath(query_template),
+        query_name,
+        context,
+        should_log_file=True,
+    )
+    _, output = self.client_interface.ExecuteQuery(
+        query_name, print_results=True
+    )
+    col_res = output['query_results']
+    return col_res
+
+  def _GetIndividualQueryMetadata(self, query_id: str) -> list[dict[str, Any]]:
+    query_plan_file_name = f'individual_query_plan_{query_id}.sql'
+    query_stats_file_name = f'individual_query_stats_{query_id}.sql'
+    context = {
+        'query_id': query_id,
+    }
+    query_plan_rows = self.ColsToRows(
+        self._RunMetadataQuery(
+            self.INDIVIDUAL_QUERY_PLAN_TEMPLATE,
+            query_plan_file_name,
+            context,
+        )
+    )
+    query_stats_rows = self.ColsToRows(
+        self._RunMetadataQuery(
+            self.INDIVIDUAL_QUERY_STATS_TEMPLATE,
+            query_stats_file_name,
+            context,
+        )
+    )
+    results = [
+        {
+            'metric': 'edw_sf_query_plan',
+            'value': 1,
+            'unit': 'metadata',
+            'metadata': {
+                f'sf_{key.lower()}': value
+                for key, value in query_plan_rows[0].items()
+            },
+        },
+        {
+            'metric': 'edw_sf_query_stats',
+            'value': 1,
+            'unit': 'metadata',
+            'metadata': {
+                'sf_query_id': query_id,
+                'sf_query_stats': json.dumps(query_stats_rows, default=str),
+            },
+        },
+    ]
+    return results
+
+  @override
+  def GetTimeBoundAuxiliaryMetrics(
+      self, start_timestamp: float, end_timestamp: float
+  ) -> list[dict[str, Any]]:
+    """Returns the auxiliary metrics for the given run."""
+    query_file_name = f'metadata_query_{start_timestamp}.sql'
+    context = {
+        'start_timestamp': start_timestamp,
+        'end_timestamp': end_timestamp,
+        'warehouse': self.warehouse,
+    }
+    col_res = self._RunMetadataQuery(
+        self.TIME_BOUND_QUERY_HISTORY_TEMPLATE,
+        query_file_name,
+        context,
+    )
+    row_res = self.ColsToRows(col_res)
+    history_results = []
+    for row in row_res:
+      history_results.append({
+          'metric': 'sf_query_metadata',
+          'value': 1,
+          'unit': 'metadata',
+          'metadata': {
+              f'sf_{key.lower()}': value for key, value in row.items()
+          },
+      })
+    for qid in col_res['QUERY_ID']:
+      history_results.extend(self._GetIndividualQueryMetadata(qid))
+    return history_results

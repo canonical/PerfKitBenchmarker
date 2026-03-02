@@ -13,6 +13,7 @@
 # limitations under the License.
 """Managed relational database provisioning and teardown for AWS RDS."""
 
+import dataclasses
 import datetime
 import json
 import logging
@@ -24,6 +25,7 @@ from perfkitbenchmarker import mysql_iaas_relational_db
 from perfkitbenchmarker import postgres_iaas_relational_db
 from perfkitbenchmarker import provider_info
 from perfkitbenchmarker import relational_db
+from perfkitbenchmarker import sample
 from perfkitbenchmarker import sqlserver_iaas_relational_db
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.providers.aws import aws_network
@@ -32,7 +34,7 @@ from perfkitbenchmarker.providers.aws import util
 FLAGS = flags.FLAGS
 
 DEFAULT_MYSQL_VERSION = '8'
-DEFAULT_POSTGRES_VERSION = '13'
+DEFAULT_POSTGRES_VERSION = '17'
 DEFAULT_SQLSERVER_VERSION = '14'
 IS_READY_TIMEOUT = 60 * 60 * 1  # 1 hour (RDS HA takes a long time to prepare)
 
@@ -46,7 +48,63 @@ POSTGRES_SUPPORTED_MAJOR_VERSIONS = [
     '14',
     '15',
     '16',
+    '17',
 ]
+
+
+@dataclasses.dataclass
+class AwsMetricSpec(relational_db.MetricSpec):
+  """Metric specification for AWS RDS.
+
+  Attributes:
+    time_period: The granularity, in seconds, of metrics to retrieve from
+      CloudWatch.
+    time_period_padding: The padding to add to the start and end times when
+      collecting metrics from CloudWatch. This is to adjust the query window to
+      account for potential delays in metric reporting or aggregation, ensuring
+      that data points around the boundaries are included.
+    dimensions: A dictionary of CloudWatch dimensions used to filter metrics for
+      a specific resource, such as DBInstanceIdentifier.
+  """
+  time_period: int = 60
+  time_period_padding: datetime.timedelta = datetime.timedelta(seconds=0)
+  dimensions: dict[str, str] = dataclasses.field(
+      default_factory=lambda: {'DBInstanceIdentifier': ''}
+  )
+
+
+RDS_COMMON_METRICS = [
+    AwsMetricSpec('CPUUtilization', 'cpu_utilization', '%', None),
+    AwsMetricSpec('ReadIOPS', 'disk_read_iops', 'iops', None),
+    AwsMetricSpec('WriteIOPS', 'disk_write_iops', 'iops', None),
+    AwsMetricSpec(
+        'ReadThroughput',
+        'disk_read_throughput',
+        'MB/s',
+        lambda x: x / (1024 * 1024),
+    ),
+    AwsMetricSpec(
+        'WriteThroughput',
+        'disk_write_throughput',
+        'MB/s',
+        lambda x: x / (1024 * 1024),
+    ),
+]
+_RDS_ONLY_METRICS = [
+    AwsMetricSpec(
+        'FreeStorageSpace',
+        'free_storage_space',
+        'GB',
+        lambda x: x / (1024 * 1024 * 1024),
+    ),
+]
+
+
+def _ConvertDateTimeToUtc(dt):
+  """Converts a datetime to UTC. If naive, assumes local time."""
+  if dt.tzinfo:
+    return dt.astimezone(datetime.timezone.utc)
+  return dt.replace(tzinfo=datetime.timezone.utc)
 
 
 class AWSSQLServerIAASRelationalDb(
@@ -58,7 +116,8 @@ class AWSSQLServerIAASRelationalDb(
 
   def CreateIpReservation(self) -> str:
     cluster_ip_address = '.'.join(
-        self.server_vm.internal_ip.split('.')[:-1]+['128'])
+        self.server_vm.internal_ip.split('.')[:-1] + ['128']
+    )
     return cluster_ip_address
 
   def ReleaseIpReservation(self) -> bool:
@@ -91,6 +150,9 @@ class BaseAwsRelationalDb(relational_db.BaseRelationalDb):
   RDS and Aurora have similar cli commands. This base class provides
   the common methods across both offerings.
   """
+
+  REQUIRED_ATTRS = ['CLOUD', 'IS_MANAGED', 'ENGINE']
+  METRICS_COLLECTION_DELAY_SECONDS = 165
 
   def __init__(self, relational_db_spec):
     super().__init__(relational_db_spec)
@@ -280,18 +342,21 @@ class BaseAwsRelationalDb(relational_db.BaseRelationalDb):
         key_value_pair = flag.split('=')
         if len(key_value_pair) != 2:
           raise AwsRelationalDbParameterError('Malformed parameter %s' % flag)
-        cmd = util.AWS_PREFIX + [
-            'rds',
-            'modify-db-parameter-group',
-            '--db-parameter-group-name=%s' % self.parameter_group,
-            '--parameters=ParameterName=%s,ParameterValue=%s,ApplyMethod=pending-reboot'
-            % (key_value_pair[0], key_value_pair[1]),
-            '--region=%s' % self.region,
-        ]
-
-        vm_util.IssueCommand(cmd)
+        self._ModifyDbParameterGroup(key_value_pair[0], key_value_pair[1])
 
       self._Reboot()
+
+  @vm_util.Retry()
+  def _ModifyDbParameterGroup(self, key: str, value: str) -> None:
+    cmd = util.AWS_PREFIX + [
+        'rds',
+        'modify-db-parameter-group',
+        '--db-parameter-group-name=%s' % self.parameter_group,
+        '--parameters=ParameterName=%s,ParameterValue=%s,ApplyMethod=pending-reboot'
+        % (key, value),
+        '--region=%s' % self.region,
+    ]
+    vm_util.IssueCommand(cmd)
 
   def _GetParameterGroupFamily(self):
     """Get the parameter group family string.
@@ -478,6 +543,85 @@ class BaseAwsRelationalDb(relational_db.BaseRelationalDb):
     if not json_output:
       return False
     return True
+
+  def _GetMetricsToCollect(self) -> list[relational_db.MetricSpec]:
+    """Returns a list of metrics to collect."""
+    metrics = RDS_COMMON_METRICS + _RDS_ONLY_METRICS
+    for metric in metrics:
+      metric.dimensions['DBInstanceIdentifier'] = self.instance_id
+    return metrics
+
+  def _CollectProviderMetric(
+      self,
+      metric: relational_db.MetricSpec,
+      start_time: datetime.datetime,
+      end_time: datetime.datetime,
+      collect_percentiles: bool = False,
+  ) -> list[sample.Sample]:
+    """Collects metrics from AWS CloudWatch."""
+    assert isinstance(metric, AwsMetricSpec)
+    logging.info(
+        'Collecting metric %s for instance %s',
+        metric.provider_name,
+        self.instance_id,
+    )
+    start_time_str = (
+        (start_time - metric.time_period_padding)
+        .astimezone(datetime.timezone.utc)
+        .strftime(relational_db.METRICS_TIME_FORMAT)
+    )
+    end_time_str = (
+        (end_time + metric.time_period_padding)
+        .astimezone(datetime.timezone.utc)
+        .strftime(relational_db.METRICS_TIME_FORMAT)
+    )
+    dimensions = [f'Name={n},Value={v}' for n, v in metric.dimensions.items()]
+    cmd = util.AWS_PREFIX + [
+        'cloudwatch',
+        'get-metric-statistics',
+        '--namespace',
+        'AWS/RDS',
+        '--metric-name',
+        metric.provider_name,
+        '--start-time',
+        start_time_str,
+        '--end-time',
+        end_time_str,
+        '--period',
+        str(metric.time_period),
+        '--statistics',
+        'Average',  # RDS metrics are at 1 minute granularity
+        '--dimensions',
+        ' '.join(dimensions),
+        '--region',
+        self.region,
+    ]
+    try:
+      stdout, _ = util.IssueRetryableCommand(cmd)
+    except errors.VmUtil.IssueCommandError as e:
+      logging.warning(
+          'Could not collect metric %s for instance %s: %s',
+          metric.provider_name,
+          self.instance_id,
+          e,
+      )
+      return []
+    response = json.loads(stdout)
+    datapoints = response['Datapoints']
+    if not datapoints:
+      logging.warning('No datapoints for metric %s', metric.provider_name)
+      return []
+
+    points = []
+    for dp in datapoints:
+      value = dp['Average']
+      if metric.conversion_func:
+        value = metric.conversion_func(value)
+      points.append((datetime.datetime.fromtimestamp(dp['Timestamp']), value))
+
+    return self._CreateSamples(
+        points, metric.sample_name, metric.unit, collect_percentiles
+    )
 
   def _Exists(self):
     """Returns true if the underlying resource exists.

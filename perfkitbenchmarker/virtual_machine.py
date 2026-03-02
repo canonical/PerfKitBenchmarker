@@ -18,7 +18,6 @@ All VM specifics are self-contained and the class provides methods to
 operate on the VM: boot, shutdown, etc.
 """
 
-
 import abc
 import copy
 import enum
@@ -26,7 +25,7 @@ import logging
 import os.path
 import threading
 import typing
-from typing import Any, Dict, List
+from typing import Dict, List
 
 from absl import flags
 from perfkitbenchmarker import benchmark_lookup
@@ -40,14 +39,19 @@ from perfkitbenchmarker import os_types
 from perfkitbenchmarker import package_lookup
 from perfkitbenchmarker import provider_info
 from perfkitbenchmarker import resource
+from perfkitbenchmarker import virtual_machine_spec
 from perfkitbenchmarker import vm_util
-from perfkitbenchmarker.configs import option_decoders
-from perfkitbenchmarker.configs import spec
 
 FLAGS = flags.FLAGS
 DEFAULT_USERNAME = 'perfkit'
 QUOTA_EXCEEDED_MESSAGE = 'Creation failed due to quota exceeded: '
 PREPROVISIONED_DATA_TIMEOUT = 600
+
+
+class CpuVersionMismatch(errors.Resource.RetryableCreationError):
+  """When a VM does not match an expected CPU version."""
+
+  pass
 
 
 def ValidateVmMetadataFlag(options_list):
@@ -77,6 +81,9 @@ def ValidateVmMetadataFlag(options_list):
 # vm_metadata flag name
 VM_METADATA = 'vm_metadata'
 
+BOOT_DISK_SIZE = flags.DEFINE_integer(
+    'boot_disk_size', None, 'The boot disk size in GiB for VMs.'
+)
 flags.DEFINE_boolean(
     'dedicated_hosts',
     False,
@@ -126,8 +133,15 @@ flags.DEFINE_boolean(
 _ASSIGN_EXTERNAL_IP = flags.DEFINE_boolean(
     'assign_external_ip',
     True,
-    'If True, an external (public) IP will be created for VMs. '
+    'If True, an external (public) IP will be created for primary NIC of VMs. '
     'If False, --connect_via_internal_ip may also be needed.',
+)
+flags.DEFINE_boolean(
+    'assign_external_ip_all_nics',
+    False,
+    'If True, an external (public) IP will be created for each network '
+    'interface. If False, an external IP is created for the first '
+    'interface only if --assign_external_ip is True.',
 )
 flags.DEFINE_string(
     'boot_startup_script',
@@ -230,60 +244,25 @@ flags.DEFINE_boolean(
     'Whether to retry commands when rate limited.',
 )
 
-GPU_K80 = 'k80'
-GPU_P100 = 'p100'
-GPU_V100 = 'v100'
-GPU_A100 = 'a100'
-GPU_H100 = 'h100'
-GPU_P4 = 'p4'
-GPU_P4_VWS = 'p4-vws'
-GPU_T4 = 't4'
-GPU_L4 = 'l4'
-GPU_A10 = 'a10'
-TESLA_GPU_TYPES = [
-    GPU_K80,
-    GPU_P100,
-    GPU_V100,
-    GPU_A100,
-    GPU_P4,
-    GPU_P4_VWS,
-    GPU_T4,
-    GPU_A10,
-]
-VALID_GPU_TYPES = TESLA_GPU_TYPES + [GPU_L4, GPU_H100]
 CPUARCH_X86_64 = 'x86_64'
 CPUARCH_AARCH64 = 'aarch64'
 
-flags.DEFINE_integer(
+GPU_COUNT = flags.DEFINE_integer(
     'gpu_count',
     None,
     'Number of gpus to attach to the VM. Requires gpu_type to be specified.',
 )
-flags.DEFINE_enum(
+GPU_TYPE = flags.DEFINE_enum(
     'gpu_type',
     None,
-    VALID_GPU_TYPES,
+    virtual_machine_spec.VALID_GPU_TYPES,
     'Type of gpus to attach to the VM. Requires gpu_count to be specified.',
 )
 
 
-def GetVmSpecClass(cloud: str, platform: str | None = None):
-  """Returns the VmSpec class with corresponding attributes.
-
-  Args:
-    cloud: The cloud being used.
-    platform: The vm platform being used (see enum above). If not provided,
-      defaults to flag value.
-
-  Returns:
-    A child of BaseVmSpec with the corresponding attributes.
-  """
-  if platform is None:
-    platform = provider_info.VM_PLATFORM.value
-  return spec.GetSpecClass(BaseVmSpec, CLOUD=cloud, PLATFORM=platform)
-
-
-def GetVmClass(cloud: str, os_type: str, platform: str | None = None):
+def GetVmClass(
+    cloud: str, os_type: str, platform: str | None = None
+) -> type['BaseVirtualMachine']:
   """Returns the VM class with corresponding attributes.
 
   Args:
@@ -305,209 +284,6 @@ def GetVmClass(cloud: str, os_type: str, platform: str | None = None):
   )
 
 
-class BaseVmSpec(spec.BaseSpec):
-  """Storing various data about a single vm.
-
-  Attributes:
-    zone: The region / zone the in which to launch the VM.
-    cidr: The CIDR subnet range in which to launch the VM.
-    machine_type: The provider-specific instance type (e.g. n1-standard-8).
-    gpu_count: None or int. Number of gpus to attach to the VM.
-    gpu_type: None or string. Type of gpus to attach to the VM.
-    image: The disk image to boot from.
-    assign_external_ip: Bool.  If true, create an external (public) IP.
-    install_packages: If false, no packages will be installed. This is useful if
-      benchmark dependencies have already been installed.
-    background_cpu_threads: The number of threads of background CPU usage while
-      running the benchmark.
-    background_network_mbits_per_sec: The number of megabits per second of
-      background network traffic during the benchmark.
-    background_network_ip_type: The IP address type (INTERNAL or EXTERNAL) to
-      use for generating background network workload.
-    disable_interrupt_moderation: If true, disables interrupt moderation.
-    disable_rss: = If true, disables rss.
-    boot_startup_script: Startup script to run during boot.
-    vm_metadata: = Additional metadata for the VM.
-  """
-
-  SPEC_TYPE = 'BaseVmSpec'
-  SPEC_ATTRS = ['CLOUD', 'PLATFORM']
-  CLOUD = None
-  PLATFORM = provider_info.DEFAULT_VM_PLATFORM
-
-  def __init__(self, *args, **kwargs):
-    self.zone = None
-    self.cidr = None
-    self.machine_type: str
-    self.gpu_count = None
-    self.gpu_type = None
-    self.image = None
-    self.assign_external_ip = None
-    self.install_packages = None
-    self.background_cpu_threads = None
-    self.background_network_mbits_per_sec = None
-    self.background_network_ip_type = None
-    self.disable_interrupt_moderation = None
-    self.disable_rss = None
-    self.vm_metadata: Dict[str, Any] = None
-    self.boot_startup_script: str = None
-    self.internal_ip: str
-    super().__init__(*args, **kwargs)
-
-  @classmethod
-  def _ApplyFlags(cls, config_values, flag_values):
-    """Overrides config values with flag values.
-
-    Can be overridden by derived classes to add support for specific flags.
-
-    Args:
-      config_values: dict mapping config option names to provided values. Is
-        modified by this function.
-      flag_values: flags.FlagValues. Runtime flags that may override the
-        provided config values.
-
-    Returns:
-      dict mapping config option names to values derived from the config
-      values or flag values.
-    """
-    super()._ApplyFlags(config_values, flag_values)
-    if flag_values['image'].present:
-      config_values['image'] = flag_values.image
-    if flag_values['install_packages'].present:
-      config_values['install_packages'] = flag_values.install_packages
-    if flag_values['machine_type'].present:
-      config_values['machine_type'] = flag_values.machine_type
-    if flag_values['background_cpu_threads'].present:
-      config_values['background_cpu_threads'] = (
-          flag_values.background_cpu_threads
-      )
-    if flag_values['background_network_mbits_per_sec'].present:
-      config_values['background_network_mbits_per_sec'] = (
-          flag_values.background_network_mbits_per_sec
-      )
-    if flag_values['background_network_ip_type'].present:
-      config_values['background_network_ip_type'] = (
-          flag_values.background_network_ip_type
-      )
-    if flag_values['dedicated_hosts'].present:
-      config_values['use_dedicated_host'] = flag_values.dedicated_hosts
-    if flag_values['num_vms_per_host'].present:
-      config_values['num_vms_per_host'] = flag_values.num_vms_per_host
-    if flag_values['gpu_type'].present:
-      config_values['gpu_type'] = flag_values.gpu_type
-    if flag_values['gpu_count'].present:
-      config_values['gpu_count'] = flag_values.gpu_count
-    if flag_values['assign_external_ip'].present:
-      config_values['assign_external_ip'] = flag_values.assign_external_ip
-    if flag_values['disable_interrupt_moderation'].present:
-      config_values['disable_interrupt_moderation'] = (
-          flag_values.disable_interrupt_moderation
-      )
-    if flag_values['disable_rss'].present:
-      config_values['disable_rss'] = flag_values.disable_rss
-    if flag_values['vm_metadata'].present:
-      config_values['vm_metadata'] = flag_values.vm_metadata
-    if flag_values['boot_startup_script'].present:
-      config_values['boot_startup_script'] = flag_values.boot_startup_script
-
-    if 'gpu_count' in config_values and 'gpu_type' not in config_values:
-      raise errors.Config.MissingOption(
-          'gpu_type must be specified if gpu_count is set'
-      )
-    if 'gpu_type' in config_values and 'gpu_count' not in config_values:
-      raise errors.Config.MissingOption(
-          'gpu_count must be specified if gpu_type is set'
-      )
-
-  @classmethod
-  def _GetOptionDecoderConstructions(cls):
-    """Gets decoder classes and constructor args for each configurable option.
-
-    Can be overridden by derived classes to add options or impose additional
-    requirements on existing options.
-
-    Returns:
-      dict. Maps option name string to a (ConfigOptionDecoder class, dict) pair.
-          The pair specifies a decoder class and its __init__() keyword
-          arguments to construct in order to decode the named option.
-    """
-    result = super()._GetOptionDecoderConstructions()
-    result.update({
-        'disable_interrupt_moderation': (
-            option_decoders.BooleanDecoder,
-            {'default': False},
-        ),
-        'disable_rss': (option_decoders.BooleanDecoder, {'default': False}),
-        'image': (
-            option_decoders.StringDecoder,
-            {'none_ok': True, 'default': None},
-        ),
-        'install_packages': (
-            option_decoders.BooleanDecoder,
-            {'default': True},
-        ),
-        'machine_type': (
-            option_decoders.StringDecoder,
-            {'none_ok': True, 'default': None},
-        ),
-        'assign_external_ip': (
-            option_decoders.BooleanDecoder,
-            {'default': True},
-        ),
-        'gpu_type': (
-            option_decoders.EnumDecoder,
-            {'valid_values': VALID_GPU_TYPES, 'default': None},
-        ),
-        'gpu_count': (
-            option_decoders.IntDecoder,
-            {'min': 1, 'default': None},
-        ),
-        'zone': (
-            option_decoders.StringDecoder,
-            {'none_ok': True, 'default': None},
-        ),
-        'cidr': (
-            option_decoders.StringDecoder,
-            {'none_ok': True, 'default': None},
-        ),
-        'use_dedicated_host': (
-            option_decoders.BooleanDecoder,
-            {'default': False},
-        ),
-        'num_vms_per_host': (option_decoders.IntDecoder, {'default': None}),
-        'background_network_mbits_per_sec': (
-            option_decoders.IntDecoder,
-            {'none_ok': True, 'default': None},
-        ),
-        'background_network_ip_type': (
-            option_decoders.EnumDecoder,
-            {
-                'default': vm_util.IpAddressSubset.EXTERNAL,
-                'valid_values': [
-                    vm_util.IpAddressSubset.EXTERNAL,
-                    vm_util.IpAddressSubset.INTERNAL,
-                ],
-            },
-        ),
-        'background_cpu_threads': (
-            option_decoders.IntDecoder,
-            {'none_ok': True, 'default': None},
-        ),
-        'boot_startup_script': (
-            option_decoders.StringDecoder,
-            {'none_ok': True, 'default': None},
-        ),
-        'vm_metadata': (
-            option_decoders.ListDecoder,
-            {
-                'item_decoder': option_decoders.StringDecoder(),
-                'default': [],
-            },
-        ),
-    })
-    return result
-
-
 class BaseVirtualMachine(os_mixin.BaseOsMixin, resource.BaseResource):
   """Base class for Virtual Machines.
 
@@ -517,8 +293,9 @@ class BaseVirtualMachine(os_mixin.BaseOsMixin, resource.BaseResource):
 
   Attributes:
     image: The disk image used to boot.
-    internal_ip: Internal IP address.
-    assign_external_ip: If True, create an external (public) IP.
+    assign_external_ip: If True, create an external (public) IP for primary NIC.
+    assign_external_ip_all_nics: If True, create an external (public) IP for
+      each network interface.
     ip_address: Public (external) IP address.
     machine_type: The provider-specific instance type (e.g. n1-standard-8).
     project: The provider-specific project associated with the VM (e.g.
@@ -557,11 +334,15 @@ class BaseVirtualMachine(os_mixin.BaseOsMixin, resource.BaseResource):
   _instance_counter_lock = threading.Lock()
   _instance_counter = 0
 
-  def __init__(self, vm_spec: BaseVmSpec):
+  # This is implemented in os_mixin.BaseOsMixin, but due to insane diamond
+  # inheritence, we need it here.
+  cpu_arch: str
+
+  def __init__(self, vm_spec: virtual_machine_spec.BaseVmSpec):
     """Initialize BaseVirtualMachine class.
 
     Args:
-      vm_spec: virtual_machine.BaseVmSpec object of the vm.
+      vm_spec: virtual_machine_spec.BaseVmSpec object of the vm.
     """
     super().__init__()
     with self._instance_counter_lock:
@@ -585,11 +366,13 @@ class BaseVirtualMachine(os_mixin.BaseOsMixin, resource.BaseResource):
       else:
         self.name = '%s-%d' % (name_prefix, self.instance_number)
       BaseVirtualMachine._instance_counter += 1
+    self.vm_spec = vm_spec
+    self.machine_type = vm_spec.machine_type
+    self.zone = vm_spec.zone
     self.disable_interrupt_moderation = vm_spec.disable_interrupt_moderation
     self.disable_rss = vm_spec.disable_rss
-    self.zone = vm_spec.zone
+    self.boot_disk_size = vm_spec.boot_disk_size
     self.cidr = vm_spec.cidr
-    self.machine_type = vm_spec.machine_type
     self.gpu_count = vm_spec.gpu_count
     self.gpu_type = vm_spec.gpu_type
     self.image = vm_spec.image
@@ -599,7 +382,9 @@ class BaseVirtualMachine(os_mixin.BaseOsMixin, resource.BaseResource):
     )
     self.boot_completion_ip_subset = _BOOT_COMPLETION_IP_SUBSET.value
     self.assign_external_ip = vm_spec.assign_external_ip
+    self.assign_external_ip_all_nics = vm_spec.assign_external_ip_all_nics
     self.ip_address = None
+    self.ip_addresses = []
     self.internal_ip = None
     self.internal_ips = []
     self.user_name = _VM_USER_NAME.value
@@ -628,16 +413,34 @@ class BaseVirtualMachine(os_mixin.BaseOsMixin, resource.BaseResource):
     self.vm_metadata = dict(item.split(':', 1) for item in vm_spec.vm_metadata)
     self.vm_group = None
     self.id = None
-    self.is_aarch64 = False
+    self._is_aarch64 = None
     self.cpu_version = None
     self.create_operation_name = None
     self.create_return_time = None
     self.is_running_time = None
     self.boot_startup_script = vm_spec.boot_startup_script
+    self.create_cmd_info_log = None
     if self.OS_TYPE == os_types.CORE_OS and self.boot_startup_script:
       raise errors.Setup.InvalidConfigurationError(
           'Startup script are not supported on CoreOS.'
       )
+
+  @property
+  def is_aarch64(self) -> bool:
+    """Whether the VM is known to be an ARM VM.
+
+    Historically each provider sets this explicitly, but for some providers like
+    KuberentesVirtualMachine, it's conveniet to fall back to what is reported by
+    Linux.
+    """
+    if self._is_aarch64 is not None:
+      return self._is_aarch64
+    # Only detect arch if it's not explicitly set.
+    return self.cpu_arch == CPUARCH_AARCH64
+
+  @is_aarch64.setter
+  def is_aarch64(self, value: bool):
+    self._is_aarch64 = value
 
   @property
   @classmethod
@@ -678,6 +481,18 @@ class BaseVirtualMachine(os_mixin.BaseOsMixin, resource.BaseResource):
     elif self.internal_ip:
       return [self.internal_ip]
     return []
+
+  def GetExternalIPs(self):
+    """Gets the External IP's for the VM."""
+    if self.ip_addresses:
+      return self.ip_addresses
+    elif self.ip_address:
+      return [self.ip_address]
+    return []
+
+  def GetLocalhostAddr(self):
+    """Returns ::1 if use_ipv6 is set, and localhost otherwise."""
+    return '::1' if pkb_flags.FLAGS.use_ipv6 else 'localhost'
 
   def SetDiskSpec(self, disk_spec, disk_count):
     """Set Disk Specs of the current VM."""
@@ -767,23 +582,27 @@ class BaseVirtualMachine(os_mixin.BaseOsMixin, resource.BaseResource):
           _REQUIRED_CPU_VERSION.value
           and _REQUIRED_CPU_VERSION.value != self.cpu_version
       ):
-        self.Delete()
-        raise errors.Resource.RetryableCreationError(
+        error_msg = (
             f'Guest arch {self.cpu_version} is not enforced guest arch'
             f' {_REQUIRED_CPU_VERSION.value}. Deleting VM and scratch disk and'
-            ' recreating.',
+            ' recreating.'
         )
+        logging.error(error_msg)
+        self.Delete()
+        raise CpuVersionMismatch(error_msg)
 
     try:
       vm_util.Retry(
           max_retries=_REQUIRED_CPU_VERSION_RETRIES.value,
-          retryable_exceptions=errors.Resource.RetryableCreationError,
+          retryable_exceptions=CpuVersionMismatch,
       )(CreateAndBootOnce)()
     except vm_util.RetriesExceededRetryError as exc:
-      raise errors.Benchmarks.InsufficientCapacityCloudFailure(
-          f'{_REQUIRED_CPU_VERSION.value} was not obtained after'
-          f' {_REQUIRED_CPU_VERSION_RETRIES.value} retries.'
-      ) from exc
+      if isinstance(exc.__cause__, CpuVersionMismatch):
+        raise errors.Benchmarks.InsufficientCapacityCloudFailure(
+            f'{_REQUIRED_CPU_VERSION.value} was not obtained after'
+            f' {_REQUIRED_CPU_VERSION_RETRIES.value} retries.'
+        ) from exc
+      raise exc
 
   def PrepareAfterBoot(self):
     """Prepares a VM after it has booted.
@@ -848,10 +667,12 @@ class BaseVirtualMachine(os_mixin.BaseOsMixin, resource.BaseResource):
     result = self.metadata.copy()
     result.update({
         'image': self.image,
-        'zone': self.zone,
         'cloud': self.CLOUD,
         'os_type': type(self).OS_TYPE,
+        'vm_platform': self.PLATFORM,
     })
+    if self.zone is not None:
+      result['zone'] = self.zone
     if self.cidr is not None:
       result['cidr'] = self.cidr
     if self.machine_type is not None:
@@ -879,8 +700,10 @@ class BaseVirtualMachine(os_mixin.BaseOsMixin, resource.BaseResource):
       result['id'] = self.id
     if self.name is not None:
       result['name'] = self.name
-    if self.ip_address is not None:
-      result['ip_address'] = self.ip_address
+    if self.GetInternalIPs():
+      result['internal_ips'] = self.GetInternalIPs()
+    if self.GetExternalIPs():
+      result['external_ips'] = self.GetExternalIPs()
     if pkb_flags.RECORD_PROCCPU.value and self.cpu_version:
       result['cpu_version'] = self.cpu_version
     if self.create_operation_name is not None:
@@ -888,30 +711,6 @@ class BaseVirtualMachine(os_mixin.BaseOsMixin, resource.BaseResource):
     if self.create_start_time:
       result['create_start_time'] = self.create_start_time
     return result
-
-  def SimulateMaintenanceEvent(self):
-    """Simulates a maintenance event on the VM."""
-    raise NotImplementedError()
-
-  def SetupLMNotification(self):
-    """Prepare environment for /scripts/gce_maintenance_notify.py script."""
-    raise NotImplementedError()
-
-  def _GetLMNotifificationCommand(self):
-    """Return Remote python execution command for LM notify script."""
-    raise NotImplementedError()
-
-  def StartLMNotification(self):
-    """Start meta-data server notification subscription."""
-    raise NotImplementedError()
-
-  def WaitLMNotificationRelease(self):
-    """Block main thread until LM ended."""
-    raise NotImplementedError()
-
-  def CollectLMNotificationsTime(self):
-    """Extract LM notifications from log file."""
-    raise NotImplementedError()
 
   def _InstallData(
       self,

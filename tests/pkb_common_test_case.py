@@ -32,6 +32,7 @@ from perfkitbenchmarker import pkb  # pylint:disable=unused-import
 from perfkitbenchmarker import provider_info
 from perfkitbenchmarker import resource
 from perfkitbenchmarker import virtual_machine
+from perfkitbenchmarker import virtual_machine_spec
 from perfkitbenchmarker.configs import benchmark_config_spec
 from perfkitbenchmarker.providers.gcp import gce_virtual_machine
 from perfkitbenchmarker.providers.gcp import util
@@ -70,7 +71,7 @@ IP_LINK_TEXT = """\
 """
 
 
-class TestVmSpec(virtual_machine.BaseVmSpec):
+class TestVmSpec(virtual_machine_spec.BaseVmSpec):
   CLOUD = 'test_vm_spec_cloud'
 
 
@@ -257,6 +258,16 @@ def CreateBenchmarkSpecFromConfigDict(
 def GetTestDir() -> pathlib.Path:
   """Returns the PKB base directory for tests."""
   return pathlib.Path(__file__).parent
+
+
+def ReadFile(file_name: str, base_path: pathlib.Path | None = None) -> str:
+  """Returns the contents of the given file in the test data directory."""
+  if base_path is None:
+    base_path = GetTestDir() / 'data'
+  path = base_path / file_name
+  with open(path) as f:
+    contents = f.read()
+  return contents
 
 
 class PkbCommonTestCase(parameterized.TestCase, absltest.TestCase):

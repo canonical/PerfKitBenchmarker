@@ -45,6 +45,7 @@ https://github.com/GoogleCloudPlatform/spark-bigquery-connector.
 """
 
 from collections.abc import MutableMapping
+import functools
 import json
 import logging
 import os
@@ -53,11 +54,13 @@ import time
 from typing import Any, List
 
 from absl import flags
+from perfkitbenchmarker import background_tasks
 from perfkitbenchmarker import configs
 from perfkitbenchmarker import dpb_constants
 from perfkitbenchmarker import dpb_service
 from perfkitbenchmarker import dpb_sparksql_benchmark_helper
 from perfkitbenchmarker import errors
+from perfkitbenchmarker import linux_virtual_machine
 from perfkitbenchmarker import object_storage_service
 from perfkitbenchmarker import sample
 from perfkitbenchmarker import temp_dir
@@ -122,6 +125,15 @@ _FETCH_RESULTS_FROM_LOGS = flags.DEFINE_bool(
     ' latency (and hence its total wall time), but it is not supported by all '
     ' DPB services.',
 )
+_CATALOG = flags.DEFINE_string(
+    'dpb_sparksql_catalog',
+    None,
+    'Spark catalog to look for data in.',
+)
+
+_READAHEAD_KB = flags.DEFINE_integer(
+    'sparksql_readahead_kb', None, 'Configure block device readahead settings.'
+)
 
 FLAGS = flags.FLAGS
 
@@ -131,7 +143,7 @@ LOG_RESULTS_PATTERN = (
     r'----@spark_sql_runner:results_end@----'
 )
 POLL_LOGS_INTERVAL = 60
-POLL_LOGS_TIMEOUT = 6 * 60
+POLL_LOGS_TIMEOUT = 15 * 60
 RESULTS_FROM_LOGS_SUPPORTED_DPB_SERVICES = (
     dpb_constants.DATAPROC_SERVERLESS,
     dpb_constants.EMR_SERVERLESS,
@@ -214,6 +226,14 @@ def CheckPrerequisites(benchmark_config):
     )
 
 
+def _PrepareNode(vm: linux_virtual_machine.BaseLinuxVirtualMachine) -> None:
+  if _READAHEAD_KB.value is not None:
+    vm.SetReadAhead(
+        _READAHEAD_KB.value * 2,
+        [d.GetDevicePath() for d in vm.scratch_disks],
+    )
+
+
 def Prepare(benchmark_spec):
   """Installs and sets up dataset on the Spark clusters.
 
@@ -223,6 +243,12 @@ def Prepare(benchmark_spec):
   Args:
     benchmark_spec: The benchmark specification
   """
+  # Only unmanaged dpb services are VM-aware
+  if benchmark_spec.dpb_service.CLOUD == 'Unmanaged':
+    nodes = benchmark_spec.dpb_service.vms['worker_group']
+    partials = [functools.partial(_PrepareNode, node) for node in nodes]
+    background_tasks.RunThreaded((lambda f: f()), partials)
+
   cluster = benchmark_spec.dpb_service
   storage_service = cluster.storage_service
 
@@ -359,6 +385,8 @@ def _RunQueries(benchmark_spec) -> tuple[str, dpb_service.JobResult]:
     args += ['--log-results', 'True']
   else:
     args += ['--report-dir', report_dir]
+  if _CATALOG.value:
+    args += ['--catalog', _CATALOG.value]
   if FLAGS.dpb_sparksql_database:
     args += ['--database', FLAGS.dpb_sparksql_database]
   if FLAGS.dpb_sparksql_create_hive_tables:
@@ -388,6 +416,7 @@ def _RunQueries(benchmark_spec) -> tuple[str, dpb_service.JobResult]:
     args += ['--table-cache', FLAGS.dpb_sparksql_table_cache]
   if dpb_sparksql_benchmark_helper.DUMP_SPARK_CONF.value:
     args += ['--dump-spark-conf', os.path.join(cluster.base_dir, 'spark-conf')]
+  args += ['--run-uri', FLAGS.run_uri]
   jars = []
   job_result = cluster.SubmitJob(
       pyspark_file='/'.join([

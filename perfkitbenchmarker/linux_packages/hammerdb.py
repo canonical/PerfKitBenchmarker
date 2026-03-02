@@ -85,8 +85,9 @@ MAP_SCRIPT_TO_DATABASE_NAME = {
     HAMMERDB_SCRIPT_TPC_H: 'tpch',
 }
 
-RUN_SCRIPT_TYPE = 'RUN'
 BUILD_SCRIPT_TYPE = 'BUILD'
+RUN_SCRIPT_TYPE = 'RUN'
+VALIDATE_SCRIPT_TYPE = 'VALIDATE'
 
 # number of queries that are expected from the TPC H Test
 TPC_H_QUERY_COUNT = 22
@@ -291,10 +292,16 @@ class HammerDbTclScript:
       )
 
   @classmethod
-  def CheckErrorFromHammerdb(cls, stdout: str):
+  def CheckErrorFromHammerdb(
+      cls, stdout: str, script_type: str = '', return_code: int = 0
+  ):
     """Check errors from the stdout of Hammerdb.
 
-    Some sample errors
+    For Validation script, if the return code is not 0, it is considered as a
+    failure.
+
+    For Build / Run script, if certain errors are found in the stdout, it is
+    considered as a failure. Some sample errors:
       Error in Virtual User 1:
       [Microsoft][ODBC Driver 17 for SQL Server][SQL Server]
       User does not have permission to perform this action.
@@ -305,11 +312,20 @@ class HammerDbTclScript:
       Virtual Users remain running (Runs terminated before finished)
 
     Args:
-       stdout: Stdout from Hammerdb script.
+      stdout: Stdout from Hammerdb script.
+      script_type: The type of script being run (e.g., BUILD, RUN, VALIDATE).
+      return_code: The return code of the Hammerdb command.
 
     Raises:
      Exception: exception when hammerdb failed
     """
+    if script_type == VALIDATE_SCRIPT_TYPE and return_code != 0:
+      raise HammerdbBenchmarkError(
+          'Validation failed with return code {} and stdout {}'.format(
+              return_code, stdout
+          )
+      )
+
     if (
         'Error' in stdout
         or 'FAILED' in stdout
@@ -340,7 +356,7 @@ class HammerDbTclScript:
     # Increase the Open file limit to a large number.
     if _HAMMERDB_SET_LINUX_OPEN_FILE_LIMIT.value:
       cmd = f'ulimit -n {_HAMMERDB_SET_LINUX_OPEN_FILE_LIMIT.value} &&'
-    stdout, _ = vm.RemoteCommand(
+    stdout, _, return_code = vm.RemoteCommandWithReturnCode(
         InDir(
             HAMMERDB_RUN_LOCATION,
             'PATH="$PATH:/opt/mssql-tools/bin" &&'
@@ -350,7 +366,7 @@ class HammerDbTclScript:
         timeout=timeout,
     )
 
-    self.CheckErrorFromHammerdb(stdout)
+    self.CheckErrorFromHammerdb(stdout, self.script_type, return_code)
     return stdout
 
 
@@ -525,6 +541,13 @@ TPC_C_MYSQL_RUN_SCRIPT = HammerDbTclScript(
     RUN_SCRIPT_TYPE,
 )
 
+TPC_C_MYSQL_VALIDATE_SCRIPT = HammerDbTclScript(
+    'hammerdb_mysql_tpc_c_validate.tcl',
+    TPCC_PARAMS,
+    P3RF_CLOUD_SQL_TEST_DIR,
+    VALIDATE_SCRIPT_TYPE,
+)
+
 TPC_H_MYSQL_BUILD_SCRIPT = HammerDbTclScript(
     'hammerdb_mysql_tpc_h_build.tcl',
     TPCH_PARAMS,
@@ -537,6 +560,13 @@ TPC_H_MYSQL_RUN_SCRIPT = HammerDbTclScript(
     TPCH_PARAMS,
     P3RF_CLOUD_SQL_TEST_DIR,
     RUN_SCRIPT_TYPE,
+)
+
+TPC_H_MYSQL_VALIDATE_SCRIPT = HammerDbTclScript(
+    'hammerdb_mysql_tpc_h_validate.tcl',
+    TPCH_PARAMS,
+    P3RF_CLOUD_SQL_TEST_DIR,
+    VALIDATE_SCRIPT_TYPE,
 )
 
 TPC_C_POSTGRES_BUILD_SCRIPT = HammerDbTclScript(
@@ -597,6 +627,25 @@ SCRIPT_MAPPING = {
             TPC_C_POSTGRES_BUILD_SCRIPT,
             TPC_C_POSTGRES_RUN_SCRIPT,
         ],
+    },
+}
+
+VALIDATE_SCRIPT_MAPPING = {
+    sql_engine_utils.MYSQL: {
+        HAMMERDB_SCRIPT_TPC_H: [
+            TPC_H_MYSQL_VALIDATE_SCRIPT,
+        ],
+        HAMMERDB_SCRIPT_TPC_C: [
+            TPC_C_MYSQL_VALIDATE_SCRIPT,
+        ],
+    },
+    sql_engine_utils.SQLSERVER: {
+        HAMMERDB_SCRIPT_TPC_H: [],
+        HAMMERDB_SCRIPT_TPC_C: [],
+    },
+    sql_engine_utils.POSTGRES: {
+        HAMMERDB_SCRIPT_TPC_H: [],
+        HAMMERDB_SCRIPT_TPC_C: [],
     },
 }
 
@@ -861,6 +910,106 @@ def SearchAndReplaceTclScript(
   )
 
 
+def _InstallHammerDbArm(vm: virtual_machine.BaseVirtualMachine):
+  """Install hammerdb on ARM."""
+  # Install build dependencies and PostgreSQL client dev library for pgtcl
+  vm.InstallPackages(
+      'wget build-essential libreadline-dev zlib1g-dev libpq-dev'
+  )
+
+  # Define aarch64 specific flags
+  cflags = (
+      '"-O3 -mcpu=neoverse-n1 -march=armv8.2-a+lse+crc+crypto+dotprod'
+      ' -moutline-atomics -Wl,--build-id"'
+  )
+  cxxflags = cflags  # Same flags for CXX in the script
+  gcc_bin_dir = '/usr/bin'
+  hammerdb_dir = HAMMERDB_RUN_LOCATION
+
+  download_commands = [
+      f'cd {hammerdb_dir}',
+      'wget https://prdownloads.sourceforge.net/tcl/tcl8.6.11-src.tar.gz',
+      (
+          'wget https://sourceforge.net/projects/expect/files/Expect/5.45.4/expect5.45.4.tar.gz'
+      ),
+      (
+          'wget https://sourceforge.net/projects/pgtclng/files/pgtclng/2.1.1/pgtcl2.1.1.tar.gz'
+      ),
+  ]
+  vm.RemoteCommand(' && '.join(download_commands))
+
+  # Build Tcl
+  build_tcl_commands = [
+      f'cd {hammerdb_dir}',
+      'tar xf tcl8.6.11-src.tar.gz',
+      'rm -f bin/tclsh8.6',  # Remove existing tclsh
+      'cd tcl8.6.11/unix',
+      (
+          f'CC="{gcc_bin_dir}/gcc" CXX="{gcc_bin_dir}/g++"'
+          f' LD="{gcc_bin_dir}/gcc"'
+          f' CFLAGS={cflags} CXXFLAGS={cxxflags} ./configure'
+          f' --prefix="{hammerdb_dir}" --enable-64bit'
+      ),
+      'make -j $(nproc)',
+      'make install',
+  ]
+  vm.RemoteCommand(' && '.join(build_tcl_commands))
+
+  # Build Expect
+  build_expect_commands = [
+      f'cd {hammerdb_dir}',
+      'tar xf expect5.45.4.tar.gz',
+      'cd expect5.45.4',
+      'arch=$(uname -m)',
+      (
+          f'CC="{gcc_bin_dir}/gcc" CXX="{gcc_bin_dir}/g++"'
+          f' LD="{gcc_bin_dir}/gcc"'
+          f' CFLAGS={cflags} CXXFLAGS={cxxflags} ./configure'
+          f' --prefix="{hammerdb_dir}" --build=${{arch}}-unknown-linux-gnu'
+          ' --enable-64bit --with-tclinclude=../include'
+      ),
+      'make -j $(nproc)',
+      'make install',
+  ]
+  vm.RemoteCommand(' && '.join(build_expect_commands))
+
+  # Build pgtcl
+  build_pgtcl_commands = [
+      f'cd {hammerdb_dir}',
+      'tar xf pgtcl2.1.1.tar.gz',
+      'cd pgtcl2.1.1',
+      # Assuming standard paths for libpq-dev headers/libs
+      (
+          'pg_include_path=$(dpkg -L libpq-dev | grep "/libpq-fe\\.h$" | head'
+          ' -n 1 | xargs dirname)'
+      ),
+      (
+          'pg_lib_path=$(dpkg -L libpq-dev | grep "/libpq\\.so$" | head -n 1'
+          ' | xargs dirname)'
+      ),
+      (
+          f'CC="{gcc_bin_dir}/gcc" CXX="{gcc_bin_dir}/g++"'
+          f' LD="{gcc_bin_dir}/gcc"'
+          f' CFLAGS={cflags} CXXFLAGS={cxxflags} ./configure'
+          f' --prefix="{hammerdb_dir}" --enable-64bit'
+          ' --with-postgres-include=${pg_include_path}'
+          ' --with-postgres-lib=${pg_lib_path}'
+      ),
+      'make -j $(nproc)',
+      'make install',
+  ]
+  vm.RemoteCommand(' && '.join(build_pgtcl_commands))
+
+  # clean up build directories and tarballs
+  clean_up_commands = [
+      f'cd {hammerdb_dir}',
+      'rm -rf expect*',
+      'rm -rf pgtcl*',
+      'rm -rf tcl*',
+  ]
+  vm.RemoteCommand(' && '.join(clean_up_commands))
+
+
 def Install(vm: virtual_machine.BaseVirtualMachine):
   """Installs hammerdbcli and dependencies on the VM."""
   vm.InstallPackages('curl')
@@ -877,29 +1026,47 @@ def Install(vm: virtual_machine.BaseVirtualMachine):
       f'cd {HAMMERDB_RUN_LOCATION}; tar xzvf {tar_file}; '
       f'mv HammerDB-{HAMMERDB_VERSION.value}/* ./'
   )
-  # Push Hammerdb install files
-  if HAMMERDB_VERSION.value == HAMMERDB_4_0:
-    install_file = 'install_hammerdb_4_0.sh'
-    # Patches hammerdb 4.0 for Postgres on Azure and time profile frequency
-    files_required = [
-        'pgolap.tcl.patch',
-        'pgoltp.tcl.patch',
-        'postgresql.xml.patch',
-        'etprof-1.1.tm.patch',
-        install_file,
-    ]
-
-    for file in files_required:
-      PushCloudSqlTestFile(vm, file, P3RF_CLOUD_SQL_TEST_DIR)
-    vm.RemoteCommand(InLocalDir(f'chmod +x {install_file}'))
-    vm.RemoteCommand(InLocalDir(f'sudo ./{install_file}'))
-
+  if vm.cpu_arch not in [
+      virtual_machine.CPUARCH_X86_64,
+      virtual_machine.CPUARCH_AARCH64,
+  ]:
+    raise HammerdbBenchmarkError(
+        'Unsupported architecture for hammerdb: {}. Only x86_64 and aarch64 are'
+        ' supported.'.format(vm.cpu_arch)
+    )
   db_engine = sql_engine_utils.GetDbEngineType(FLAGS.db_engine)
-  if db_engine == sql_engine_utils.MYSQL:
-    # Install specific mysql library for hammerdb
-    vm.Install('libmysqlclient21')
+  if (
+      HAMMERDB_VERSION.value == HAMMERDB_4_3
+      and db_engine == sql_engine_utils.POSTGRES
+      and vm.cpu_arch == virtual_machine.CPUARCH_AARCH64
+  ):
+    _InstallHammerDbArm(vm)
+  else:
+    # normal install
+    # Push Hammerdb install files
+    if HAMMERDB_VERSION.value == HAMMERDB_4_0:
+      install_file = 'install_hammerdb_4_0.sh'
+      # Patches hammerdb 4.0 for Postgres on Azure and time profile frequency
+      files_required = [
+          'pgolap.tcl.patch',
+          'pgoltp.tcl.patch',
+          'postgresql.xml.patch',
+          'etprof-1.1.tm.patch',
+          install_file,
+      ]
 
-  vm.RemoteCommand('export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/')
+      for file in files_required:
+        PushCloudSqlTestFile(vm, file, P3RF_CLOUD_SQL_TEST_DIR)
+      vm.RemoteCommand(InLocalDir(f'chmod +x {install_file}'))
+      vm.RemoteCommand(InLocalDir(f'sudo ./{install_file}'))
+
+    if db_engine == sql_engine_utils.MYSQL:
+      # Install specific mysql library for hammerdb
+      vm.Install('libmysqlclient21')
+  if vm.cpu_arch == virtual_machine.CPUARCH_AARCH64:
+    vm.RemoteCommand('export LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu/')
+  else:
+    vm.RemoteCommand('export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/')
 
 
 def SetupConfig(
@@ -980,6 +1147,20 @@ def Run(
   # Run the build scripts which contains build schema (inserts into dbs)
   # And the benchmark scripts. The last stdout is the result from the run script
   return scripts[-1].Run(vm, timeout=timeout)
+
+
+def RunValidation(
+    vm: virtual_machine.BaseVirtualMachine,
+    db_engine: str,
+    hammerdb_script: str,
+    timeout: int | None = 60 * 60 * 8,
+) -> str:
+  """Run the HammerDBCli Validation Script."""
+  db_engine = sql_engine_utils.GetDbEngineType(db_engine)
+
+  scripts = VALIDATE_SCRIPT_MAPPING[db_engine][hammerdb_script]
+
+  return scripts[-1].Run(vm, timeout=timeout) if scripts else ''
 
 
 def GetMetadata(db_engine: str):

@@ -40,13 +40,21 @@ from perfkitbenchmarker.configs import spec
 from perfkitbenchmarker.configs import vm_group_decoders
 from perfkitbenchmarker.resources import example_resource_spec
 from perfkitbenchmarker.resources import jobs_setter
-# Included to import & load Kubernetes' __init__.py somewhere.
-from perfkitbenchmarker.resources import kubernetes  # pylint:disable=unused-import
 from perfkitbenchmarker.resources import managed_ai_model_spec
 from perfkitbenchmarker.resources.pinecone import pinecone_resource_spec
+from perfkitbenchmarker.resources.vertex_vector_search import vvs_resource_spec
 
 
 _NONE_OK = {'default': None, 'none_ok': True}
+
+
+def _LoadProvider(config, flag_values):
+  """Loads the provider associated with the config."""
+  cloud = config.get('cloud')
+  if not cloud or flag_values['cloud'].present:
+    cloud = flag_values.cloud
+  if cloud:
+    providers.LoadProvider(cloud)
 
 
 class _DpbApplicationListDecoder(option_decoders.ListDecoder):
@@ -55,9 +63,12 @@ class _DpbApplicationListDecoder(option_decoders.ListDecoder):
   def __init__(self, **kwargs):
     super().__init__(
         default=None,
-        item_decoder=option_decoders.EnumDecoder(
-            [dpb_constants.FLINK, dpb_constants.HIVE]
-        ),
+        item_decoder=option_decoders.EnumDecoder([
+            dpb_constants.FLINK,
+            dpb_constants.HIVE,
+            dpb_constants.DELTA,
+            dpb_constants.ICEBERG,
+        ]),
         **kwargs,
     )
 
@@ -81,7 +92,6 @@ class _DpbServiceDecoder(option_decoders.TypeVerifier):
       errors.Config.InvalidValue upon invalid input value.
     """
     dpb_service_config = super().Decode(value, component_full_name, flag_values)
-
     if (
         dpb_service_config['service_type'] == dpb_constants.EMR
         and component_full_name == 'dpb_wordcount_benchmark'
@@ -93,6 +103,21 @@ class _DpbServiceDecoder(option_decoders.TypeVerifier):
         flag_values,
         **dpb_service_config,
     )
+    # pytype: disable=attribute-error
+    non_default_legacy_runtime_engine = (
+        result.dataproc_serverless_runtime_engine != 'default'
+    )
+    non_default_engine = (
+        result.dataproc_serverless_engine
+        != dpb_constants.DATAPROC_DEFAULT_ENGINE
+    )
+    if non_default_legacy_runtime_engine and non_default_engine:
+      raise errors.Config.InvalidValue(
+          'Non-default legacy "dataproc_serverless_runtime_engine" config is'
+          ' not compatible with newer "dataproc_serverless_engine" config (for'
+          ' Lightning Engine).'
+      )
+    # pytype: enable=attribute-error
     return result
 
 
@@ -214,11 +239,34 @@ class _DpbServiceSpec(spec.BaseSpec):
             option_decoders.IntDecoder,
             {'default': None, 'none_ok': True},
         ),
-        'dataproc_serverless_runtime_engine': (
+        'dataproc_serverless_runtime_engine': (  # legacy "runtime engine"
             option_decoders.EnumDecoder,
             {
                 'valid_values': ('default', 'native'),
                 'default': 'default',
+            },
+        ),
+        # new "engine" config (to enable Lightning Engine)
+        'dataproc_serverless_engine': (
+            option_decoders.EnumDecoder,
+            {
+                'valid_values': (
+                    dpb_constants.DATAPROC_DEFAULT_ENGINE,
+                    dpb_constants.DATAPROC_LIGHTNING_ENGINE,
+                ),
+                'default': dpb_constants.DATAPROC_DEFAULT_ENGINE,
+            },
+        ),
+        'dataproc_serverless_lightning_engine_runtime': (
+            option_decoders.EnumDecoder,
+            {
+                'valid_values': (
+                    dpb_constants.DATAPROC_LIGHTNING_ENGINE_DEFAULT_RUNTIME,
+                    dpb_constants.DATAPROC_LIGHTNING_ENGINE_NATIVE_RUNTIME,
+                ),
+                'default': (
+                    dpb_constants.DATAPROC_LIGHTNING_ENGINE_DEFAULT_RUNTIME
+                ),
             },
         ),
         'dataproc_serverless_memory_overhead': (
@@ -432,29 +480,20 @@ class _TpuGroupSpec(spec.BaseSpec):
             option_decoders.EnumDecoder,
             {'valid_values': provider_info.VALID_CLOUDS},
         ),
-        'tpu_cidr_range': (
+        'tpu_name': (option_decoders.StringDecoder, {'default': None}),
+        'tpu_type': (
             option_decoders.StringDecoder,
             {'default': None},
         ),
-        'tpu_accelerator_type': (
+        'tpu_topology': (
             option_decoders.StringDecoder,
             {'default': None},
         ),
-        'tpu_description': (
-            option_decoders.StringDecoder,
-            {'default': None},
-        ),
-        'tpu_network': (option_decoders.StringDecoder, {'default': None}),
         'tpu_tf_version': (
             option_decoders.StringDecoder,
             {'default': None},
         ),
         'tpu_zone': (option_decoders.StringDecoder, {'default': None}),
-        'tpu_name': (option_decoders.StringDecoder, {'default': None}),
-        'tpu_preemptible': (
-            option_decoders.BooleanDecoder,
-            {'default': False},
-        ),
     })
     return result
 
@@ -473,22 +512,16 @@ class _TpuGroupSpec(spec.BaseSpec):
     super()._ApplyFlags(config_values, flag_values)
     if flag_values['cloud'].present:
       config_values['cloud'] = flag_values.cloud
-    if flag_values['tpu_cidr_range'].present:
-      config_values['tpu_cidr_range'] = flag_values.tpu_cidr_range
-    if flag_values['tpu_accelerator_type'].present:
-      config_values['tpu_accelerator_type'] = flag_values.tpu_accelerator_type
-    if flag_values['tpu_description'].present:
-      config_values['tpu_description'] = flag_values.tpu_description
-    if flag_values['tpu_network'].present:
-      config_values['tpu_network'] = flag_values.tpu_network
+    if flag_values['tpu_name'].present:
+      config_values['tpu_name'] = flag_values.tpu_name
+    if flag_values['tpu_type'].present:
+      config_values['tpu_type'] = flag_values.tpu_type
+    if flag_values['tpu_topology'].present:
+      config_values['tpu_topology'] = flag_values.tpu_topology
     if flag_values['tpu_tf_version'].present:
       config_values['tpu_tf_version'] = flag_values.tpu_tf_version
     if flag_values['tpu_zone'].present:
       config_values['tpu_zone'] = flag_values.tpu_zone
-    if flag_values['tpu_name'].present:
-      config_values['tpu_name'] = flag_values.tpu_name
-    if flag_values['tpu_preemptible'].present:
-      config_values['tpu_preemptible'] = flag_values.tpu_preemptible
 
 
 class _EdwServiceDecoder(option_decoders.TypeVerifier):
@@ -775,6 +808,9 @@ class _RelationalDbDecoder(option_decoders.TypeVerifier):
     relational_db_config = super().Decode(
         value, component_full_name, flag_values
     )
+    # LoadProvider is required for resources to be registered.
+    _LoadProvider(relational_db_config, flag_values)
+
     if 'engine' in relational_db_config:
       if flag_values['db_engine'].present:
         db_spec_class = relational_db_spec.GetRelationalDbSpecClass(
@@ -817,15 +853,19 @@ class _NonRelationalDbDecoder(option_decoders.TypeVerifier):
     non_relational_db_config = super().Decode(
         value, component_full_name, flag_values
     )
+    _LoadProvider(non_relational_db_config, flag_values)
+
+    service_type = None
     if 'service_type' in non_relational_db_config:
-      db_spec_class = non_relational_db.GetNonRelationalDbSpecClass(
-          non_relational_db_config['service_type']
-      )
-    else:
+      service_type = non_relational_db_config['service_type']
+    if flag_values['non_relational_db_service_type'].present:
+      service_type = flag_values.non_relational_db_service_type
+    if not service_type:
       raise errors.Config.InvalidValue(
           'Required attribute `service_type` missing from non_relational_db '
           'config.'
       )
+    db_spec_class = non_relational_db.GetNonRelationalDbSpecClass(service_type)
     return db_spec_class(
         self._GetOptionFullName(component_full_name),
         flag_values,
@@ -1468,6 +1508,10 @@ class BenchmarkConfigSpec(spec.BaseSpec):
         'ai_model': (_ManagedAiModelSpecDecoder, {'default': None}),
         'pinecone': (
             pinecone_resource_spec.PineconeResourcesDecoder,
+            {'default': None},
+        ),
+        'vvs': (
+            vvs_resource_spec.VVSResourcesDecoder,
             {'default': None},
         ),
         'data_discovery_service': (

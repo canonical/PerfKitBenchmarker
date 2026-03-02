@@ -29,12 +29,12 @@ for you.
 import abc
 import collections
 import copy
-import json
+import io
 import logging
 import os
-import pipes
 import posixpath
 import re
+import shlex
 import threading
 import time
 import uuid
@@ -43,10 +43,20 @@ from typing import Any, Dict, Optional, Set, Tuple, Union
 import yaml
 from absl import flags
 from packaging import version as packaging_version
+import pandas as pd
+from perfkitbenchmarker import background_tasks
+from perfkitbenchmarker import disk
+from perfkitbenchmarker import errors
+from perfkitbenchmarker import flags as pkb_flags
+from perfkitbenchmarker import linux_packages
+from perfkitbenchmarker import log_util
+from perfkitbenchmarker import os_mixin
+from perfkitbenchmarker import os_types
+from perfkitbenchmarker import regex_util
+from perfkitbenchmarker import sample
+from perfkitbenchmarker import virtual_machine
+from perfkitbenchmarker import vm_util
 
-from perfkitbenchmarker import (background_tasks, disk, errors, linux_packages,
-                                os_mixin, os_types, regex_util, sample,
-                                virtual_machine, vm_util)
 
 FLAGS = flags.FLAGS
 
@@ -160,7 +170,10 @@ flags.DEFINE_bool(
 )
 
 flags.DEFINE_integer(
-    'ssh_retries', 10, 'Default number of times to retry SSH.', lower_bound=0
+    'ssh_retries',
+    10,
+    'Default number of times to retry transient failures on SSH/SCP commands.',
+    lower_bound=1,
 )
 
 flags.DEFINE_integer(
@@ -274,6 +287,14 @@ _ENABLE_NVME_INTERRUPT_COALEASING = flags.DEFINE_bool(
     'modify the interrupt coaleasing behavior.',
 )
 
+_ENABLE_RT_KERNEL = flags.DEFINE_bool(
+    'enable_rt_kernel',
+    False,
+    'Attempt to install and enable the real time kernel on '
+    'the VM.'
+    'Currently only implemented for RockyLinux.',
+)
+
 
 # RHEL package managers
 YUM = 'yum'
@@ -285,6 +306,42 @@ RETRYABLE_SSH_RETCODE = 255
 # the stack level. Can remove after python 11; see:
 # https://bugs.python.org/issue45171
 logger = logging.getLogger()
+
+
+def ParseRangeList(csv_list: str) -> set[int]:
+  """Parses a comma separated list of numbers and/or ranges into a set of ints.
+
+  Args:
+    csv_list: The CSV list to parse.
+
+  Returns:
+    A set of integers.
+  """
+  if not csv_list:
+    return set()
+
+  answer: set[int] = set()
+  if ',' in csv_list:
+    items_to_convert = csv_list.split(',')
+  else:
+    items_to_convert = [csv_list]
+
+  for item_value in items_to_convert:
+    if '-' not in item_value:
+      answer.add(int(item_value))
+      continue
+
+    lhs, rhs = item_value.split('-')
+    try:
+      lhs = int(lhs)
+      rhs = int(rhs)
+    except ValueError as exc:
+      raise ValueError(f'Invalid range: [{item_value}]') from exc
+    if lhs > rhs:
+      raise ValueError(f'Invalid range found while parsing: [{lhs}-{rhs}]')
+    answer.update(range(lhs, rhs + 1))
+
+  return answer
 
 
 class CpuVulnerabilities:
@@ -603,7 +660,7 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
                      '--stderr', stderr_file,
                      '--status', status_file,
                      '--exclusive', exclusive_file,
-                     '--command', pipes.quote(command)]  # pyformat: disable
+                     '--command', shlex.quote(command)]  # pyformat: disable
     if timeout:
       start_command.extend(['--timeout', str(timeout)])
 
@@ -711,6 +768,8 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
       self.SetupPackageManager()
     self.SetFiles()
     self.DoSysctls()
+    if _ENABLE_RT_KERNEL.value:
+      self._EnableRealTimeKernel()
     self._DoAppendKernelCommandLine()
     self.ModifyKernelModules()
     self.DoConfigureNetworkForBBR()
@@ -737,6 +796,12 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
     """Stops the VM."""
     raise NotImplementedError()
 
+  def _EnableRealTimeKernel(self):
+    """Enables real-time kernel features on the VM."""
+    raise NotImplementedError(
+        f'Real-time kernel not supported for {self.OS_TYPE}'
+    )
+
   def SetFiles(self):
     """Apply --set_files to the VM."""
 
@@ -758,10 +823,9 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
 
     if self.num_disable_cpus <= 0 or self.num_disable_cpus >= self.num_cpus:
       raise ValueError(
-          'num_disable_cpus must be between 1 and '
-          '(num_cpus - 1) inclusive.  '
-          'num_disable_cpus: %i, num_cpus: %i'
-          % (self.num_disable_cpus, self.num_cpus)
+          'num_disable_cpus must be between 1 and (num_cpus - 1) inclusive.  '
+          f'num_disable_cpus: {self.num_disable_cpus}, '
+          f'num_cpus: {self.num_cpus}'
       )
 
     # We can't disable cpu 0, starting from the last cpu in /proc/cpuinfo.
@@ -1145,11 +1209,13 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
     self.os_metadata['kernel_release'] = str(self.kernel_release)
     self.os_metadata['cpu_arch'] = self.cpu_arch
     self.os_metadata.update(self.partition_table)
+    self.os_metadata['kernel_command_line'] = self.kernel_command_line
     if FLAGS.append_kernel_command_line:
-      self.os_metadata['kernel_command_line'] = self.kernel_command_line
       self.os_metadata['append_kernel_command_line'] = (
           FLAGS.append_kernel_command_line
       )
+    if _ENABLE_RT_KERNEL.value:
+      self.os_metadata['enable_rt_kernel'] = True
     # TODO(pclay): consider publishing full lsmod as a sample. It's probably too
     # spammy for metadata
     if _KERNEL_MODULES_TO_ADD.value:
@@ -1297,6 +1363,9 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
     if disk.NFS == disk_type:
       mount_options = '-t nfs %s' % mount_options
       fs_type = 'nfs'
+    elif disk.LUSTRE == disk_type:
+      mount_options = '-t lustre %s' % mount_options
+      fs_type = 'lustre'
     elif disk.SMB == disk_type:
       mount_options = '-t cifs %s' % mount_options
       fs_type = 'smb'
@@ -1353,10 +1422,10 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
     remote_ip = '[%s]' % self.GetConnectionIp()
     remote_location = '%s@%s:%s' % (self.user_name, remote_ip, remote_path)
     scp_cmd = ['scp', '-P', str(self.ssh_port), '-pr']
-    # An scp is not retried, so increase the connection timeout.
     ssh_private_key = (
         self.ssh_private_key if self.is_static else vm_util.GetPrivateKeyPath()
     )
+    # Allow increasing the connection timeout since it can be useful.
     scp_cmd.extend(
         vm_util.GetSshOptions(
             ssh_private_key, connect_timeout=FLAGS.scp_connect_timeout
@@ -1371,12 +1440,35 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
       simplified_cmd.extend([remote_location, file_path])
       scp_cmd.extend([remote_location, file_path])
 
-    logging.info(
+    log_util.LogToShortLogAndRoot(
         'Copying file with simplified command: %s', ' '.join(simplified_cmd)
     )
-    stdout, stderr, retcode = vm_util.IssueCommand(
-        scp_cmd, timeout=None, should_pre_log=False, raise_on_failure=False
-    )
+
+    stdout, stderr, retcode = '', '', 1  # placate uninitialized variable checks
+    for _ in range(FLAGS.ssh_retries):
+      stdout, stderr, retcode = vm_util.IssueCommand(
+          scp_cmd,
+          timeout=None,
+          should_pre_log=False,
+          raise_on_failure=False,
+          log_to_short_log=False,
+      )
+
+      # Retry on 255 because this indicates an SSH failure
+      if retcode != RETRYABLE_SSH_RETCODE:
+        break
+
+      # Recursive scp is generally not idempotent so retrying is not perfectly
+      # safe. However, if the copy target (ie. remote_path if copy_to is True)
+      # does not include a matching dirname as the source, then the scp _is_
+      # idempotent. Callers should try to set the copy target accordingly to
+      # avoid this pitfall.
+      #
+      # For example, `scp -r /tmp/foo_dir perfkit@host:some_dir/foo_dir` is NOT
+      # idempotent but `scp -r /tmp/foo_dir perfkit@host:some_dir` is.
+      #
+      # See:
+      # https://www.tsmean.com/articles/command-line-tools/scp-and-idempotency/
 
     if retcode:
       full_cmd = ' '.join(scp_cmd)
@@ -1450,7 +1542,7 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
     Raises:
       RemoteCommandError: If there was a problem establishing the connection.
     """
-    kwargs = _IncrementStackLevel(**kwargs)
+    kwargs = vm_util.IncrementStackLevel(**kwargs)
     return self.RemoteCommandWithReturnCode(*args, **kwargs)[:2]
 
   def RemoteCommandWithReturnCode(
@@ -1469,7 +1561,7 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
     Raises:
       RemoteCommandError: If there was a problem establishing the connection.
     """
-    kwargs = _IncrementStackLevel(**kwargs)
+    kwargs = vm_util.IncrementStackLevel(**kwargs)
     return self.RemoteHostCommandWithReturnCode(*args, **kwargs)
 
   def RemoteHostCommandWithReturnCode(
@@ -1478,10 +1570,12 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
       retries: int | None = None,
       ignore_failure: bool = False,
       login_shell: bool = False,
+      disable_tty_lock: bool = False,
       timeout: float | None = None,
       ip_address: str | None = None,
       should_pre_log: bool = True,
       stack_level: int = 1,
+      suppress_logging: bool = False,
   ) -> Tuple[str, str, int]:
     """Runs a command on the VM.
 
@@ -1495,12 +1589,16 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
         the flag ssh_retries.
       ignore_failure: Ignore any failure if set to true.
       login_shell: Run command in a login shell.
+      disable_tty_lock: Disables TTY lock. Multiple commands will try to take
+        control of the terminal.
       timeout: The timeout for IssueCommand.
       ip_address: The ip address to use to connect to host.  If None, uses
         self.GetConnectionIp()
       should_pre_log: Whether to output a "Running command" log statement.
       stack_level: Number of stack frames to skip & get an "interesting" caller,
         for logging. 1 skips this function, 2 skips this & its caller, etc..
+      suppress_logging: A boolean indicated whether STDOUT and STDERR should be
+        suppressed. Used for sensitive information.
 
     Returns:
       A tuple of stdout, stderr, return_code from running the command.
@@ -1537,16 +1635,14 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
       ]
 
     if should_pre_log:
-      logger.info(
-          'Running on %s via ssh: %s',
-          self.name,
-          command,
-          stacklevel=stack_level,
-      )
+      log_message = f'Running on {self.name} via ssh: {command}'
+      log_util.LogToShortLogAndRoot(log_message, stacklevel=stack_level)
+    stdout, stderr, retcode = '', '', 1  # placate uninitialized variable checks
     try:
       if login_shell:
         ssh_cmd.extend(['-t', '-t', 'bash -l -c "%s"' % command])
-        self._pseudo_tty_lock.acquire()
+        if not disable_tty_lock:
+          self._pseudo_tty_lock.acquire()
       else:
         ssh_cmd.append(command)
 
@@ -1556,13 +1652,15 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
             timeout=timeout,
             should_pre_log=False,
             raise_on_failure=False,
+            suppress_logging=suppress_logging,
             stack_level=stack_level,
+            log_to_short_log=False,
         )
         # Retry on 255 because this indicates an SSH failure
         if retcode != RETRYABLE_SSH_RETCODE:
           break
     finally:
-      if login_shell:
+      if login_shell and not disable_tty_lock:
         self._pseudo_tty_lock.release()
 
     if retcode:
@@ -1594,7 +1692,7 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
     Raises:
       RemoteCommandError: If there was a problem establishing the connection.
     """
-    kwargs = _IncrementStackLevel(**kwargs)
+    kwargs = vm_util.IncrementStackLevel(**kwargs)
     return self.RemoteHostCommandWithReturnCode(*args, **kwargs)[:2]
 
   def _CheckRebootability(self):
@@ -1618,6 +1716,8 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
     self._kernel_release = None
     self._kernel_command_line = None
     self._lscpu_cache = None
+    # recalculated in RecordAdditionalMetadata
+    self.num_cpus = None
     self.RecordAdditionalMetadata()
     if self.install_packages:
       self._CreateInstallDir()
@@ -1727,41 +1827,6 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
     drop_caches_command = 'sudo /sbin/sysctl vm.drop_caches=3'
     self.RemoteCommand(drop_caches_command)
 
-  def _ParseNumCpus(self, cpu_list: str) -> int:
-    """Parses the cpu list string and returns the number of CPUs.
-
-    Args:
-      cpu_list: The CPU list string, e.g. 1-2,4-5
-
-    Returns:
-      The number of logical CPUs.
-      For the example with input '1-2,4-5', it returns 4.
-    """
-    if ',' in cpu_list:
-      num_cpus = 0
-      for sub_cpu_list in cpu_list.split(','):
-        num_cpus += self._ParseNumCpus(sub_cpu_list)
-      return num_cpus
-
-    if '-' in cpu_list:
-      lhs, rhs = cpu_list.split('-')
-      try:
-        lhs = int(lhs)
-        rhs = int(rhs)
-      except ValueError as exc:
-        raise ValueError(f'Invalid CPU range: [{cpu_list}]') from exc
-      if lhs > rhs:
-        raise ValueError(f'Invalid range found while parsing: [{lhs}-{rhs}]')
-
-      return rhs - lhs + 1
-
-    try:
-      int(cpu_list)
-    except ValueError as exc:
-      raise ValueError(f'Invalid cpu specified: [{cpu_list}]') from exc
-
-    return 1
-
   def _RemoteFileExists(self, file_path: str) -> bool:
     """Returns true if the file exists on the VM."""
     stdout, _ = self.RemoteCommand(
@@ -1769,57 +1834,56 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
     )
     return not stdout
 
-  def _GetNumCpusFromMultiFiles(self):
-    """Extracts the number of logical CPUs from multiple files.
+  def GetCpusAllowedSet(self) -> set[int]:
+    r"""Returns the list of CPUs allowed for the current process.
 
-    Extracts the number of CPUs from /sys/fs/cgroup/cpuset.cpus.effective,
-    /dev/cgroup/cpuset.cpus.effective, /proc/self/status, or /proc/cpuinfo.
+    Processes the output of the following files in order:
+    1. /sys/fs/cgroup/cpuset.cpus.effective
+    2. /proc/self/status
+    3. /proc/cpuinfo
+
     Below are the example of their returns:
     $ cat XX/cpuset.cpus.effective :
           0-23
-    $ cat /proc/self/status | grep Cpus_allowed_list :
-          Cpus_allowed_list:    0-23
-    $ cat /proc/cpuinfo | grep processor | wc -l :
-          24
+    $ cat /proc/self/status | grep Cpus_allowed_list |cut -d: -f2
+          0-23
+    $ cat /proc/cpuinfo |sed -e 's/[[:blank:]]*//g' | grep ^processor
+      | cut -d: -f2 |tr '\n' ','
+      0,1,2,3
 
     Returns:
-      The number of logical CPUs.
+      A set of CPUs allowed for the current process.
     """
-
     if self._RemoteFileExists('/sys/fs/cgroup/cpuset.cpus.effective'):
       stdout, _ = self.RemoteCommand('cat /sys/fs/cgroup/cpuset.cpus.effective')
-      return self._ParseNumCpus(stdout)
     elif self._RemoteFileExists('/proc/self/status'):
       stdout, _ = self.RemoteCommand(
-          'cat /proc/self/status | grep Cpus_allowed_list'
+          'cat /proc/self/status | grep Cpus_allowed_list |cut -d: -f2'
       )
-      return self._ParseNumCpus(stdout.split(':\t')[-1])
     elif self._RemoteFileExists('/proc/cpuinfo'):
-      stdout, _ = self.RemoteCommand(
-          'cat /proc/cpuinfo | grep processor | wc -l'
+      cmd = 'cat /proc/cpuinfo '
+      cmd += r"| sed -n 's/processor\s*\:\s*\([0-9]*\)/\1/p'"
+      cmd += '| paste -sd,'
+      stdout, _ = self.RemoteCommand(cmd)
+    else:
+      raise ValueError(
+          'GetCpusAllowedSet failed, cannot read'
+          ' /sys/fs/cgroup/cpuset.cpus.effective, /proc/self/status, or'
+          ' /proc/cpuinfo.'
       )
-      try:
-        int(stdout)
-      except ValueError as exc:
-        raise ValueError(f'Invalid cpu specified: [{stdout}]') from exc
-      return int(stdout)
 
-    raise ValueError(
-        '_GetNumCpus failed, '
-        'cannot read /sys/fs/cgroup/cpuset.cpus.effective, '
-        '/dev/cgroup/cpuset.cpus.effective, /proc/self/status, /proc/cpuinfo.'
-    )
+    return ParseRangeList(stdout)
 
   def _GetNumCpus(self):
     """Returns the number of logical CPUs on the VM.
 
     If the flag `use_numcpu_multi_files` is true,
-    call _GetNumCpusFromMultiFiles function to get the number of CPUs.
+    call GetCpusAllowedSet function to help calculate the number of CPUs.
     Otherwise, extracts the value from `/proc/cpuinfo` file.
     This method does not cache results (unlike "num_cpus").
     """
     if FLAGS.use_numcpu_multi_files:
-      return self._GetNumCpusFromMultiFiles()
+      return len(self.GetCpusAllowedSet())
 
     stdout, _ = self.RemoteCommand('cat /proc/cpuinfo | grep processor | wc -l')
     return int(stdout)
@@ -2150,13 +2214,12 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
   def _IsSmtEnabled(self):
     """Whether simultaneous multithreading (SMT) is enabled on the vm.
 
-    Looks for the "nosmt" attribute in the booted linux kernel command line
-    parameters.
+    Checks if Thread(s) per Core is greater than 1.
 
     Returns:
       Whether SMT is enabled on the vm.
     """
-    return not bool(re.search(r'\bnosmt\b', self.kernel_command_line))
+    return self.CheckLsCpu().threads_per_core > 1
 
   @property
   def cpu_vulnerabilities(self) -> CpuVulnerabilities:
@@ -2185,41 +2248,27 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
     """Get the NVME disk device info, by querying the VM."""
     self.InstallPackages('nvme-cli')
     version_str, _ = self.RemoteCommand('sudo nvme --version')
-    version_num = version_str.split()[2]
-    # TODO(arushigaur): Version check can be removed and we can just parse
-    # the raw output.
-    if packaging_version.parse(version_num) >= packaging_version.parse(
-        '1.5'
-    ) and packaging_version.parse(version_num) < packaging_version.parse(
-        '2.11'
-    ):
-      stdout, _ = self.RemoteCommand('sudo nvme list --output-format json')
-      if not stdout:
-        return []
-      response = json.loads(stdout)
-      return response.get('Devices', [])
-    else:
-      # custom parsing for older OSes that do not ship nvme-cli ver 1.5+.
-      response = []
-      stdout, _ = self.RemoteCommand('sudo nvme list')
-      if 'No NVMe devices detected' in stdout:
-        return []
-      rows = stdout.splitlines()
-      delimiter_row = rows[1]  # row 0 is the column headers
-      delimiter_index = [0] + [
-          i for i in range(len(delimiter_row)) if delimiter_row[i] == ' '
-      ]
-      for row in rows[2:]:
-        device = {}
-        device_info = [
-            row[i:j]
-            for i, j in zip(delimiter_index, delimiter_index[1:] + [None])
-        ]
-        device['DevicePath'] = device_info[0].strip()
-        device['SerialNumber'] = device_info[1].strip()
-        device['ModelNumber'] = device_info[2].strip()
-        response.append(device)
-      return response
+    logging.info('nvme-cli version: %s', version_str.split()[2])
+    response = []
+    stdout, _ = self.RemoteCommand('sudo nvme list')
+    if 'No NVMe devices detected' in stdout:
+      return []
+    rows = stdout.splitlines()
+    header_row = rows[0]
+    delimiter_row = rows[1]
+    col_spans = [
+        (m.start(), m.end()) for m in re.finditer(r'-+', delimiter_row)
+    ]
+    data = '\n'.join([header_row] + rows[2:])
+    df_colspecs = pd.read_fwf(io.StringIO(data), colspecs=col_spans)
+    df_rows = df_colspecs.to_dict(orient='records')
+    for row in df_rows:
+      response.append({
+          'DevicePath': row.get('Node'),
+          'SerialNumber': row.get('SN'),
+          'ModelNumber': row.get('Model'),
+      })
+    return response
 
   def GenerateAndCaptureLogs(self) -> list[str]:
     """Generates and/or captures logs for this VM and returns the paths.
@@ -2229,7 +2278,6 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
 
     Returns:
       A list of paths where the logs are stored on the caller's machine.
-
     """
     log_files = []
     # syslog
@@ -2255,6 +2303,8 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
     serial_port_1_path = vm_util.PrependTempDir('serial_port_1')
     if self.GenerateAndCaptureSerialPortOutput(serial_port_1_path):
       log_files.append(serial_port_1_path)
+    if pkb_flags.GENERATE_VM_CREATE_CMD_INFO_LOG.value:
+      log_files.append(self.GetCreateCmdInfoLogPath())
     return log_files
 
   def GenerateAndCaptureSosReport(self, local_path: str) -> bool:
@@ -2280,9 +2330,7 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
     sosreport_path = '/tmp/sosreport-*.tar.xz'
     # The report is owned by root and is not readable by other users, so we
     # need to change the permissions to copy it.
-    self.RemoteCommand(
-        f'sudo chmod o+r {sosreport_path}'
-    )
+    self.RemoteCommand(f'sudo chmod o+r {sosreport_path}')
     self.RemoteCopy(local_path, sosreport_path, copy_to=False)
     return True
 
@@ -2304,16 +2352,135 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
     )
     return False
 
+  def GetCreateCmdInfoLogPath(self) -> str:
+    """Writes the create cmd info log to a temp file and returns the path."""
+    logging.warning(
+        'Create command info log capture is not implemented for this VM.'
+    )
+    return ''
 
-def _IncrementStackLevel(**kwargs: Any) -> Any:
-  """Increments the stack_level variable stored in kwargs."""
-  if 'stack_level' in kwargs:
-    kwargs['stack_level'] += 1
-  else:
-    # Default to 2 - one for helper function this is called from, & one for
-    # RemoteHostCommandWithReturnCode.
-    kwargs['stack_level'] = 2
-  return kwargs
+  def CopyLogs(self, log_path: str):
+    """Copies logs from the given path on the VM to the scratch directory.
+
+    If the provided path is a directory, all files within that directory are
+    copied. If the path is a file, only that file is copied.
+
+    Log paths are converted to snake_case and .log extension is added if it is
+    missing. And VM name is prepended to the file name to distinguish between
+    multiple VMs.
+
+    Example (Directory):
+    VM: pkb-123456-0
+    Log path: /var/log/syslog
+
+    Copied file: /tmp/perkitbenchmarker/123456/pkb-123456-0__var_log_syslog.log
+
+    Example (File):
+    VM: pkb-123456-0
+    Log path: /etc/mongod.conf
+
+    Copied file: /tmp/perkitbenchmarker/123456/pkb-123456-0__etc_mongod.conf.log
+
+    Args:
+      log_path: The directory or file path on the VM to copy the logs from.
+    """
+
+    def GetTargeFilePath(remote_file: str) -> str:
+      """Build the target file path for a given remote file."""
+      # Join absolute path of the log file to preserve the directory
+      # structure.
+      target_file_name = f'{self.name}_{remote_file.replace("/", "_")}'
+      target_file_path = os.path.join(vm_util.GetTempDir(), target_file_name)
+      # Add .log extension if it is missing since Artemis only copied logs
+      # with this extension.
+      if not target_file_path.endswith('.log'):
+        target_file_path += '.log'
+      return target_file_path
+
+    files_to_copy = []
+    # First, check if the path is a directory.
+    _, _, is_dir_code = self.RemoteCommandWithReturnCode(
+        f'[[ -d "{log_path}" ]]', ignore_failure=True
+    )
+    if is_dir_code == 0:
+      # Path is a directory, find all files within it.
+      try:
+        stdout, stderr = self.RemoteCommand(f'sudo find {log_path} -type f')
+        if not stdout:
+          logging.warning(
+              'No files found in directory %s: %s', log_path, stderr
+          )
+          return
+        files_to_copy = [rf.strip() for rf in stdout.splitlines()]
+      except errors.VirtualMachine.RemoteCommandError as e:
+        logging.warning('Failed to find logs in directory %s: %s', log_path, e)
+        return
+    else:
+      # Path is not a directory, check if it is a file.
+      _, _, is_file_code = self.RemoteCommandWithReturnCode(
+          f'[[ -f "{log_path}" ]]', ignore_failure=True
+      )
+      if is_file_code == 0:
+        # Path is a single file.
+        files_to_copy = [log_path]
+      else:
+        # Path does not exist or is not a regular file or directory.
+        logging.warning(
+            'Log path %s does not exist or is not a regular file or '
+            'directory on VM %s. Skipping log copying for this path.',
+            log_path,
+            self.name,
+        )
+        return
+
+    for remote_file in files_to_copy:
+      try:
+        # Build the target file path for a given remote file.
+        target_file_path = GetTargeFilePath(remote_file)
+        # Pull the file from the VM to target_file_path. Note that vm.PullFile
+        # does not use sudo.
+        self.PullFile(target_file_path, remote_file)
+      except errors.VirtualMachine.RemoteCommandError as scp_error:
+        logging.warning(
+            'Error copying log file %s from vm %s: %s',
+            remote_file,
+            self.name,
+            scp_error,
+        )
+
+        # Define a sudo cat remote command to read the file with elevated
+        # privileges.
+        sudo_cat_command = f'sudo cat {remote_file}'
+        try:
+          # Execute the command and capture the stdout, which is the content of
+          # the remote log file.
+          log_contents, _ = self.RemoteCommand(
+              sudo_cat_command, suppress_logging=True
+          )
+          # Build the target file path for a given remote file.
+          target_file_path = GetTargeFilePath(remote_file)
+          # Write the captured stdout to target_file_path.
+          with open(target_file_path, 'w') as target_file:
+            target_file.write(log_contents)
+          logging.info(
+              'Successfully copied remote file %s from vm %s with sudo cat'
+              ' to %s',
+              remote_file,
+              self.name,
+              target_file_path,
+          )
+        except errors.VirtualMachine.RemoteCommandError as ssh_sudo_cat_error:
+          logging.warning(
+              'Error copying log file %s from vm %s with sudo cat: %s',
+              remote_file,
+              self.name,
+              ssh_sudo_cat_error,
+          )
+
+        # We attempt to copy all given log files. However, it's possible that
+        # copying some files might fail. Failures in copying such log files
+        # should not block further log files from being copied.
+        pass
 
 
 class ClearMixin(BaseLinuxMixin):
@@ -2495,8 +2662,8 @@ class BaseContainerLinuxMixin(BaseLinuxMixin):
     pass
 
 
-class BaseRhelMixin(BaseLinuxMixin):
-  """Class holding RHEL/CentOS specific VM methods and attributes."""
+class BaseRedHatMixin(BaseLinuxMixin):
+  """Class representing OSes derived from Red Hat Linux that use yum or dnf."""
 
   # In all RHEL 8+ based distros yum is an alias to dnf.
   # dnf is backwards compatible with yum, but has some additional capabilities
@@ -2505,8 +2672,7 @@ class BaseRhelMixin(BaseLinuxMixin):
   # This can be removed when Amazon Linux 2 is no longer supported by PKB.
   PACKAGE_MANAGER = DNF
 
-  # OS_TYPE = os_types.RHEL
-  BASE_OS_TYPE = os_types.RHEL
+  BASE_OS_TYPE = os_types.RED_HAT
 
   # RHEL's command to create a initramfs image.
   INIT_RAM_FS_CMD = 'sudo dracut --regenerate-all -f'
@@ -2646,17 +2812,25 @@ class BaseRhelMixin(BaseLinuxMixin):
         r'echo GRUB_CMDLINE_LINUX_DEFAULT=\"\${GRUB_CMDLINE_LINUX_DEFAULT} %s\"'
         ' | sudo tee -a /etc/default/grub' % command_line
     )
-    self.RemoteCommand('sudo grub2-mkconfig -o /boot/grub2/grub.cfg')
-    self.RemoteCommand('sudo grub2-mkconfig -o /etc/grub2.cfg')
+    # RHEL 9.3+ requires a flag to update the kernel command line.
+    # It does not exist in older versions.
+    # https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/9/html/9.3_release_notes/new-features#new-features-boot-loader
+    update_grub = 'sudo grub2-mkconfig'
+    if self.TryRemoteCommand(f'{update_grub} --update-bls-cmdline'):
+      update_grub += ' --update-bls-cmdline'
+    self.RemoteCommand(f'{update_grub} -o /boot/grub2/grub.cfg')
+    self.RemoteCommand(f'{update_grub} -o /etc/grub2.cfg')
     if reboot:
       self.Reboot()
 
 
-class AmazonLinux2Mixin(BaseRhelMixin):
+class AmazonLinux2Mixin(BaseRedHatMixin, os_mixin.DeprecatedOsMixin):
   """Class holding Amazon Linux 2 VM methods and attributes."""
 
   OS_TYPE = os_types.AMAZONLINUX2
   PACKAGE_MANAGER = YUM
+  ALTERNATIVE_OS = os_types.AMAZONLINUX2023
+  END_OF_LIFE = '2026-07-01'
 
   def SetupPackageManager(self):
     """Install EPEL."""
@@ -2670,7 +2844,7 @@ class AmazonNeuronMixin(AmazonLinux2Mixin):
   OS_TYPE = os_types.AMAZON_NEURON
 
 
-class AmazonLinux2023Mixin(BaseRhelMixin):
+class AmazonLinux2023Mixin(BaseRedHatMixin):
   """Class holding Amazon Linux 2023 VM methods and attributes."""
 
   OS_TYPE = os_types.AMAZONLINUX2023
@@ -2678,7 +2852,7 @@ class AmazonLinux2023Mixin(BaseRhelMixin):
   # https://docs.aws.amazon.com/linux/al2023/ug/compare-with-al2.html#epel
 
 
-class Rhel8Mixin(BaseRhelMixin):
+class Rhel8Mixin(BaseRedHatMixin):
   """Class holding RHEL 8 specific VM methods and attributes."""
 
   OS_TYPE = os_types.RHEL8
@@ -2689,7 +2863,7 @@ class Rhel8Mixin(BaseRhelMixin):
     self.RemoteCommand(f'sudo dnf install -y {_EPEL_URL.format(8)}')
 
 
-class Rhel9Mixin(BaseRhelMixin):
+class Rhel9Mixin(BaseRedHatMixin):
   """Class holding RHEL 9 specific VM methods and attributes."""
 
   OS_TYPE = os_types.RHEL9
@@ -2700,7 +2874,36 @@ class Rhel9Mixin(BaseRhelMixin):
     self.RemoteCommand(f'sudo dnf install -y {_EPEL_URL.format(9)}')
 
 
-class Fedora36Mixin(BaseRhelMixin):
+class Rhel10Mixin(BaseRedHatMixin):
+  """Class holding RHEL 10 specific VM methods and attributes."""
+
+  OS_TYPE = os_types.RHEL10
+
+  def SetupPackageManager(self):
+    """Install EPEL."""
+    # https://docs.fedoraproject.org/en-US/epel/#_rhel_10
+    self.RemoteCommand(f'sudo dnf install -y {_EPEL_URL.format(10)}')
+
+
+class Ol8Mixin(BaseRedHatMixin):
+  """Class holding Oracle Linux 8 specific VM methods and attributes."""
+
+  OS_TYPE = os_types.OL8
+
+  def SetupPackageManager(self):
+    """Oracle Linux images come with EPEL pre-installed."""
+
+
+class Ol9Mixin(BaseRedHatMixin):
+  """Class holding Oracle Linux 9 specific VM methods and attributes."""
+
+  OS_TYPE = os_types.OL9
+
+  def SetupPackageManager(self):
+    """Oracle Linux images come with EPEL pre-installed."""
+
+
+class Fedora36Mixin(BaseRedHatMixin):
   """Class holding Fedora36 specific methods and attributes."""
 
   OS_TYPE = os_types.FEDORA36
@@ -2709,7 +2912,7 @@ class Fedora36Mixin(BaseRhelMixin):
     """Fedora does not need epel."""
 
 
-class Fedora37Mixin(BaseRhelMixin):
+class Fedora37Mixin(BaseRedHatMixin):
   """Class holding Fedora37 specific methods and attributes."""
 
   OS_TYPE = os_types.FEDORA37
@@ -2718,7 +2921,7 @@ class Fedora37Mixin(BaseRhelMixin):
     """Fedora does not need epel."""
 
 
-class CentOsStream9Mixin(BaseRhelMixin):
+class CentOsStream9Mixin(BaseRedHatMixin):
   """Class holding CentOS Stream 9 specific VM methods and attributes."""
 
   OS_TYPE = os_types.CENTOS_STREAM9
@@ -2732,32 +2935,50 @@ class CentOsStream9Mixin(BaseRhelMixin):
     )
 
 
-class RockyLinux8Mixin(BaseRhelMixin):
+class BaseRockyLinuxMixin(BaseRedHatMixin):
+  """Class holding Rocky Linux specific VM methods and attributes."""
+
+  def _EnableRealTimeKernel(self):
+    self.RemoteCommand(
+        'sudo dnf config-manager --set-enabled rt && '
+        'sudo dnf install -y kernel-rt && '
+        'sudo grubby --set-default /boot/vmlinuz*+rt'
+    )
+    self._needs_reboot = True
+
+  def SetupPackageManager(self):
+    """Install EPEL."""
+    # https://docs.fedoraproject.org/en-US/epel/getting-started/
+    self.RemoteCommand(
+        'sudo dnf config-manager --set-enabled crb &&'
+        'sudo dnf install -y epel-release'
+    )
+
+
+class RockyLinux8Mixin(BaseRockyLinuxMixin):
   """Class holding Rocky Linux 8 specific VM methods and attributes."""
 
   OS_TYPE = os_types.ROCKY_LINUX8
 
   def SetupPackageManager(self):
     """Install EPEL."""
-    # https://docs.fedoraproject.org/en-US/epel/#_almalinux_8_rocky_linux_8
+    # https://docs.fedoraproject.org/en-US/epel/getting-started/
     self.RemoteCommand(
         'sudo dnf config-manager --set-enabled powertools && '
         'sudo dnf install -y epel-release'
     )
 
 
-class RockyLinux9Mixin(BaseRhelMixin):
+class RockyLinux9Mixin(BaseRockyLinuxMixin):
   """Class holding Rocky Linux 8 specific VM methods and attributes."""
 
   OS_TYPE = os_types.ROCKY_LINUX9
 
-  def SetupPackageManager(self):
-    """Install EPEL."""
-    # https://docs.fedoraproject.org/en-US/epel/#_almalinux_9_rocky_linux_98
-    self.RemoteCommand(
-        'sudo dnf config-manager --set-enabled crb &&'
-        'sudo dnf install -y epel-release'
-    )
+
+class RockyLinux10Mixin(BaseRockyLinuxMixin):
+  """Class holding Rocky Linux 10 specific VM methods and attributes."""
+
+  OS_TYPE = os_types.ROCKY_LINUX10
 
 
 class CoreOsMixin(BaseContainerLinuxMixin):
@@ -2984,6 +3205,18 @@ class Debian12Mixin(BaseDebianMixin):
     super().PrepareVMEnvironment()
 
 
+class Debian13Mixin(BaseDebianMixin):
+  """Class holding Debian 13 specific VM methods and attributes."""
+
+  OS_TYPE = os_types.DEBIAN13
+
+  def PrepareVMEnvironment(self):
+    # Missing in some images. Required by PrepareVMEnvironment to determine
+    # partitioning.
+    self.InstallPackages('fdisk')
+    super().PrepareVMEnvironment()
+
+
 class Debian11BackportsMixin(Debian11Mixin):
   """Debian 11 with backported kernel."""
 
@@ -3005,10 +3238,12 @@ class BaseUbuntuMixin(BaseDebianMixin):
       self.Reboot()
 
 
-class Ubuntu2004Mixin(BaseUbuntuMixin):
+class Ubuntu2004Mixin(BaseUbuntuMixin, os_mixin.DeprecatedOsMixin):
   """Class holding Ubuntu2004 specific VM methods and attributes."""
 
   OS_TYPE = os_types.UBUNTU2004
+  ALTERNATIVE_OS = os_types.UBUNTU2204
+  END_OF_LIFE = '2025-04-01'
 
   def UpdateEnvironmentPath(self):
     """Add /snap/bin to default search path for Ubuntu2004.
@@ -3292,7 +3527,7 @@ def CreateUlimitSamples(
   return samples
 
 
-class UlimitResults():
+class UlimitResults:
   """Holds the contents of the command ulimit."""
 
   def __init__(self, ulimit: str):

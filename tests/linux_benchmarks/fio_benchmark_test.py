@@ -21,7 +21,7 @@ import mock
 from perfkitbenchmarker import temp_dir
 from perfkitbenchmarker import units
 from perfkitbenchmarker import vm_util
-from perfkitbenchmarker.linux_benchmarks import fio_benchmark
+from perfkitbenchmarker.linux_benchmarks.fio import fio_benchmark
 from perfkitbenchmarker.linux_packages import numactl
 from tests import pkb_common_test_case
 
@@ -47,6 +47,7 @@ filename=/test/filename
 do_verify=0
 verify_fatal=0
 group_reporting=1
+percentile_list=1:5:10:20:25:30:40:50:60:70:75:80:90:95:99:99.5:99.9:99.95:99.99
 randrepeat=0
 offset_increment=1k
 
@@ -97,6 +98,7 @@ filename=/test/filename
 do_verify=0
 verify_fatal=0
 group_reporting=1
+percentile_list=1:5:10:20:25:30:40:50:60:70:75:80:90:95:99:99.5:99.9:99.95:99.99
 
 [sequential_write-io-depth-1-num-jobs-1]
 stonewall
@@ -185,6 +187,7 @@ filename=/test/filename
 do_verify=0
 verify_fatal=0
 group_reporting=1
+percentile_list=1:5:10:20:25:30:40:50:60:70:75:80:90:95:99:99.5:99.9:99.95:99.99
 randrepeat=0
 
 [sequential_read-io-depth-1-num-jobs-1]
@@ -277,6 +280,7 @@ filename=/test/filename
 do_verify=0
 verify_fatal=0
 group_reporting=1
+percentile_list=1:5:10:20:25:30:40:50:60:70:75:80:90:95:99:99.5:99.9:99.95:99.99
 randrepeat=0
 
 [seq_64M_read_10TB-io-depth-1-num-jobs-1]
@@ -378,6 +382,7 @@ filename=/test/filename
 do_verify=0
 verify_fatal=0
 group_reporting=1
+percentile_list=1:5:10:20:25:30:40:50:60:70:75:80:90:95:99:99.5:99.9:99.95:99.99
 randrepeat=0
 
 [seq_64M_read_10TB-io-depth-1-num-jobs-1]
@@ -431,6 +436,7 @@ filename=/test/filename
 do_verify=0
 verify_fatal=0
 group_reporting=1
+percentile_list=1:5:10:20:25:30:40:50:60:70:75:80:90:95:99:99.5:99.9:99.95:99.99
 randrepeat=0
 
 [rand_8k_read_100%-io-depth-1-num-jobs-1.0]
@@ -502,6 +508,7 @@ filename=/test/filename
 do_verify=0
 verify_fatal=0
 group_reporting=1
+percentile_list=1:5:10:20:25:30:40:50:60:70:75:80:90:95:99:99.5:99.9:99.95:99.99
 randrepeat=0
 
 [rand_8k_read_100%-io-depth-1-num-jobs-1.0]
@@ -604,11 +611,11 @@ blocksize = 8k
     ), mock.patch(
         fio_name + '.fio.ParseResults'
     ), mock.patch(
-        fio_name + '.FLAGS'
+        fio_name + '.fio_flags'
     ) as mock_fio_flags, mock.patch.object(
         numactl, 'GetNuma', new=lambda vm: {'0': '0'}
     ):
-      mock_fio_flags.fio_target_mode = mode
+      mock_fio_flags.FIO_TARGET_MODE.value = mode
       benchmark_spec = mock.MagicMock()
       benchmark_spec.vms = [mock.MagicMock()]
       benchmark_spec.vms[0].RobustRemoteCommand = mock.MagicMock(

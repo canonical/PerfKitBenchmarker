@@ -393,6 +393,22 @@ class AzureVirtualNetwork(network.BaseNetwork):
       self.address_index += 1
       return next_address_space
 
+  def UpdateAddressSpace(self) -> None:
+    """Adds an address space to the virtual network."""
+    vm_util.IssueRetryableCommand(
+        [
+            azure.AZURE_PATH,
+            'network',
+            'vnet',
+            'update',
+            '--name',
+            self.name,
+            '--address-prefixes',
+        ]
+        + self.address_spaces
+        + self.resource_group.args
+    )
+
   def Create(self):
     """Creates the virtual network."""
     with self.vnet_lock:
@@ -450,7 +466,15 @@ class AzureVirtualNetwork(network.BaseNetwork):
 class AzureSubnet(resource.BaseResource):
   """Object representing an Azure Subnet."""
 
-  def __init__(self, vnet, name):
+  def __init__(self, vnet, name, delegations=None):
+    """Initializes AzureSubnet.
+
+    Args:
+      vnet: The AzureVirtualNetwork object.
+      name: The name of the subnet.
+      delegations: String of space-separated list of services to whom subnet is
+        delegated.
+    """
     super().__init__()
     if azure_flags.AZURE_SUBNET_ID.value:
       # use pre-existing subnet
@@ -466,6 +490,7 @@ class AzureSubnet(resource.BaseResource):
       self.resource_group = GetResourceGroup()
       self.vnet = vnet
       self.name = name
+      self.delegations = delegations
       self.args = ['--subnet', self.name]
 
       self.address_space = ''
@@ -475,7 +500,10 @@ class AzureSubnet(resource.BaseResource):
         self.vnet.address_spaces.append(self.address_space)
 
   def _Create(self):
-    vm_util.IssueCommand(
+    delegations = []
+    if self.delegations:
+      delegations = ['--delegations', self.delegations]
+    stdout, _, _ = vm_util.IssueCommand(
         [
             azure.AZURE_PATH,
             'network',
@@ -490,7 +518,9 @@ class AzureSubnet(resource.BaseResource):
             self.name,
         ]
         + self.resource_group.args
+        + delegations
     )
+    self.id = json.loads(stdout)['id']
 
   @vm_util.Retry()
   def _Exists(self):
@@ -714,8 +744,8 @@ class AzureFirewall(network.BaseFirewall):
       source_range: unsupported at present.
     """
 
-    if vm.network.nsg:
-      vm.network.nsg.AllowPort(
+    for nsg in vm.network.nsgs:
+      nsg.AllowPort(
           vm, start_port, end_port=end_port, source_range=source_range
       )
 
@@ -730,7 +760,8 @@ class AzureFirewall(network.BaseFirewall):
       vm: The BaseVirtualMachine object to open the ICMP protocol for.
     """
 
-    vm.network.nsg.AllowIcmp()
+    for nsg in vm.network.nsgs:
+      nsg.AllowIcmp()
 
 
 class AzureNetwork(network.BaseNetwork):
@@ -808,21 +839,28 @@ class AzureNetwork(network.BaseNetwork):
     # Length restriction from https://docs.microsoft.com/en-us/azure/azure-resource-manager/management/resource-name-rules#microsoftnetwork  pylint: disable=line-too-long
     prefix = '%s-%s' % (self.resource_group.name, self.region)
     vnet_name = prefix + '-vnet'
-    if len(vnet_name) > 64:
-      vnet_name = prefix[:59] + '-vnet'
+    if len(vnet_name) > 60:
+      vnet_name = prefix[:55] + '-vnet'
     self.vnet = AzureVirtualNetwork.GetForRegion(spec, self.region, vnet_name)
-    subnet_name = vnet_name
+    zone_suffix = ''
     if self.availability_zone:
-      subnet_name += '-' + self.availability_zone
-    subnet_name += '-subnet'
-    self.subnet = AzureSubnet(self.vnet, subnet_name)
-    if azure_flags.AZURE_SUBNET_ID.value:
+      zone_suffix = '-' + self.availability_zone
+    subnet_name_base = vnet_name + zone_suffix + '-subnet'
+    self.subnets = []
+    self.nsgs = []
+    # TODO(andytzhu) - query az vm list-skus to enforce upper bound.
+    for nic_num in range(azure_flags.AZURE_NIC_COUNT.value):
+      subnet_name = subnet_name_base + str(nic_num)
+      subnet = AzureSubnet(self.vnet, subnet_name)
+      self.subnets.append(subnet)
       # usage of an nsg is not currently supported with an existing subnet.
-      self.nsg = None
-    else:
-      self.nsg = AzureNetworkSecurityGroup(
-          self.region, self.subnet, self.subnet.name + '-nsg'
-      )
+      if not azure_flags.AZURE_SUBNET_ID.value:
+        nsg = AzureNetworkSecurityGroup(
+            self.region, subnet, subnet.name + '-nsg'
+        )
+        self.nsgs.append(nsg)
+    # TODO(andytzhu) - Replace self.subnet with self.subnets.
+    self.subnet = self.subnets[0]
 
   @vm_util.Retry(
       retryable_exceptions=(
@@ -847,11 +885,11 @@ class AzureNetwork(network.BaseNetwork):
 
     if self.vnet:
       self.vnet.Create()
-    if self.subnet:
-      self.subnet.Create()
-    if self.nsg:
-      self.nsg.Create()
-      self.nsg.AttachToSubnet()
+    for subnet in self.subnets:
+      subnet.Create()
+    for nsg in self.nsgs:
+      nsg.Create()
+      nsg.AttachToSubnet()
 
   def Delete(self):
     """Deletes the network."""

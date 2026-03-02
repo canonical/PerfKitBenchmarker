@@ -32,11 +32,17 @@ from perfkitbenchmarker import data
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import linux_packages
 from perfkitbenchmarker import regex_util
+from perfkitbenchmarker import vm_util
 import requests
 
 FLAGS = flags.FLAGS
 
-_VERSION = flags.DEFINE_string('hadoop_version', None, 'Version of Hadoop.')
+_VERSION = flags.DEFINE_string(
+    'hadoop_version',
+    '3.4.1',
+    'Version of Hadoop. Default is 3.4.1 to get around'
+    ' https://issues.apache.org/jira/projects/INFRA/issues/INFRA-27182.',
+)
 _URL_OVERRIDE = flags.DEFINE_string(
     'hadoop_bin_url', None, 'Specify to override url from HADOOP_URL_BASE.'
 )
@@ -46,6 +52,13 @@ _BLOCKSIZE_OVERRIDE = flags.DEFINE_integer(
     128,
     'Blocksize in MiB to be used by the HDFS filesystem. '
     'This is the chunksize in which the HDFS file will be divided into.',
+)
+
+_CLIENT_READAHEAD_OVERRIDE = flags.DEFINE_integer(
+    'hadoop_hdfs_client_readahead',
+    None,
+    'Client readahead in KiB to be used by the HDFS filesystem. '
+    'This is the readahead size in KiB for the HDFS client.',
 )
 
 _DFS_REPLICATION_OVERRIDE = flags.DEFINE_integer(
@@ -166,7 +179,9 @@ def CheckPrerequisites():
     data.ResourcePath(resource)
 
 
+@vm_util.Retry(poll_interval=10)
 def _Install(vm):
+  """Installs Hadoop on the VM."""
   # Not all benhmarks know they are installing Hadooop so re-validate here.
   CheckPrerequisites()
   vm.Install('openjdk')
@@ -175,7 +190,7 @@ def _Install(vm):
 
   vm.RemoteCommand(
       (
-          'mkdir {0} && curl -L {1} | tar -C {0} --strip-components=1 -xzf -'
+          'mkdir -p {0} && curl -L {1} | tar -C {0} --strip-components=1 -xzf -'
       ).format(HADOOP_DIR, hadoop_url)
   )
 
@@ -295,6 +310,7 @@ def _RenderConfig(
       'hadoop_namenode_opts': _HADOOP_NAMENODE_OPTS.value,
       'dfs_replication': _DFS_REPLICATION_OVERRIDE.value,
       'yarn_scheduler': _YARN_SCHEDULER.value,
+      'client_readahead': _CLIENT_READAHEAD_OVERRIDE.value,
   }
 
   for file_name in DATA_FILES:

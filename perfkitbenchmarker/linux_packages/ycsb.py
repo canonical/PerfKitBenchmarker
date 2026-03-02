@@ -51,6 +51,7 @@ from perfkitbenchmarker import data
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import events
 from perfkitbenchmarker import linux_packages
+from perfkitbenchmarker import log_util
 from perfkitbenchmarker import resource
 from perfkitbenchmarker import sample
 from perfkitbenchmarker import virtual_machine
@@ -291,6 +292,11 @@ flags.DEFINE_integer(
     0,
     'Sleep duration in seconds between load and run stage.',
 )
+YCSB_SLEEP_BETWEEN_THREAD_RUNS_SEC = flags.DEFINE_integer(
+    'ycsb_sleep_between_thread_runs_sec',
+    0,
+    'Sleep duration in seconds between runs with different thread counts.',
+)
 _BURST_LOAD_MULTIPLIER = flags.DEFINE_integer(
     'ycsb_burst_load',
     None,
@@ -318,22 +324,33 @@ _SHOULD_FAIL_ON_INCOMPLETE_LOADING = flags.DEFINE_boolean(
     'ycsb_fail_on_incomplete_loading',
     False,
     'Whether to fail the benchmarking if loading is not complete, '
-    'e.g., there are insert failures.',
+    'e.g., there are insert failures. Takes precedence over any "insert" value'
+    ' set in --ycsb_load_max_error_rates.',
 )
-_INCOMPLETE_LOADING_METRIC = flags.DEFINE_string(
-    'ycsb_insert_error_metric',
-    'insert Return=ERROR',
-    'Used with --ycsb_fail_on_incomplete_loading. Will fail the benchmark if '
-    "this metric's value is non-zero. This metric should be an indicator of "
-    'incomplete table loading. If insertion retries are enabled via '
-    'core_workload_insertion_retry_limit, then the default metric may be '
-    'non-zero even though the retried insertion eventually succeeded.',
+_LOAD_MAX_ERROR_RATES = flags.DEFINE_list(
+    'ycsb_load_max_error_rates',
+    [],
+    'Comma-separated list of "key=value" pairs, where the key is the operation'
+    ' name and the value is the error rate threshold during the load stage.'
+    ' A value of 1.0 will ignore all errors.'
+    ' insert=0.0 will be set if --ycsb_fail_on_incomplete_loading is true.'
+    ' Operations not specified will default to using --ycsb_max_error_rate.',
+)
+_RUN_MAX_ERROR_RATES = flags.DEFINE_list(
+    'ycsb_run_max_error_rates',
+    [],
+    'Comma-separated list of "key=value" pairs, where the key is the operation'
+    ' name and the value is the error rate threshold during the run stage.'
+    ' A value of 1.0 will ignore all errors.'
+    ' Operations not specified will default to using --ycsb_max_error_rate.',
 )
 _ERROR_RATE_THRESHOLD = flags.DEFINE_float(
     'ycsb_max_error_rate',
     1.00,
-    'The maximum error rate allowed for the run. '
-    'By default, this allows any number of errors.',
+    'The maximum error rate allowed for the run for any operation not'
+    ' specified in --ycsb_run_max_error_rates or '
+    '--ycsb_load_max_error_rates. '
+    'The default flag values allows any number of errors.',
 )
 
 # CPU optimization mode flags
@@ -595,6 +612,27 @@ def _GetRunParameters() -> dict[str, str]:
   return result
 
 
+def _GetLoadPerOpErrorRateThresholds() -> dict[str, float]:
+  """Returns a dict of params from the --ycsb_load_max_error_rates flag."""
+  result = {}
+  for kv in _LOAD_MAX_ERROR_RATES.value:
+    operation, value = kv.split('=', 1)
+    result[operation.lower()] = float(value)
+
+  if _SHOULD_FAIL_ON_INCOMPLETE_LOADING.value:
+    result['insert'] = 0.0
+  return result
+
+
+def _GetRunPerOpErrorRateThresholds() -> dict[str, float]:
+  """Returns a dict of params from the --ycsb_run_max_error_rates flag."""
+  result = {}
+  for kv in _RUN_MAX_ERROR_RATES.value:
+    operation, value = kv.split('=', 1)
+    result[operation.lower()] = float(value)
+  return result
+
+
 def CheckPrerequisites():
   """Verifies that the workload files are present and parameters are valid.
 
@@ -686,6 +724,27 @@ def CheckPrerequisites():
     )
 
 
+def _DownloadAndInstallTarball(vm, install_dir, url):
+  """Downloads and installs a tarball to the VM."""
+  if url.startswith('gs://'):
+    download_cmd = 'gsutil cat'
+  else:
+    download_cmd = 'curl -L'
+  install_cmd = (
+      f'mkdir -p {install_dir} && {download_cmd} {url} | '
+      f'tar -C {install_dir} --strip-components=1 -xzf - '
+      # Log4j 2 < 2.16 is vulnerable to
+      # https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2021-44228.
+      # YCSB currently ships with a number of vulnerable jars. None are used by
+      # PKB, so simply exclude them.
+      # After https://github.com/brianfrankcooper/YCSB/pull/1583 is merged and
+      # released, this will not be necessary.
+      # TODO(user): Update minimum YCSB version and remove.
+      "--exclude='**/log4j-core-2*.jar' "
+  )
+  vm.RemoteCommand(install_cmd)
+
+
 @vm_util.Retry(poll_interval=1)
 def Install(vm):
   """Installs the YCSB and, if needed, hdrhistogram package on the VM."""
@@ -697,18 +756,7 @@ def Install(vm):
   # ycsb.py uses /usr/bin/env python
   vm.RemoteCommand('sudo ln -sf /usr/bin/python2.7 /usr/local/bin/python')
   vm.Install('maven')
-  install_cmd = (
-      'mkdir -p {0} && curl -L {1} | '
-      'tar -C {0} --strip-components=1 -xzf - '
-      # Log4j 2 < 2.16 is vulnerable to
-      # https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2021-44228.
-      # YCSB currently ships with a number of vulnerable jars. None are used by
-      # PKB, so simply exclude them.
-      # After https://github.com/brianfrankcooper/YCSB/pull/1583 is merged and
-      # released, this will not be necessary.
-      # TODO(user): Update minimum YCSB version and remove.
-      "--exclude='**/log4j-core-2*.jar' "
-  )
+
   if _YCSB_COMMIT.value:
     vm.RemoteCommand(
         f'mkdir -p {YCSB_DIR} && cd {YCSB_DIR} && git init && (git config'
@@ -730,8 +778,8 @@ def Install(vm):
         or FLAGS.ycsb_tar_url
         or YCSB_URL_TEMPLATE.format(_YCSB_VERSION.value)
     )
-    vm.RemoteCommand(install_cmd.format(YCSB_DIR, ycsb_url))
-  vm.RemoteCommand(install_cmd.format(HDRHISTOGRAM_DIR, HDRHISTOGRAM_TAR_URL))
+    _DownloadAndInstallTarball(vm, YCSB_DIR, ycsb_url)
+  _DownloadAndInstallTarball(vm, HDRHISTOGRAM_DIR, HDRHISTOGRAM_TAR_URL)
   # _JAVA_OPTIONS needed to work around this issue:
   # https://stackoverflow.com/questions/53010200/maven-surefire-could-not-find-forkedbooter-class
   # https://stackoverflow.com/questions/34170811/maven-connection-reset-error
@@ -896,10 +944,26 @@ class YCSBExecutor:
       param, value = pv.split('=', 1)
       kwargs[param] = value
     command = self._BuildCommand('load', **kwargs)
+    start = round(time.time())
     stdout, stderr = vm.RobustRemoteCommand(command)
-    return ycsb_stats.ParseResults(
-        str(stderr + stdout), self.measurement_type, _ERROR_RATE_THRESHOLD.value
-    )
+    try:
+      return ycsb_stats.ParseResults(
+          ycsb_result_string=str(stderr + stdout),
+          data_type=self.measurement_type,
+          default_error_rate_threshold=_ERROR_RATE_THRESHOLD.value,
+          per_op_error_rate_thresholds=_GetLoadPerOpErrorRateThresholds(),
+          timestamp_offset_sec=start,
+      )
+    except errors.Benchmarks.RunError:
+      logging.error(
+          'YCSB error rate too high for VM %s\n'
+          'COMMAND: %s\nSTDOUT: %s\nSTDERR: %s',
+          vm.name,
+          command,
+          stdout,
+          stderr,
+      )
+      raise
 
   def _LoadThreaded(self, vms, workload_file, **kwargs):
     """Runs "Load" in parallel for each VM in VMs.
@@ -1019,13 +1083,26 @@ class YCSBExecutor:
     hdr_files_dir = kwargs.get('hdrhistogram.output.path', None)
     if hdr_files_dir:
       vm.RemoteCommand('mkdir -p {}'.format(hdr_files_dir))
+    start = round(time.time())
     stdout, stderr = vm.RobustRemoteCommand(command)
-    return ycsb_stats.ParseResults(
-        str(stderr + stdout),
-        self.measurement_type,
-        _ERROR_RATE_THRESHOLD.value,
-        self.burst_time_offset_sec,
-    )
+    try:
+      return ycsb_stats.ParseResults(
+          ycsb_result_string=str(stderr + stdout),
+          data_type=self.measurement_type,
+          default_error_rate_threshold=_ERROR_RATE_THRESHOLD.value,
+          per_op_error_rate_thresholds=_GetRunPerOpErrorRateThresholds(),
+          timestamp_offset_sec=start,
+      )
+    except errors.Benchmarks.RunError:
+      logging.error(
+          'YCSB error rate too high for VM %s\n'
+          'COMMAND: %s\nSTDOUT: %s\nSTDERR: %s',
+          vm.name,
+          command,
+          stdout,
+          stderr,
+      )
+      raise
 
   def _RunThreaded(self, vms, **kwargs):
     """Run a single workload using `vms`."""
@@ -1122,9 +1199,17 @@ class YCSBExecutor:
     Returns:
       List of sample.Sample objects.
     """
+    if _LATENCY_THRESHOLD.value and len(workloads) > 1:
+      logging.warning(
+          'Latency threshold mode is not fully supported with multiple workload'
+          ' files. Only the first workload file (%s) will be run in latency'
+          ' threshold mode.',
+          workloads[0],
+      )
     all_results = []
     parameters = {}
     for workload_index, workload_file in enumerate(workloads):
+      log_util.LogToShortLogAndRoot('Running workload file: %s', workload_file)
       if FLAGS.ycsb_operation_count:
         parameters = {'operationcount': FLAGS.ycsb_operation_count}
       if FLAGS.ycsb_record_count:
@@ -1173,6 +1258,11 @@ class YCSBExecutor:
       for client_count, target_qps_per_vm in _GetThreadsQpsPerLoaderList(
           len(vms)
       ):
+        log_util.LogToShortLogAndRoot(
+            'Running with thread count: %s and target QPS: %s',
+            client_count,
+            target_qps_per_vm,
+        )
 
         @vm_util.Retry(
             retryable_exceptions=ycsb_stats.CombineHdrLogError,
@@ -1185,24 +1275,28 @@ class YCSBExecutor:
             workload_meta: Mapping[str, Any],
             is_sustained: bool = False,
         ):
-          parameters['threads'] = client_count
+          # Create a copy of the parameters dictionary to avoid leaking state
+          # from one iteration to another. Ex. running with multiple thread
+          # counts
+          iter_params = parameters.copy()
+          iter_params['threads'] = client_count
           if target_qps_per_vm:
             # Threads should be less than the target QPS since YCSB throttles
             # weirdly when threads is much larger than target.
-            parameters['threads'] = min(client_count, target_qps_per_vm)
-            parameters['target'] = int(target_qps_per_vm * len(vms))
+            iter_params['threads'] = min(client_count, target_qps_per_vm)
+            iter_params['target'] = int(target_qps_per_vm * len(vms))
           if is_sustained:
-            parameters['maxexecutiontime'] = (
+            iter_params['maxexecutiontime'] = (
                 FLAGS.ycsb_dynamic_load_sustain_timelimit
             )
           start = time.time()
-          results = self._RunThreaded(vms, **parameters)
+          results = self._RunThreaded(vms, **iter_params)
           events.record_event.send(
               type(self).__name__,
               event='run',
               start_timestamp=start,
               end_timestamp=time.time(),
-              metadata=copy.deepcopy(parameters),
+              metadata=copy.deepcopy(iter_params),
           )
           client_meta = workload_meta.copy()
           client_meta.update(parameters)
@@ -1301,11 +1395,19 @@ class YCSBExecutor:
           if target_throughput is None:
             break
           if _DYNAMIC_LOAD_SLEEP_SEC.value > 0:
-            logging.info(
+            log_util.LogToShortLogAndRoot(
                 'Sleeping %s seconds after dynamic load.',
                 _DYNAMIC_LOAD_SLEEP_SEC.value,
             )
             time.sleep(_DYNAMIC_LOAD_SLEEP_SEC.value)
+
+        if YCSB_SLEEP_BETWEEN_THREAD_RUNS_SEC.value > 0:
+          log_util.LogToShortLogAndRoot(
+              'Finished run with thread count: %s. Sleeping for %s seconds.',
+              client_count,
+              YCSB_SLEEP_BETWEEN_THREAD_RUNS_SEC.value,
+          )
+          time.sleep(YCSB_SLEEP_BETWEEN_THREAD_RUNS_SEC.value)
 
     return all_results
 
@@ -1318,26 +1420,14 @@ class YCSBExecutor:
     load_samples = []
     assert workloads, 'no workloads'
 
-    def _HasInsertFailures(result_samples):
-      for s in result_samples:
-        if s.metric == _INCOMPLETE_LOADING_METRIC.value and s.value > 0:
-          return True
-      return False
-
     if FLAGS.ycsb_reload_database or not self.loaded:
       load_samples += list(
           self._LoadThreaded(vms, workloads[0], **(load_kwargs or {}))
       )
-      if _SHOULD_FAIL_ON_INCOMPLETE_LOADING.value and _HasInsertFailures(
-          load_samples
-      ):
-        raise errors.Benchmarks.RunError(
-            'There are insert failures, so the table loading is incomplete'
-        )
 
       self.loaded = True
     if FLAGS.ycsb_sleep_after_load_in_sec > 0:
-      logging.info(
+      log_util.LogToShortLogAndRoot(
           'Sleeping %s seconds after load stage.',
           FLAGS.ycsb_sleep_after_load_in_sec,
       )
@@ -1369,11 +1459,13 @@ class YCSBExecutor:
       samples = self._RunLowestLatencyMode(vms, workloads, run_kwargs, database)
     else:
       samples = list(self.RunStaircaseLoads(vms, workloads, **run_kwargs))
+
     if FLAGS.ycsb_sleep_after_load_in_sec > 0 and not SKIP_LOAD_STAGE.value:
       for s in samples:
         s.metadata['sleep_after_load_in_sec'] = (
             FLAGS.ycsb_sleep_after_load_in_sec
         )
+
     return samples
 
   def _SetRunParameters(self, params: Mapping[str, Any]) -> None:
@@ -1450,7 +1542,9 @@ class YCSBExecutor:
     ending_length = FLAGS.ycsb_timelimit
     ending_threadcount = int(FLAGS.ycsb_threads_per_client[0])
     incremental_targets = self.GetIncrementalQpsTargets(ending_qps)
-    logging.info('Incremental targets: %s', incremental_targets)
+    log_util.LogToShortLogAndRoot(
+        'Incremental targets: %s', incremental_targets
+    )
 
     # Warm-up phase is shorter and doesn't need results parsing
     FLAGS['ycsb_timelimit'].parse(INCREMENTAL_TIMELIMIT_SEC)
@@ -1546,12 +1640,12 @@ class YCSBExecutor:
     while True:
       samples = _RunWorkload(target)
       result = ycsb_stats.ExtractStats(samples, _LOWEST_LATENCY_PERCENTILE)
-      logging.info('Run stats: %s', result)
+      log_util.LogToShortLogAndRoot('Run stats: %s', result)
       if (
           result.read_latency > min_read_latency + _LOWEST_LATENCY_BUFFER
           or result.update_latency > min_update_latency + _LOWEST_LATENCY_BUFFER
       ):
-        logging.info(
+        log_util.LogToShortLogAndRoot(
             'Found lowest latency at %s ops/s. Run had higher read and/or'
             ' update latency than threshold %s read %s ms, update %s ms.',
             prev_result.throughput,
@@ -1643,7 +1737,7 @@ class YCSBExecutor:
                 copy.copy(run_samples[0].metadata),
             )
         )
-        logging.info(
+        log_util.LogToShortLogAndRoot(
             'Run had throughput target %s and measured stats \n %s \n %s, '
             'with CPU utilization %s.',
             target_qps,
@@ -1656,7 +1750,7 @@ class YCSBExecutor:
         elif cpu_utilization > CPU_OPTIMIZATION_TARGET.value:
           upper_bound = measured_qps
         else:
-          logging.info(
+          log_util.LogToShortLogAndRoot(
               'Found CPU utilization percentage between target %s and %s',
               CPU_OPTIMIZATION_TARGET_MIN.value,
               CPU_OPTIMIZATION_TARGET.value,
@@ -1675,7 +1769,7 @@ class YCSBExecutor:
 
         # Sleep between steps for some workloads.
         if _CPU_OPTIMIZATION_SLEEP_MINS.value:
-          logging.info(
+          log_util.LogToShortLogAndRoot(
               'Run phase finished, sleeping for %s minutes before starting the '
               'next run.',
               _CPU_OPTIMIZATION_SLEEP_MINS.value,
@@ -1766,7 +1860,7 @@ class YCSBExecutor:
         stats = ycsb_stats.ExtractStats(
             run_samples, percentile=_LATENCY_THRESHOLD_PERCENTILE.value
         )
-        logging.info(
+        log_util.LogToShortLogAndRoot(
             'Run had throughput target %s and measured stats %s',
             target_qps,
             stats,
@@ -1801,7 +1895,7 @@ class YCSBExecutor:
           upper_bound = target_qps
 
         if _LATENCY_THRESHOLD_SLEEP_MINS.value:
-          logging.info(
+          log_util.LogToShortLogAndRoot(
               'Run phase finished, sleeping for %s minutes before starting the '
               'next run.',
               _LATENCY_THRESHOLD_SLEEP_MINS.value,

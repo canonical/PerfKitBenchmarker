@@ -33,13 +33,28 @@ flags.DEFINE_integer(
     None,
     'Provisioned throughput (MB/s) for (SSD) volumes in AWS.',
 )
+AWS_EBS_CARD_COUNT = flags.DEFINE_integer(
+    'aws_ebs_card_count', 1, 'The number of EBS cards per instance.'
+)
 AWS_NIC_QUEUE_COUNTS = flags.DEFINE_list(
     'aws_nic_queue_counts',
     None,
-    'The queue count of each NIC. Specify a list of key=value pairs, where key'
-    ' is the network device name and value is the queue count.',
+    'The queue count of each NIC, ordered by NIC device index.',
 )
-
+AWS_INSTANCE_BANDWIDTH_WEIGHTING = flags.DEFINE_enum(
+    'aws_instance_bandwidth_weighting',
+    None,
+    ['vpc-1', 'ebs-1'],
+    'The bandwidth weighting of each instance, increasing one of vpc and ebs'
+    ' bandwidth at the expense of the other. Valid options are vpc-1, ebs-1.',
+)
+AWS_DISABLE_NON_PRIMARY_NIC_SOURCE_DEST_CHECK = flags.DEFINE_boolean(
+    'aws_disable_non_primary_nic_source_dest_check',
+    False,
+    'Whether to disable the source-dest-check for non-primary NICs. This'
+    ' prevents the AWS VPC fabric from dropping suspicious packets where ARP or'
+    ' handshakes are not used.',
+)
 flags.DEFINE_string(
     'aws_dax_node_type',
     'dax.r4.large',
@@ -61,7 +76,7 @@ flags.DEFINE_integer(
     18000,
     'The time to wait for an EMR job to finish, in seconds',
 )
-flags.DEFINE_boolean(
+USE_AWS_SPOT_INSTANCES = flags.DEFINE_boolean(
     'aws_spot_instances',
     False,
     'Whether to use AWS spot instances for any AWS VMs.',
@@ -79,9 +94,6 @@ flags.DEFINE_enum(
     'The required '
     'duration for the Spot Instances (also known as Spot blocks),'
     ' in minutes. This value must be a multiple of 60.',
-)
-flags.DEFINE_integer(
-    'aws_boot_disk_size', None, 'The boot disk size in GiB for AWS VMs.'
 )
 flags.DEFINE_string('kops', 'kops', 'The path to the kops binary.')
 flags.DEFINE_string(
@@ -215,9 +227,17 @@ flags.DEFINE_integer(
     1,
     249,
 )
+flags.DEFINE_boolean(
+    'eks_install_alb_controller',
+    False,
+    'Whether to install AWS Load Balancer Controller in EKS Karpenter clusters'
+    'Default value - do not install unless explicitly requested',
+)
 AWS_CAPACITY_BLOCK_RESERVATION_ID = flags.DEFINE_string(
     'aws_capacity_block_reservation_id',
-    None, 'Reservation id for capacity block.')
+    None,
+    'Reservation id for capacity block.',
+)
 AWS_CREATE_DISKS_WITH_VM = flags.DEFINE_boolean(
     'aws_create_disks_with_vm',
     True,
@@ -230,6 +250,12 @@ AURORA_STORAGE_TYPE = flags.DEFINE_enum(
     ['aurora', 'aurora-iopt1'],
     'Aurora storage type to use, corresponds to different modes of billing. See'
     ' https://aws.amazon.com/rds/aurora/pricing/.',
+)
+AURORA_METRICS_COLLECTION_SLEEP_SECONDS = flags.DEFINE_integer(
+    'aws_aurora_metrics_collection_sleep_seconds',
+    2 * 60 * 60,
+    'The time to sleep before collecting Aurora metrics. By default this is a'
+    ' long time in order to collect accurate VolumeBytesUsed metrics.',
 )
 AWS_EC2_INSTANCE_PROFILE = flags.DEFINE_string(
     'aws_ec2_instance_profile',
@@ -247,6 +273,17 @@ PCLUSTER_PATH = flags.DEFINE_string(
     'pcluster_path',
     'pcluster',
     'The path for the pcluster (parallel-cluster) utility.',
+)
+
+AWS_LUSTRE_COMPRESSION = flags.DEFINE_boolean(
+    'aws_lustre_compression',
+    False,
+    'Whether or not to enable LZ4 compression for AWS lustre.',
+)
+AWS_S3_MOUNT_ENABLE_METADATA_CACHE = flags.DEFINE_boolean(
+    'aws_s3_mount_enable_metadata_cache',
+    False,
+    'Whether to enable metadata cache for s3 mountpoint.',
 )
 
 
@@ -269,6 +306,7 @@ def _ValidatePreprovisionedDataAccess(flag_values: dict[str, Any]) -> bool:
       or flag_values[AWS_EKS_POD_IDENTITY_ROLE.name]
   )
 
+
 # MemoryDB Flags
 MEMORYDB_NODE_TYPE = flags.DEFINE_string(
     'aws_memorydb_node_type',
@@ -277,4 +315,38 @@ MEMORYDB_NODE_TYPE = flags.DEFINE_string(
 )
 MEMORYDB_FAILOVER_ZONE = flags.DEFINE_string(
     'aws_memorydb_failover_zone', None, 'AWS MemoryDB failover zone'
+)
+
+# DocumentDB Flags
+AWS_DOCUMENTDB_CLUSTER_NAME = flags.DEFINE_string(
+    'aws_documentdb_cluster_name',
+    None,
+    'The name of the documentdb cluster. This makes the resource user managed'
+    ' and assumes the correct zone is passed in.',
+)
+AWS_DOCUMENTDB_INSTANCE_CLASS = flags.DEFINE_string(
+    'aws_documentdb_instance_class',
+    None,
+    'The instance class to use for the documentdb cluster. Corresponds to the'
+    ' --db-instance-class parameter for the create command.',
+)
+AWS_DOCUMENTDB_REPLICA_COUNT = flags.DEFINE_integer(
+    'aws_documentdb_replica_count',
+    0,
+    'The number of replicas to use for the documentdb cluster.',
+)
+AWS_DOCUMENTDB_ZONES = flags.DEFINE_list(
+    'aws_documentdb_zones',
+    None,
+    'The zones to use for the documentdb cluster.',
+)
+AWS_DOCUMENTDB_TLS = flags.DEFINE_bool(
+    'aws_documentdb_tls',
+    False,
+    'Whether to enable TLS for the documentdb cluster.',
+)
+AWS_DOCUMENTDB_SNAPSHOT = flags.DEFINE_string(
+    'aws_documentdb_snapshot',
+    None,
+    'If supplied, creates the DocumentDB instance from the snapshot.',
 )

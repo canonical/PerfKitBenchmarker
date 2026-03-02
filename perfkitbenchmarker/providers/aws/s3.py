@@ -15,10 +15,9 @@
 """Contains classes/functions related to S3."""
 
 import json
-import logging
 import os
 import posixpath
-from typing import List
+from typing import List, TYPE_CHECKING
 
 from absl import flags
 from absl import logging
@@ -27,8 +26,9 @@ from perfkitbenchmarker import linux_packages
 from perfkitbenchmarker import object_storage_service
 from perfkitbenchmarker import provider_info
 from perfkitbenchmarker import vm_util
-from perfkitbenchmarker.providers.aws import aws_virtual_machine
 from perfkitbenchmarker.providers.aws import util
+if TYPE_CHECKING:
+  from perfkitbenchmarker.providers.aws import aws_virtual_machine  # pylint: disable=g-import-not-at-top
 
 FLAGS = flags.FLAGS
 
@@ -36,6 +36,42 @@ AWS_CREDENTIAL_LOCATION = '.aws'
 DEFAULT_AWS_REGION = 'us-east-1'
 _READ = 's3:GetObject'
 _WRITE = 's3:PutObject'
+
+
+class S3BucketSpec(object_storage_service.BaseBucketSpec):
+  """Properties of an S3 Bucket."""
+
+  CLOUD = provider_info.AWS
+
+  def __init__(
+      self,
+      mount_point=None,
+      bucket_name=None,
+      region=None,
+      zone=None,
+      is_s3_express=False,
+  ):
+    super().__init__(mount_point, bucket_name, region, zone)
+    self.is_s3_express = is_s3_express
+
+
+class S3Bucket(object_storage_service.Bucket):
+  """S3 Bucket Resource containing S3Service."""
+
+  def __init__(self, bucket_spec):
+    super().__init__(bucket_spec)
+    self.is_s3_express = bucket_spec.is_s3_express
+    self.service = S3Service()
+
+  def _Create(self):
+    location = self.zone or self.region
+    self.service.PrepareService(location)
+    self.service.MakeBucket(self.bucket_name)
+
+  def _Delete(self):
+    self.service.CleanupService()
+    self.service.EmptyBucket(self.bucket_name)
+    self.service.DeleteBucket(self.bucket_name)
 
 
 class S3Service(object_storage_service.ObjectStorageService):
@@ -270,8 +306,7 @@ class S3Service(object_storage_service.ObjectStorageService):
 
   UPLOAD_HTTP_METHOD = 'PUT'
 
-  def PrepareVM(self, vm):
-    assert isinstance(vm, aws_virtual_machine.AwsVirtualMachine)
+  def PrepareVM(self, vm: 'aws_virtual_machine.AwsVirtualMachine'):
     if not vm.instance_profile:
       raise ValueError('--aws_ec2_instance_profile is required to access s3.')
 

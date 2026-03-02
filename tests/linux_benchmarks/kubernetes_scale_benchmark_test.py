@@ -5,10 +5,12 @@ import unittest
 from absl.testing import flagsaver
 import mock
 from perfkitbenchmarker import benchmark_spec
-from perfkitbenchmarker import container_service
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import sample
 from perfkitbenchmarker.linux_benchmarks import kubernetes_scale_benchmark
+from perfkitbenchmarker.resources.container_service import kubectl
+from perfkitbenchmarker.resources.container_service import kubernetes_cluster
+from perfkitbenchmarker.resources.container_service import kubernetes_events
 from tests import pkb_common_test_case
 
 
@@ -21,7 +23,7 @@ class KubernetesScaleBenchmarkTest(pkb_common_test_case.PkbCommonTestCase):
   def setUp(self):
     super().setUp()
     self.bm_spec = mock.create_autospec(benchmark_spec.BenchmarkSpec)
-    self.cluster = mock.create_autospec(container_service.KubernetesCluster)
+    self.cluster = mock.create_autospec(kubernetes_cluster.KubernetesCluster)
     self.bm_spec.container_cluster = self.cluster
     self.expected_num_samples_per_reason = 9
 
@@ -38,44 +40,115 @@ class KubernetesScaleBenchmarkTest(pkb_common_test_case.PkbCommonTestCase):
   def testPodStatusConditions(self):
     self.enter_context(
         mock.patch.object(
-            container_service,
+            kubectl,
             'RunKubectlCommand',
             return_value=(
-                (
-                    '{"lastProbeTime":null,"lastTransitionTime":"1970-01-01T00:01:19Z","status":"True","type":"PodReadyToStartContainers"}'
-                    ' {"lastProbeTime":null,"lastTransitionTime":"1970-01-01T18:51:17Z","status":"True","type":"Initialized"}'
-                    ' {"lastProbeTime":null,"lastTransitionTime":"1970-01-01T00:01:19Z","status":"True","type":"Ready"}'
-                    ' {"lastProbeTime":null,"lastTransitionTime":"1970-01-01T00:01:19Z","status":"True","type":"ContainersReady"}'
-                    ' {"lastProbeTime":null,"lastTransitionTime":"1970-01-01T18:51:17Z","status":"True","type":"PodScheduled"}'
-                ),
+                """
+                "pod123": [
+                  {
+                    "lastProbeTime":null,
+                    "lastTransitionTime":"1970-01-01T00:01:19Z",
+                    "status":"True",
+                    "type":"PodReadyToStartContainers"
+                  }, {
+                    "lastProbeTime":null,
+                    "lastTransitionTime":"1970-01-01T18:51:17Z",
+                    "status":"True",
+                    "type":"Initialized"
+                  }, {
+                    "lastProbeTime":null,
+                    "lastTransitionTime":"1970-01-01T00:01:19Z",
+                    "status":"True",
+                    "type":"Ready"
+                  }, {
+                    "lastProbeTime":null,
+                    "lastTransitionTime":"1970-01-01T00:01:19Z",
+                    "status":"True",
+                    "type":"ContainersReady"
+                  }
+                ],
+                "pod456": [
+                  {
+                    "lastProbeTime":null,
+                    "lastTransitionTime":"1970-01-01T18:51:17Z",
+                    "status":"True",
+                    "type":"PodScheduled"
+                  }
+                ],
+                """,
                 '',
                 0,
             ),
         )
     )
-    conditions = kubernetes_scale_benchmark._GetResourceStatusConditions(
-        'pod', 'pod123'
+    conditions = kubernetes_scale_benchmark.GetStatusConditionsForResourceType(
+        'pod',
+        frozenset(),
     )
     self.assertLen(conditions, 5)
 
-  def testOneStatForOnePod(self):
-    self.cluster.GetAllNamesForResourceType.return_value = ['pod1']
+  def testPodStatusConditionsWithIgnoredResources(self):
     self.enter_context(
         mock.patch.object(
-            container_service,
+            kubectl,
+            'RunKubectlCommand',
+            return_value=(
+                """
+                "pod123": [
+                  {
+                    "lastProbeTime":null,
+                    "lastTransitionTime":"1970-01-01T00:01:19Z",
+                    "status":"True",
+                    "type":"PodReadyToStartContainers"
+                  }, {
+                    "lastProbeTime":null,
+                    "lastTransitionTime":"1970-01-01T18:51:17Z",
+                    "status":"True",
+                    "type":"Initialized"
+                  }
+                ],
+                "pod456": [
+                  {
+                    "lastProbeTime":null,
+                    "lastTransitionTime":"1970-01-01T18:51:17Z",
+                    "status":"True",
+                    "type":"PodScheduled"
+                  }
+                ],
+                """,
+                '',
+                0,
+            ),
+        )
+    )
+    conditions = kubernetes_scale_benchmark.GetStatusConditionsForResourceType(
+        'pod',
+        resources_to_ignore=frozenset(['pod456']),
+    )
+    self.assertLen(conditions, 2)
+
+  def testOneStatForOnePod(self):
+    self.enter_context(
+        mock.patch.object(
+            kubectl,
             'RunKubectlCommand',
             side_effect=[
                 (
-                    '{"lastProbeTime":null,"lastTransitionTime":"1970-01-01T00:01:00Z","status":"True","type":"Ready"}',
+                    """
+                    "pod1": [{
+                      "lastProbeTime":null,
+                      "lastTransitionTime":"1970-01-01T00:01:00Z",
+                      "status":"True",
+                      "type":"Ready"
+                    }],
+                    """,
                     '',
                     0,
                 ),
             ],
         )
     )
-    samples = kubernetes_scale_benchmark.ParseStatusChanges(
-        self.cluster, 'pod', 50
-    )
+    samples = kubernetes_scale_benchmark.ParseStatusChanges('pod', 50)
     self.assertLen(samples, self.expected_num_samples_per_reason)
     for s in samples:
       self.assertStartsWith(s.metric, 'pod_Ready')
@@ -86,37 +159,39 @@ class KubernetesScaleBenchmarkTest(pkb_common_test_case.PkbCommonTestCase):
     self.assertEqual(samples_by_metric['pod_Ready_count'].value, 1)
 
   def testOneStatForMultiplePods(self):
-    self.cluster.GetAllNamesForResourceType.return_value = [
-        'pod1',
-        'pod2',
-        'pod3',
-    ]
     self.enter_context(
         mock.patch.object(
-            container_service,
+            kubectl,
             'RunKubectlCommand',
             side_effect=[
                 (
-                    '{"lastProbeTime":null,"lastTransitionTime":"1970-01-01T00:01:00Z","status":"True","type":"Ready"}',
-                    '',
-                    0,
-                ),
-                (
-                    '{"lastProbeTime":null,"lastTransitionTime":"1970-01-01T00:00:40Z","status":"True","type":"Ready"}',
-                    '',
-                    0,
-                ),
-                (
-                    '{"lastProbeTime":null,"lastTransitionTime":"1970-01-01T00:01:20Z","status":"True","type":"Ready"}',
+                    """
+                    "pod1": [{
+                      "lastProbeTime":null,
+                      "lastTransitionTime":"1970-01-01T00:01:00Z",
+                      "status":"True",
+                      "type":"Ready"
+                    }],
+                    "pod2": [{
+                      "lastProbeTime":null,
+                      "lastTransitionTime":"1970-01-01T00:00:40Z",
+                      "status":"True",
+                      "type":"Ready"
+                    }],
+                    "pod3": [{
+                      "lastProbeTime":null,
+                      "lastTransitionTime":"1970-01-01T00:01:20Z",
+                      "status":"True",
+                      "type":"Ready"
+                    }],
+                    """,
                     '',
                     0,
                 ),
             ],
         )
     )
-    samples = kubernetes_scale_benchmark.ParseStatusChanges(
-        self.cluster, 'pod', 40
-    )
+    samples = kubernetes_scale_benchmark.ParseStatusChanges('pod', 40)
     self.assertLen(samples, self.expected_num_samples_per_reason)
     for s in samples:
       self.assertStartsWith(s.metric, 'pod_Ready')
@@ -130,26 +205,34 @@ class KubernetesScaleBenchmarkTest(pkb_common_test_case.PkbCommonTestCase):
     self.assertEqual(samples_by_metric['pod_Ready_count'].value, 3)
 
   def testMultipleStatForOnePod(self):
-    self.cluster.GetAllNamesForResourceType.return_value = ['pod1']
     self.enter_context(
         mock.patch.object(
-            container_service,
+            kubectl,
             'RunKubectlCommand',
             side_effect=[
                 (
-                    (
-                        '{"lastProbeTime":null,"lastTransitionTime":"1970-01-01T00:01:00Z","status":"True","type":"Ready"} '
-                        '{"lastProbeTime":null,"lastTransitionTime":"1970-01-01T00:01:00Z","status":"True","type":"ContainersReady"}'
-                    ),
+                    """
+                    "pod1": [
+                      {
+                        "lastProbeTime":null,
+                        "lastTransitionTime":"1970-01-01T00:01:00Z",
+                        "status":"True",
+                        "type":"Ready"
+                      }, {
+                        "lastProbeTime":null,
+                        "lastTransitionTime":"1970-01-01T00:01:00Z",
+                        "status":"True",
+                        "type":"ContainersReady"
+                      }
+                    ],
+                    """,
                     '',
                     0,
                 ),
             ],
         )
     )
-    samples = kubernetes_scale_benchmark.ParseStatusChanges(
-        self.cluster, 'pod', 40
-    )
+    samples = kubernetes_scale_benchmark.ParseStatusChanges('pod', 40)
     self.assertLen(samples, self.expected_num_samples_per_reason * 2)
     for s in samples:
       self.assertStartsWith(s.metric, 'pod_')
@@ -158,23 +241,27 @@ class KubernetesScaleBenchmarkTest(pkb_common_test_case.PkbCommonTestCase):
     self.assertIn('pod_ContainersReady_p50', samples_by_metric.keys())
 
   def testOneStatForOneNode(self):
-    self.cluster.GetAllNamesForResourceType.return_value = ['node1']
     self.enter_context(
         mock.patch.object(
-            container_service,
+            kubectl,
             'RunKubectlCommand',
             side_effect=[
                 (
-                    '{"lastProbeTime":null,"lastTransitionTime":"1970-01-01T00:01:00Z","status":"True","type":"Ready"}',
+                    """
+                    "node1": [{
+                      "lastProbeTime":null,
+                      "lastTransitionTime":"1970-01-01T00:01:00Z",
+                      "status":"True",
+                      "type":"Ready"
+                    }],
+                    """,
                     '',
                     0,
                 ),
             ],
         )
     )
-    samples = kubernetes_scale_benchmark.ParseStatusChanges(
-        self.cluster, 'node', 50
-    )
+    samples = kubernetes_scale_benchmark.ParseStatusChanges('node', 50)
     self.assertLen(samples, self.expected_num_samples_per_reason)
     for s in samples:
       self.assertStartsWith(s.metric, 'node_Ready')
@@ -184,61 +271,114 @@ class KubernetesScaleBenchmarkTest(pkb_common_test_case.PkbCommonTestCase):
     self.assertIn('node_Ready_count', samples_by_metric.keys())
     self.assertEqual(samples_by_metric['node_Ready_count'].value, 1)
 
-  @flagsaver.flagsaver(kubernetes_goal_replicas=10)
+  @flagsaver.flagsaver(kubernetes_scale_report_latency_percentiles=False)
+  @flagsaver.flagsaver(kubernetes_scale_report_individual_latencies=True)
+  def testReportLatenciesMultipleStatsOnePod(self):
+    self.enter_context(
+        mock.patch.object(
+            kubectl,
+            'RunKubectlCommand',
+            side_effect=[
+                (
+                    """
+                    "pod1": [
+                      {
+                        "lastProbeTime":null,
+                        "lastTransitionTime":"1970-01-01T00:01:00Z",
+                        "status":"True",
+                        "type":"Ready"
+                      }, {
+                        "lastProbeTime":null,
+                        "lastTransitionTime":"1970-01-01T00:01:00Z",
+                        "status":"True",
+                        "type":"ContainersReady"
+                      }
+                    ],
+                    """,
+                    '',
+                    0,
+                ),
+            ],
+        )
+    )
+    samples = kubernetes_scale_benchmark.ParseStatusChanges('pod', 40)
+    self.assertLen(samples, 4)
+    # self.assertEqual(samples, [])
+    samples_by_metric = _SamplesByMetric(samples)
+    self.assertEqual(
+        samples_by_metric.keys(),
+        {
+            'pod_Ready_count',
+            'pod_ContainersReady_count',
+            'pod_Ready',
+            'pod_ContainersReady',
+        },
+    )
+
+  @flagsaver.flagsaver(kubernetes_scale_num_replicas=10)
   def testCheckFailuresPassesWithCorrectNumberOfPods(self):
-    self.cluster.GetEvents.return_value = []
-    kubernetes_scale_benchmark._CheckForFailures(
+    self.cluster.event_poller = kubernetes_events.KubernetesEventPoller(set)
+    kubernetes_scale_benchmark.CheckForFailures(
         self.cluster,
         [
             sample.Sample('pod_Ready_p90', 95.0, 'seconds'),
             sample.Sample('pod_Ready_count', 10, 'count'),
         ],
+        9,
     )
 
-  @flagsaver.flagsaver(kubernetes_goal_replicas=10)
+  @flagsaver.flagsaver(kubernetes_scale_num_replicas=10)
   def testCheckFailuresThrowsRegularError(self):
-    self.cluster.GetEvents.return_value = [
-        container_service.KubernetesEvent(
-            reason='PodReady',
-            message='Pod is ready',
-            resource=container_service.KubernetesEventResource(
-                name='pod',
-                kind='Pod',
-            ),
-            timestamp=100,
-        )
-    ]
+    self.cluster.event_poller = kubernetes_events.KubernetesEventPoller(
+        lambda: {
+            kubernetes_events.KubernetesEvent(
+                reason='PodReady',
+                message='Pod is ready',
+                resource=kubernetes_events.KubernetesEventResource(
+                    name='pod',
+                    kind='Pod',
+                ),
+                type='Normal',
+                timestamp=100,
+            )
+        }
+    )
     with self.assertRaises(errors.Benchmarks.RunError):
-      kubernetes_scale_benchmark._CheckForFailures(
+      kubernetes_scale_benchmark.CheckForFailures(
           self.cluster,
           [
               sample.Sample('pod_Ready_count', 5, 'count'),
           ],
+          9,
       )
 
-  @flagsaver.flagsaver(kubernetes_goal_replicas=10)
+  @flagsaver.flagsaver(kubernetes_scale_num_replicas=10)
   def testCheckFailuresThrowsQuotaExceeded(self):
-    self.cluster.GetEvents.return_value = [
-        container_service.KubernetesEvent(
-            reason='FailedScaleUp',
-            message=(
-                'Node scale up in zones us-west1-b associated with this pod'
-                ' failed: GCE quota exceeded. Pod is at risk of not being'
-                ' scheduled.'
-            ),
-            resource=container_service.KubernetesEventResource(
-                name='pod',
-                kind='Pod',
-            ),
-            timestamp=100,
-        )
-    ]
+    self.cluster.event_poller = kubernetes_events.KubernetesEventPoller(
+        lambda: {
+            kubernetes_events.KubernetesEvent(
+                reason='FailedScaleUp',
+                message=(
+                    'Node scale up in zones us-west1-b associated with this pod'
+                    ' failed: GCE quota exceeded. Pod is at risk of not being'
+                    ' scheduled.'
+                ),
+                resource=kubernetes_events.KubernetesEventResource(
+                    name='pod',
+                    kind='Pod',
+                ),
+                type='Warning',
+                timestamp=100,
+            )
+        }
+    )
     with self.assertRaises(errors.Benchmarks.QuotaFailure):
-      kubernetes_scale_benchmark._CheckForFailures(
+      kubernetes_scale_benchmark.CheckForFailures(
           self.cluster,
           [
               sample.Sample('pod_Ready_count', 5, 'count'),
           ],
+          9,
       )
 
 

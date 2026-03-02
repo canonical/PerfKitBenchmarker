@@ -4,6 +4,7 @@ AlloyDb is currently a postgres engine GCP supporting to achieve better
 performance with postgres.
 """
 
+import datetime
 import json
 import logging
 from typing import Any, Dict, List, Tuple
@@ -13,6 +14,8 @@ from perfkitbenchmarker import errors
 from perfkitbenchmarker import regex_util
 from perfkitbenchmarker import relational_db
 from perfkitbenchmarker import relational_db_spec
+from perfkitbenchmarker import sample
+from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.providers.gcp import util
 import requests
 
@@ -50,11 +53,17 @@ _READ_POOL_NODE_COUNT = flags.DEFINE_integer(
     upper_bound=20,
 )
 
-SUPPORTED_ALLOYDB_ENGINE_VERSIONS = ['13']
+ALLOYDB_DATABASE_VERSION_MAPPING = {
+    '14': 'POSTGRES_14',
+    '15': 'POSTGRES_15',
+    '16': 'POSTGRES_16',
+    '17': 'POSTGRES_17',
+}
 
-DEFAULT_ENGINE_VERSION = '13'
+DEFAULT_ENGINE_VERSION = '17'
 CREATION_TIMEOUT = 30 * 60
-IS_READY_TIMEOUT = 600  # 10 minutes
+IS_READY_TIMEOUT = 10 * 60
+UPDATE_TIMEOUT = 60 * 60
 
 
 class GCPAlloyRelationalDb(relational_db.BaseRelationalDb):
@@ -91,11 +100,45 @@ class GCPAlloyRelationalDb(relational_db.BaseRelationalDb):
     Returns:
       (string): Default version for the given database engine.
     """
-    if engine not in SUPPORTED_ALLOYDB_ENGINE_VERSIONS:
+    if engine not in ALLOYDB_DATABASE_VERSION_MAPPING:
       raise NotImplementedError(
           'Default engine not specified for engine {}'.format(engine)
       )
     return DEFAULT_ENGINE_VERSION
+
+  def _GetMetricsToCollect(self) -> list[relational_db.MetricSpec]:
+    return [
+        util.GcpMetricSpec(
+            provider_name='alloydb.googleapis.com/cluster/storage/usage',
+            sample_name='disk_bytes_used',
+            unit='GB',
+            conversion_func=lambda x: x / (1024 * 1024 * 1024),
+            project=self.project,
+            resource_filter=(
+                'resource.type="alloydb.googleapis.com/Cluster" AND'
+                f' resource.labels.cluster_id="{self.cluster_id}"'
+                f' AND resource.labels.resource_container="{self.project}"'
+                f' AND resource.labels.location="{self.region}"'
+            ),
+        )
+    ]
+
+  def _CollectProviderMetric(
+      self,
+      metric: relational_db.MetricSpec,
+      start_time: datetime.datetime,
+      end_time: datetime.datetime,
+      collect_percentiles: bool = False,
+  ) -> list[sample.Sample]:
+    assert isinstance(metric, util.GcpMetricSpec)
+    points = util.GetTimeSeries(
+        metric,
+        start_time,
+        end_time,
+    )
+    return self._CreateSamples(
+        points, metric.sample_name, metric.unit, collect_percentiles
+    )
 
   def GetResourceMetadata(self) -> Dict[str, Any]:
     metadata = super().GetResourceMetadata()
@@ -117,21 +160,20 @@ class GCPAlloyRelationalDb(relational_db.BaseRelationalDb):
     )
 
   def _Create(self) -> None:
-    """Creates the Cloud SQL instance and authorizes traffic from anywhere.
+    """See base class."""
 
-    Raises:
-      UnsupportedDatabaseEngineError:
-        if the database is unmanaged and the engine isn't MYSQL.
-      Exception: if an invalid MySQL flag was used.
-    """
     # Create a database cluster
+    database_version_string = self._GetEngineVersionString(
+        self.spec.engine_version
+    )
     cmd_string = [
         'clusters',
         'create',
         self.cluster_id,
-        '--password=%s' % self.spec.database_password,
-        '--network=%s' % self.client_vm.network.network_resource.name,
+        f'--password={self.spec.database_password}',
+        f'--network={self.client_vm.network.network_resource.name}',
         '--allocated-ip-range-name=google-service-range',
+        f'--database-version={database_version_string}',
     ]
 
     # Continuous backup is not enabled by default when using gcloud
@@ -141,8 +183,13 @@ class GCPAlloyRelationalDb(relational_db.BaseRelationalDb):
     else:
       cmd_string.append('--no-enable-continuous-backup')
 
-    cmd = self._GetAlloyDbCommand(cmd_string)
-    _, _, _ = cmd.Issue(timeout=CREATION_TIMEOUT)
+    self._IssueAlloyDbCreateCommand(cmd_string)
+
+    if self.spec.db_spec.machine_type is not None:
+      machine_shape_param = f'--machine-type={self.spec.db_spec.machine_type}'
+    else:
+      # Default machine family is n2 if only CPU count is specified.
+      machine_shape_param = f'--cpu-count={self.spec.db_spec.cpus}'
 
     # Create a primary instance
     cmd_string = [
@@ -150,16 +197,14 @@ class GCPAlloyRelationalDb(relational_db.BaseRelationalDb):
         'create',
         self.instance_id,
         '--cluster=%s' % self.cluster_id,
-        '--cpu-count=%s' % self.spec.db_spec.cpus,
+        machine_shape_param,
         '--instance-type=PRIMARY',
     ]
     if self.spec.high_availability:
       cmd_string.append('--availability-type=REGIONAL')
     else:
       cmd_string.append('--availability-type=ZONAL')
-
-    cmd = self._GetAlloyDbCommand(cmd_string)
-    cmd.Issue(timeout=CREATION_TIMEOUT)
+    self._IssueAlloyDbCreateCommand(cmd_string)
 
     cmd_string = [
         'instances',
@@ -182,12 +227,11 @@ class GCPAlloyRelationalDb(relational_db.BaseRelationalDb):
           'create',
           self.replica_instance_id,
           f'--cluster={self.cluster_id}',
-          f'--cpu-count={self.spec.db_spec.cpus}',
+          machine_shape_param,
           f'--read-pool-node-count={_READ_POOL_NODE_COUNT.value}',
           '--instance-type=READ_POOL',
       ]
-      cmd = self._GetAlloyDbCommand(cmd_string)
-      cmd.Issue(timeout=CREATION_TIMEOUT)
+      self._IssueAlloyDbCreateCommand(cmd_string)
 
       # Assign the endpoint for the read replica
       cmd_string = [
@@ -281,6 +325,7 @@ class GCPAlloyRelationalDb(relational_db.BaseRelationalDb):
         'SELECT google_columnar_engine_jobs_wait(14400000)', database_name
     )
 
+  @vm_util.Retry(timeout=UPDATE_TIMEOUT)
   def UpdateAlloyDBFlags(
       self,
       columnar_engine_size: int | None,
@@ -347,6 +392,37 @@ class GCPAlloyRelationalDb(relational_db.BaseRelationalDb):
     cmd.flags['region'] = self.region
     return cmd
 
+  def _IssueAlloyDbCreateCommand(
+      self, cmd_string: List[str]
+  ) -> Tuple[str, str, int]:
+    """Issues an AlloyDB command, handling errors and retries.
+
+    Args:
+       cmd_string: The command string to issue.
+
+    Returns:
+       A tuple of stdout, stderr, and retcode.
+    """
+    cmd = self._GetAlloyDbCommand(cmd_string)
+    stdout, stderr, retcode = cmd.Issue(
+        timeout=CREATION_TIMEOUT, raise_on_failure=False
+    )
+
+    if retcode:
+      # If the cluster/instance already exists, we can proceed.
+      if 'already exists' in stderr:
+        return stdout, stderr, retcode
+      if 'an internal error has occurred' in stderr:
+        raise errors.Resource.RetryableCreationError(
+            f'Creation failed due to internal error: {stderr}'
+        )
+      util.CheckGcloudResponseKnownFailures(stderr, retcode)
+      raise errors.VmUtil.IssueCommandError(
+          f'Command failed: {cmd_string}\n{stderr}'
+      )
+
+    return stdout, stderr, retcode
+
   def _IsReady(self) -> bool:
     """Return true if the underlying resource is ready."""
     cluster = self._DescribeCluster()
@@ -366,3 +442,24 @@ class GCPAlloyRelationalDb(relational_db.BaseRelationalDb):
     cmd_string = ['clusters', 'delete', self.cluster_id, '--force', '--async']
     cmd = self._GetAlloyDbCommand(cmd_string)
     cmd.Issue()
+
+  def _GetEngineVersionString(self, version: str) -> str:
+    """Returns AlloyDB-specific version string for a given database engine.
+
+    Args:
+      version: engine version
+
+    Returns:
+      (string): AlloyDB-specific name for the requested engine and version.
+
+    Raises:
+      NotImplementedError on invalid engine / version combination.
+    """
+    if version not in ALLOYDB_DATABASE_VERSION_MAPPING:
+      valid_versions = ', '.join(ALLOYDB_DATABASE_VERSION_MAPPING.keys())
+      raise NotImplementedError(
+          f'Version {version} is not supported, supported versions include'
+          f' {valid_versions}'
+      )
+
+    return ALLOYDB_DATABASE_VERSION_MAPPING[version]

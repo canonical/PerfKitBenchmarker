@@ -20,25 +20,64 @@ See https://docs.aws.amazon.com/eks/latest/userguide/getting-started.html for
 instructions.
 """
 
+from collections import abc
+import json
 import logging
 import re
-from typing import Any, Dict
+from typing import Any
+from urllib import parse
 
 from absl import flags
-from perfkitbenchmarker import container_service
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import provider_info
 from perfkitbenchmarker import virtual_machine
+from perfkitbenchmarker import virtual_machine_spec
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.providers.aws import aws_disk
 from perfkitbenchmarker.providers.aws import aws_virtual_machine
 from perfkitbenchmarker.providers.aws import flags as aws_flags
 from perfkitbenchmarker.providers.aws import util
+from perfkitbenchmarker.resources.container_service import container
+from perfkitbenchmarker.resources.container_service import container_cluster
+from perfkitbenchmarker.resources.container_service import kubectl
+from perfkitbenchmarker.resources.container_service import kubernetes_cluster
+from perfkitbenchmarker.resources.container_service import kubernetes_commands
+
 
 FLAGS = flags.FLAGS
+# GPU types which practically require spot to get.
+_RARE_GPU_TYPES = [
+    virtual_machine_spec.GPU_H100,
+    virtual_machine_spec.GPU_A100,
+    virtual_machine_spec.GPU_B200,
+]
 
 
-class BaseEksCluster(container_service.KubernetesCluster):
+def RecursivelyUpdateDictionary(
+    original: dict[str, Any], updates: dict[str, Any]
+) -> dict[str, Any]:
+  """Updates a nested dictionary.
+
+  Overwrites values in the original dictionary with the values in the updates
+  dictionary, but preserves nested dictionaries even if both have a value.
+
+  Args:
+    original: The original dictionary to update.
+    updates: The dictionary of updates to apply to the original dictionary.
+
+  Returns:
+    The updated dictionary, with keys + values from both.
+  """
+  # Copied from https://stackoverflow.com/questions/3232943
+  for k, v in updates.items():
+    if isinstance(v, abc.Mapping):
+      original[k] = RecursivelyUpdateDictionary(original.get(k, {}), v)
+    else:
+      original[k] = v
+  return original
+
+
+class BaseEksCluster(kubernetes_cluster.KubernetesCluster):
   """Shared base class for Elastic Kubernetes Service cluster auto mode & not."""
 
   def __init__(self, spec):
@@ -65,6 +104,8 @@ class BaseEksCluster(container_service.KubernetesCluster):
       self.region = util.GetRegionFromZones(self.control_plane_zones)
     self.cluster_version: str = FLAGS.container_cluster_version
     self.account: str = util.GetAccount()
+    self.node_to_nodepool: dict[str, container.BaseNodePoolConfig | None] = {}
+    self.node_to_machine_type: dict[str, str | None] = {}
 
   def _ChooseSecondZone(self):
     """Choose a second zone for the control plane if only one is specified."""
@@ -84,16 +125,39 @@ class BaseEksCluster(container_service.KubernetesCluster):
     """Delete the ssh key."""
     aws_virtual_machine.AwsKeyFileManager.DeleteKeyfile(self.region)
 
-  def _EksCtlCreate(self, eksctl_flags: dict[str, Any]):
+  def _EksCtlCreate(self, create_json: dict[str, Any]):
     """Creates the EKS cluster."""
     # If multiple zones are passed use them for the control plane.
     # Otherwise EKS will auto-select control plane zones in the region.
     if self.control_plane_zones:
-      eksctl_flags['zones'] = ','.join(self.control_plane_zones)
-
-    cmd = [FLAGS.eksctl, 'create', 'cluster'] + sorted(
-        '--{}={}'.format(k, v) for k, v in eksctl_flags.items() if v
+      create_json['availabilityZones'] = self.control_plane_zones
+    # Schema for the cluster create command is here:
+    # https://schema.eksctl.io/
+    create_json = RecursivelyUpdateDictionary(
+        {
+            'apiVersion': 'eksctl.io/v1alpha5',
+            'kind': 'ClusterConfig',
+            'metadata': {
+                'name': self.name,
+                'region': self.region,
+                'version': self.cluster_version,
+                'tags': util.MakeDefaultTags(),
+            },
+            'iam': {
+                'withOidc': True,
+            },
+        },
+        create_json,
     )
+    filename = self._WriteJsonToFile(create_json)
+    cmd = [
+        FLAGS.eksctl,
+        'create',
+        'cluster',
+        '-f',
+        filename,
+        f'--kubeconfig={FLAGS.kubeconfig}',
+    ]
     stdout, _, retcode = vm_util.IssueCommand(
         cmd, timeout=1800, raise_on_failure=False
     )
@@ -102,6 +166,54 @@ class BaseEksCluster(container_service.KubernetesCluster):
         raise errors.Benchmarks.QuotaFailure(stdout)
       else:
         raise errors.Resource.CreationError(stdout)
+
+  def _RenderNodeGroupJson(
+      self, nodepool: container.BaseNodePoolConfig
+  ) -> dict[str, Any]:
+    """Constructs the node group json dictionary."""
+    group_json = {
+        'name': nodepool.name,
+        'instanceType': nodepool.machine_type,
+        'desiredCapacity': nodepool.num_nodes,
+        'amiFamily': 'AmazonLinux2023',
+        'tags': util.MakeDefaultTags(),
+        'labels': {
+            'pkb_nodepool': nodepool.name,
+        },
+    }
+    if (
+        nodepool.name == self.default_nodepool.name
+        and self.min_nodes != self.max_nodes
+    ):
+      # Min / max config only apply to the default nodepool.
+      group_json['minSize'] = self.min_nodes
+      group_json['maxSize'] = self.max_nodes
+      group_json['desiredCapacity'] = min(
+          max(self.min_nodes, nodepool.num_nodes), self.max_nodes
+      )
+    return group_json
+
+  def _WriteJsonToFile(self, json_dict: dict[str, Any]) -> str:
+    """Renders the given json dict to a file.
+
+    Args:
+      json_dict: The json dict to render.
+
+    Returns:
+      The file path of the rendered json.
+    """
+    with vm_util.NamedTemporaryFile(
+        dir=vm_util.GetTempDir(), delete=False, mode='w'
+    ) as tf:
+      rendered_json = json.dumps(json_dict, indent=2)
+      logging.info(
+          'Writing to %s rendered eksctl create json: %s',
+          tf.name,
+          rendered_json,
+      )
+      tf.write(rendered_json)
+      tf.close()
+      return tf.name
 
   def _Delete(self):
     """Deletes the control plane and worker nodes."""
@@ -117,9 +229,137 @@ class BaseEksCluster(container_service.KubernetesCluster):
     ]
     vm_util.IssueCommand(cmd, timeout=1800)
 
+  def GetNodePoolFromNodeName(
+      self, node_name: str
+  ) -> container.BaseNodePoolConfig | None:
+    """Gets the nodepool from the node name.
+
+    This method assumes that the nodepool name is embedded in the node name.
+    Better would be a lookup from the cloud provider.
+
+    Args:
+      node_name: The name of the node.
+
+    Returns:
+      The associated nodepool, or None if not found.
+    """
+    if node_name in self.node_to_nodepool:
+      return self.node_to_nodepool[node_name]
+    nodepool_name, err, code = kubectl.RunKubectlCommand(
+        [
+            'get',
+            'node',
+            node_name,
+            '-o',
+            'jsonpath="{.metadata.labels.pkb_nodepool}"',
+        ],
+        raise_on_failure=False,
+    )
+    if code:
+      logging.warning(
+          'Got error when trying to get nodepool name for node %s: %s',
+          err,
+          node_name,
+      )
+      nodepool = None
+    else:
+      nodepool_name = nodepool_name.strip().strip('"')
+      if nodepool_name == 'default':
+        nodepool = self.default_nodepool
+      else:
+        if nodepool_name not in self.nodepools:
+          logging.warning(
+              'Nodepool %s not found in nodepools %s',
+              nodepool_name,
+              self.nodepools,
+          )
+          nodepool = None
+        else:
+          nodepool = self.nodepools[nodepool_name]
+    self.node_to_nodepool[node_name] = nodepool
+    return nodepool
+
+  def GetMachineTypeFromNodeName(self, node_name: str) -> str | None:
+    """Gets the machine type from the node name."""
+    if node_name in self.node_to_machine_type:
+      return self.node_to_machine_type[node_name]
+    out, _, _ = kubectl.RunKubectlCommand(
+        [
+            'get',
+            'nodes',
+            '-o',
+            (
+                "jsonpath='{range"
+                r' .items[*]}{.metadata.name},{.metadata.labels.beta\.'
+                r'kubernetes\.io/instance-type}{"\n"}{end}\''
+            ),
+        ],
+    )
+    for line in out.splitlines():
+      pieces = line.split(',')
+      if not pieces or len(pieces) != 2:
+        continue
+      node, machine_type = pieces
+      node = node.strip("'")
+      machine_type = machine_type.strip("'")
+      self.node_to_machine_type[node] = machine_type
+    if node_name not in self.node_to_machine_type:
+      self.node_to_machine_type[node_name] = None
+    return self.node_to_machine_type[node_name]
+
   def GetDefaultStorageClass(self) -> str:
     """Get the default storage class for the provider."""
     return aws_disk.GP2
+
+  @property
+  def _ingress_manifest_path(self) -> str:
+    """The path to the ingress manifest template file."""
+    return 'container/ingress.yaml.j2'
+
+  def _WaitForIngress(self, name: str, namespace: str, port: int) -> str:
+    """Waits for an Ingress resource to be deployed to the cluster."""
+    del port
+    kubernetes_commands.WaitForResource(
+        'ingress',
+        kubernetes_cluster.INGRESS_JSONPATH,
+        namespace=namespace,
+        condition_type='jsonpath=',
+        extra_args=[name],
+    )
+    stdout, _, _ = kubectl.RunKubectlCommand([
+        'get',
+        'ingress',
+        name,
+        '-n',
+        namespace,
+        '-o',
+        f'jsonpath={kubernetes_cluster.INGRESS_JSONPATH}',
+    ])
+    return self._GetAddressFromIngress(stdout)
+
+  def GetNodePoolNames(self) -> list[str]:
+    """Get node pool names for the cluster."""
+
+    cmd = [
+        FLAGS.eksctl,
+        'get',
+        'nodegroup',
+        '--cluster',
+        self.name,
+        '--region',
+        self.region,
+        '-o',
+        'json',
+    ]
+    stdout, stderr, retcode = vm_util.IssueCommand(cmd)
+    if retcode:
+      logging.warning('Failed to get nodegroups: %s, error: %s', stdout, stderr)
+      return []
+    nodegroups = json.loads(stdout)
+    return [ng['Name'] for ng in nodegroups]
+
+  def AddNodepool(self, batch_name, pool_id):
+    pass
 
 
 class EksCluster(BaseEksCluster):
@@ -137,11 +377,12 @@ class EksCluster(BaseEksCluster):
 
   def InitializeNodePoolForCloud(
       self,
-      vm_config: virtual_machine.BaseVirtualMachine,
-      nodepool_config: container_service.BaseNodePoolConfig,
+      vm_config: virtual_machine_spec.BaseVmSpec,
+      nodepool_config: container.BaseNodePoolConfig,
   ):
-    nodepool_config.disk_type = vm_config.DEFAULT_ROOT_DISK_TYPE  # pytype: disable=attribute-error
-    nodepool_config.disk_size = vm_config.boot_disk_size  # pytype: disable=attribute-error
+    nodepool_config.disk_type = (
+        aws_virtual_machine.AwsVirtualMachine.DEFAULT_ROOT_DISK_TYPE
+    )
 
   def GetResourceMetadata(self):
     """Returns a dict containing metadata about the cluster.
@@ -156,27 +397,28 @@ class EksCluster(BaseEksCluster):
 
   def _Create(self):
     """Creates the control plane and worker nodes."""
-    eksctl_flags = {
-        'kubeconfig': FLAGS.kubeconfig,
-        'managed': True,
-        'name': self.name,
-        'nodegroup-name': container_service.DEFAULT_NODEPOOL,
-        'version': self.cluster_version,
-        # NAT mode uses an EIP.
-        'vpc-nat-mode': 'Disable',
-        'with-oidc': True,
-    }
-    if self.min_nodes != self.max_nodes:
-      eksctl_flags.update({
-          'nodes-min': self.min_nodes,
-          'nodes-max': self.max_nodes,
-      })
-    eksctl_flags.update(self._GetNodeFlags(self.default_nodepool))
-
-    self._EksCtlCreate(eksctl_flags)
-
+    nodepool_jsons = [self._RenderNodeGroupJson(self.default_nodepool)]
     for _, node_group in self.nodepools.items():
-      self._CreateNodeGroup(node_group)
+      nodepool_jsons += [self._RenderNodeGroupJson(node_group)]
+    create_json: dict[str, Any] = {
+        'managedNodeGroups': nodepool_jsons,
+        'vpc': {
+            'nat': {'gateway': 'Disable'},
+        },
+    }
+    self._EksCtlCreate(create_json)
+
+    # Above create command passes "withOidc=true", but it doesn't seem to work &
+    # therefore this command is needed.
+    cmd = [
+        FLAGS.eksctl,
+        'utils',
+        'associate-iam-oidc-provider',
+        f'--cluster={self.name}',
+        f'--region={self.region}',
+        '--approve',
+    ]
+    vm_util.IssueCommand(cmd)
 
     # EBS CSI driver is required for creating EBS volumes in version > 1.23
     # https://docs.aws.amazon.com/eks/latest/userguide/ebs-csi.html
@@ -234,40 +476,29 @@ class EksCluster(BaseEksCluster):
       ]
       vm_util.IssueCommand(cmd)
 
-  def _CreateNodeGroup(
-      self, nodepool_config: container_service.BaseNodePoolConfig
-  ):
-    """Creates a node group."""
-    eksctl_flags = {
-        'cluster': self.name,
-        'name': nodepool_config.name,
-        # Support ARM: https://github.com/weaveworks/eksctl/issues/3569
-        'skip-outdated-addons-check': True,
-    }
-    eksctl_flags.update(self._GetNodeFlags(nodepool_config))
-    cmd = [FLAGS.eksctl, 'create', 'nodegroup'] + sorted(
-        '--{}={}'.format(k, v) for k, v in eksctl_flags.items() if v
-    )
-    vm_util.IssueCommand(cmd, timeout=600)
-
-  def _GetNodeFlags(
-      self, nodepool_config: container_service.BaseNodePoolConfig
-  ) -> Dict[str, Any]:
-    """Get common flags for creating clusters and node_groups."""
-    tags = util.MakeDefaultTags()
-    return {
-        'nodes': nodepool_config.num_nodes,
-        'node-labels': f'pkb_nodepool={nodepool_config.name}',
-        'node-type': nodepool_config.machine_type,
-        'node-volume-size': nodepool_config.disk_size,
-        # zone may be split a comma separated list
-        'node-zones': nodepool_config.zone,
-        'region': self.region,
-        'tags': ','.join(f'{k}={v}' for k, v in tags.items()),
-        'ssh-public-key': (
-            aws_virtual_machine.AwsKeyFileManager.GetKeyNameForRun()
-        ),
-    }
+  def _RenderNodeGroupJson(
+      self, nodepool: container.BaseNodePoolConfig
+  ) -> dict[str, Any]:
+    """Constructs the node group json dictionary."""
+    base_json = super()._RenderNodeGroupJson(nodepool)
+    if nodepool.disk_size:
+      base_json['volumeSize'] = nodepool.disk_size
+    base_json.update({
+        'ssh': {
+            'allow': True,
+            'publicKeyPath': (
+                aws_virtual_machine.AwsKeyFileManager.GetKeyNameForRun()
+            ),
+        },
+    })
+    if self.control_plane_zones:
+      # zones can be a comma separated list or simply a region
+      if isinstance(nodepool.zone, str):
+        zones = [nodepool.zone]
+      else:
+        zones = nodepool.zone
+      base_json['availabilityZones'] = zones
+    return base_json
 
   def _IsReady(self):
     """Returns True if the workers are ready, else False."""
@@ -283,7 +514,7 @@ class EksCluster(BaseEksCluster):
     return ready_nodes >= self.min_nodes
 
   def ResizeNodePool(
-      self, new_size: int, node_pool: str = container_service.DEFAULT_NODEPOOL
+      self, new_size: int, node_pool: str = container_cluster.DEFAULT_NODEPOOL
   ):
     """Change the number of nodes in the node group."""
     cmd = [
@@ -304,9 +535,10 @@ class EksCluster(BaseEksCluster):
 class EksAutoCluster(BaseEksCluster):
   """Class representing an Elastic Kubernetes Service cluster with auto mode.
 
-  Automode supports auto scaling & ignores the concept of nodepools & selecting
-  machine types. It also automatically creates some related resources like a
-  load balancer & networks.
+  Auto mode supports auto scaling & allows users to not specify nodepools nor
+  select machine types if they so wish (but nodepools can still be used to
+  specify these if desired). It also automatically creates some related
+  resources like a load balancer & networks.
   """
 
   CLOUD = provider_info.AWS
@@ -315,27 +547,19 @@ class EksAutoCluster(BaseEksCluster):
   def __init__(self, spec):
     super().__init__(spec)
     self._ChooseSecondZone()
+    is_rare_gpu = virtual_machine.GPU_TYPE.value in _RARE_GPU_TYPES
+    self.use_spot: bool = aws_flags.USE_AWS_SPOT_INSTANCES.value or is_rare_gpu
 
   def InitializeNodePoolForCloud(
       self,
-      vm_config: virtual_machine.BaseVirtualMachine,
-      nodepool_config: container_service.BaseNodePoolConfig,
+      vm_config: virtual_machine_spec.BaseVmSpec,
+      nodepool_config: container.BaseNodePoolConfig,
   ):
     pass
 
   def _Create(self):
     """Creates the control plane and worker nodes."""
-    tags = util.MakeDefaultTags()
-    eksctl_flags = {
-        'kubeconfig': FLAGS.kubeconfig,
-        'name': self.name,
-        'version': self.cluster_version,
-        'with-oidc': True,
-        'enable-auto-mode': True,
-        'region': self.region,
-        'tags': ','.join(f'{k}={v}' for k, v in tags.items()),
-    }
-    self._EksCtlCreate(eksctl_flags)
+    self._EksCtlCreate({'autoModeConfig': {'enabled': True}})
 
     # Enable public and private access to the cluster.
     vpc_cmd = [
@@ -348,7 +572,17 @@ class EksAutoCluster(BaseEksCluster):
         '--public-access=true',
         '--approve',
     ]
-    vm_util.IssueCommand(vpc_cmd, timeout=900)
+    # Retry esp. "cluster currently has an update in progress" errors.
+    vm_util.IssueRetryableCommand(vpc_cmd, timeout=900)
+
+  def _PostCreate(self):
+    """Performs post-creation steps for the cluster."""
+    super()._PostCreate()
+    if self.use_spot:
+      kubernetes_commands.ApplyManifest(
+          'container/auto/nodepool.yaml.j2',
+          CLUSTER_NAME=self.name,
+      )
 
   def _Delete(self):
     """Deletes the control plane and worker nodes."""
@@ -366,7 +600,7 @@ class EksAutoCluster(BaseEksCluster):
 
   def _IsReady(self):
     """Returns True if cluster is running. Autopilot defaults to 0 nodes."""
-    stdout, _, _ = container_service.RunKubectlCommand(['cluster-info'])
+    stdout, _, _ = kubectl.RunKubectlCommand(['cluster-info'])
     # These two strings are printed in sequence, but with ansi color code
     # escape characters in between.
     return 'Kubernetes control plane' in stdout and 'is running at' in stdout
@@ -376,14 +610,716 @@ class EksAutoCluster(BaseEksCluster):
     return aws_disk.GP2
 
   def ResizeNodePool(
-      self, new_size: int, node_pool: str = container_service.DEFAULT_NODEPOOL
+      self, new_size: int, node_pool: str = container_cluster.DEFAULT_NODEPOOL
   ):
     """Change the number of nodes in the node group."""
     # Autopilot does not support nodepools & manual resizes.
     pass
 
-  def GetJinjaNodeSelector(self) -> str:
-    """Get the node selector section of a yaml for the provider."""
+  def GetNodeSelectors(self, machine_type: str | None = None) -> dict[str, str]:
+    """Get the node selectors section of a yaml for the provider."""
+    del machine_type  # Unused.
     # Theoretically needed in mixed mode, but deployments fail without it:
     # https://docs.aws.amazon.com/eks/latest/userguide/associate-workload.html#_require_a_workload_is_deployed_to_eks_auto_mode_nodes
-    return 'eks.amazonaws.com/compute-type: auto'
+    selectors = {'eks.amazonaws.com/compute-type': 'auto'}
+    if self.use_spot:
+      selectors['karpenter.sh/capacity-type'] = 'spot'
+    if virtual_machine.GPU_TYPE.value:
+      selectors['eks.amazonaws.com/instance-gpu-name'] = (
+          virtual_machine.GPU_TYPE.value
+      )
+    return selectors
+
+
+_KARPENTER_NAMESPACE = 'kube-system'
+_KARPENTER_VERSION = '1.8.1'
+_DEAULT_K8S_VERSION = '1.34'
+
+
+class EksKarpenterCluster(BaseEksCluster):
+  """Class representing an Elastic Kubernetes Service cluster with karpenter.
+
+  Requires installation of helm: https://helm.sh/docs/intro/install/
+  """
+
+  CLOUD = provider_info.AWS
+  CLUSTER_TYPE = 'Karpenter'
+
+  def __init__(self, spec):
+    super().__init__(spec)
+    self._ChooseSecondZone()
+    self.stack_name = f'Karpenter-{self.name}'
+    self.cluster_version: str = self.cluster_version or _DEAULT_K8S_VERSION
+
+  def InitializeNodePoolForCloud(
+      self,
+      vm_config: virtual_machine_spec.BaseVmSpec,
+      nodepool_config: container.BaseNodePoolConfig,
+  ):
+    pass
+
+  def _Create(self):
+    """Creates the control plane and worker nodes."""
+    template_filename = vm_util.PrependTempDir('cloud-formation-template.yaml')
+    vm_util.IssueCommand([
+        'curl',
+        '-fsSL',
+        f'https://raw.githubusercontent.com/aws/karpenter-provider-aws/v{_KARPENTER_VERSION}/website/content/en/preview/getting-started/getting-started-with-karpenter/cloudformation.yaml',
+        '-o',
+        template_filename,
+    ])
+    # key=value format differs from other service's Key=key,Value=value format
+    formation_tags = [f'{k}={v}' for k, v in util.MakeDefaultTags().items()]
+    vm_util.IssueCommand(
+        [
+            'aws',
+            'cloudformation',
+            'deploy',
+            '--stack-name',
+            self.stack_name,
+            '--template-file',
+            template_filename,
+            '--capabilities',
+            'CAPABILITY_NAMED_IAM',
+            '--parameter-overrides',
+            f'ClusterName={self.name}',
+            '--region',
+            f'{self.region}',
+            '--tags',
+        ]
+        + formation_tags,
+    )
+    create_json: dict[str, Any] = {
+        'metadata': {
+            'tags': {'karpenter.sh/discovery': self.name},
+        },
+        'iam': {
+            'podIdentityAssociations': [{
+                'namespace': _KARPENTER_NAMESPACE,
+                'serviceAccountName': 'karpenter',
+                'roleName': f'{self.name}-karpenter',
+                'permissionPolicyARNs': [
+                    f'arn:aws:iam::{self.account}:policy/KarpenterControllerPolicy-{self.name}'
+                ],
+            }],
+        },
+        'iamIdentityMappings': [{
+            'arn': (
+                f'arn:aws:iam::{self.account}:role/KarpenterNodeRole-{self.name}'
+            ),
+            'username': 'system:node:{{EC2PrivateDNSName}}',
+            'groups': ['system:bootstrappers', 'system:nodes'],
+        }],
+        'addons': [{'name': 'eks-pod-identity-agent'}],
+        'managedNodeGroups': [self._RenderNodeGroupJson(self.default_nodepool)],
+    }
+    self._EksCtlCreate(create_json)
+
+  def _InstallAwsLoadBalancerController(self) -> None:
+    """Installs AWS Load Balancer Controller for the cluster."""
+    # 1) Ensure OIDC provider (IRSA)
+    vm_util.IssueCommand(
+        [
+            FLAGS.eksctl,
+            'utils',
+            'associate-iam-oidc-provider',
+            f'--region={self.region}',
+            f'--cluster={self.name}',
+            '--approve',
+        ],
+        suppress_failure=lambda stdout, stderr, retcode: 'already associated'
+        in stderr,
+    )
+    # 2) Ensure the IAM policy exists (reuse by name or create)
+    list_cmd = util.AWS_PREFIX + [
+        'iam',
+        'list-policies',
+        '--scope',
+        'Local',
+        '--query',
+        "Policies[?PolicyName=='AWSLoadBalancerControllerIAMPolicy'].Arn | [0]",
+        '--output',
+        'text',
+    ]
+    stdout, _, _ = vm_util.IssueCommand(list_cmd)
+    policy_arn = (stdout or '').strip()
+    if not policy_arn or policy_arn == 'None':
+      with vm_util.NamedTemporaryFile(dir=vm_util.GetTempDir(), mode='w') as tf:
+        vm_util.IssueCommand([
+            'curl',
+            '-sSL',
+            '-o',
+            tf.name,
+            (
+                'https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/'
+                'v2.13.4/docs/install/iam_policy.json'
+            ),
+        ])
+        stdout, _, _ = vm_util.IssueCommand(
+            util.AWS_PREFIX
+            + [
+                'iam',
+                'create-policy',
+                '--policy-name',
+                'AWSLoadBalancerControllerIAMPolicy',
+                '--policy-document',
+                f'file://{tf.name}',
+                '--query',
+                'Policy.Arn',
+                '--output',
+                'text',
+            ]
+        )
+        policy_arn = (stdout or '').strip()
+    # 3) Ensure ServiceAccount
+    vm_util.IssueCommand(
+        [
+            FLAGS.eksctl,
+            'create',
+            'iamserviceaccount',
+            '--cluster',
+            self.name,
+            '--region',
+            self.region,
+            '--namespace',
+            'kube-system',
+            '--name',
+            'aws-load-balancer-controller',
+            '--attach-policy-arn',
+            policy_arn,
+            '--approve',
+            '--override-existing-serviceaccounts',
+        ],
+        suppress_failure=lambda stdout, stderr, retcode: 'already exists'
+        in stderr,
+    )
+    # 4) Apply CRDs
+    kubectl.RunKubectlCommand(
+        [
+            'apply',
+            '-f',
+            'https://raw.githubusercontent.com/aws/eks-charts/master/stable/aws-load-balancer-controller/crds/crds.yaml',
+        ],
+        suppress_failure=lambda stdout, stderr, retcode: 'already exists'
+        in stderr,
+    )
+    # 5) Installs Helm chart
+    vm_util.IssueCommand(
+        ['helm', 'repo', 'add', 'eks', 'https://aws.github.io/eks-charts'],
+        suppress_failure=lambda stdout, stderr, retcode: 'already exists'
+        in stderr,
+    )
+    vm_util.IssueCommand(['helm', 'repo', 'update', 'eks'])
+    vm_util.IssueCommand([
+        'helm',
+        'upgrade',
+        '--install',
+        'aws-load-balancer-controller',
+        'eks/aws-load-balancer-controller',
+        '-n',
+        'kube-system',
+        '--kubeconfig',
+        FLAGS.kubeconfig,
+        '--set',
+        f'clusterName={self.name}',
+        '--set',
+        'serviceAccount.create=false',
+        '--set',
+        'serviceAccount.name=aws-load-balancer-controller',
+        '--set',
+        f'region={self.region}',
+        '--set',
+        'createIngressClassResource=true',
+        '--set',
+        'ingressClass=alb',
+        '--set',
+        'replicaCount=1',
+    ])
+    # 6) Wait for rollout
+    kubectl.RunKubectlCommand([
+        'rollout',
+        'status',
+        'deployment/aws-load-balancer-controller',
+        '-n',
+        'kube-system',
+        '--timeout=180s',
+    ])
+
+  @property
+  def _ingress_manifest_path(self) -> str:
+    """The path to the ingress manifest template file.
+
+    Has service + ingress with annotations for AWS Load Balancer Controller
+    (without IngressClass).
+
+    Returns:
+      The path to the ingress manifest template file.
+    """
+    return 'container/karpenter/ingress_alb.yaml.j2'
+
+  def _WaitForIngress(self, name: str, namespace: str, port: int) -> str:
+    """Wait for the ingress & apply some additional networking fixes."""
+    # Wait until the ingress resource gets an address (hostname or IP).
+    kubernetes_commands.WaitForResource(
+        'ingress',
+        kubernetes_cluster.INGRESS_JSONPATH,
+        namespace=namespace,
+        condition_type='jsonpath=',
+        extra_args=[name],
+    )
+    # Retrieve the ingress address to return it back.
+    stdout, _, _ = kubectl.RunKubectlCommand([
+        'get',
+        'ingress',
+        name,
+        '-n',
+        namespace,
+        '-o',
+        f'jsonpath={kubernetes_cluster.INGRESS_JSONPATH}',
+    ])
+    address = self._GetAddressFromIngress(stdout)
+
+    # Networking fixups for ALB/NODE security groups.
+    self._PostIngressNetworkingFixups(
+        namespace=namespace, name=name, port=port, address=address
+    )
+
+    return address
+
+  def _PostIngressNetworkingFixups(
+      self, namespace: str, name: str, port: int, address: str
+  ) -> None:
+    """Fixs ALB -> nodes connectivity to prevent 504 errors from unhealthy targets."""
+
+    # 1) Get ALB security group from address
+    host = (
+        parse.urlparse(address).hostname
+        if address.startswith('http')
+        else address
+    )
+    normalized = (host or '').replace('dualstack.', '')
+    if not normalized:
+      raise errors.Config.InvalidValue(
+          f'No valid hostname in address: {address}'
+      )
+    out, _ = vm_util.IssueRetryableCommand(
+        util.AWS_PREFIX
+        + [
+            'elbv2',
+            'describe-load-balancers',
+            '--region',
+            self.region,
+            '--query',
+            (
+                'LoadBalancers[?contains(DNSName,'
+                f" '{normalized}')].SecurityGroups[0]"
+            ),
+            '--output',
+            'text',
+        ],
+        timeout=120,
+    )
+    alb_sg = (out or '').strip()
+    if not alb_sg or alb_sg == 'None':
+      raise errors.Resource.GetError(
+          f'ALB security group not found for {normalized}'
+      )
+    # 2) Get node security groups from actual running instances
+    ids_out, _ = vm_util.IssueRetryableCommand(
+        [
+            FLAGS.kubectl,
+            '--kubeconfig',
+            FLAGS.kubeconfig,
+            'get',
+            'nodes',
+            '-o',
+            'jsonpath={.items[*].spec.providerID}',
+        ],
+        timeout=120,
+    )
+    if not ids_out.strip():
+      raise errors.Resource.GetError('No nodes found in cluster')
+    # 3) Extract instance IDs
+    instance_ids = [
+        pid.split('/')[-1]
+        for pid in ids_out.split()
+        if '/' in pid and pid.split('/')[-1].startswith('i-')
+    ]
+    if not instance_ids:
+      raise errors.Resource.GetError('No valid instance IDs found from nodes')
+    out, _, _ = vm_util.IssueCommand(
+        util.AWS_PREFIX
+        + [
+            'ec2',
+            'describe-instances',
+            '--region',
+            self.region,
+            '--instance-ids',
+            *instance_ids,
+            '--query',
+            'Reservations[].Instances[].SecurityGroups[].GroupId',
+            '--output',
+            'text',
+        ]
+    )
+    if not out.strip():
+      raise errors.Resource.GetError(
+          f'No security groups found for instances: {instance_ids}'
+      )
+    node_sgs = set(out.split())
+    # 4) CRITICAL: Allow ALB to reach nodes on app port (fixes 504 errors)
+    for sg in node_sgs:
+      vm_util.IssueCommand(
+          util.AWS_PREFIX
+          + [
+              'ec2',
+              'authorize-security-group-ingress',
+              '--region',
+              self.region,
+              '--group-id',
+              sg,
+              '--protocol',
+              'tcp',
+              '--port',
+              str(port),
+              '--source-group',
+              alb_sg,
+          ],
+          suppress_failure=lambda stdout, stderr, retcode: 'already exists'
+          in stderr,
+      )
+    logging.info(
+        '[PKB][EKS] Allowed ALB SG %s -> node SGs on port %s', alb_sg, port
+    )
+
+  def _PostCreate(self):
+    """Performs post-creation steps for the cluster."""
+    super()._PostCreate()
+    vm_util.IssueCommand([
+        'helm',
+        'upgrade',
+        '--install',
+        'karpenter',
+        'oci://public.ecr.aws/karpenter/karpenter',
+        '--version',
+        str(_KARPENTER_VERSION),
+        '--namespace',
+        _KARPENTER_NAMESPACE,
+        '--kubeconfig',
+        FLAGS.kubeconfig,
+        '--create-namespace',
+        '--set',
+        f'settings.clusterName={self.name}',
+        '--set',
+        f'settings.interruptionQueue={self.name}',
+        '--set',
+        'controller.resources.requests.cpu=1',
+        '--set',
+        'controller.resources.requests.memory=1Gi',
+        '--set',
+        'controller.resources.limits.cpu=1',
+        '--set',
+        'controller.resources.limits.memory=1Gi',
+        '--set',
+        'logLevel=debug',
+        '--wait',
+    ])
+    # Ensure ALB ingress support: installs AWS Load Balancer Controller.
+    if FLAGS.eks_install_alb_controller:
+      self._InstallAwsLoadBalancerController()
+    # Get the AMI version for current kubernetes version.
+    # See e.g. https://karpenter.sh/docs/tasks/managing-amis/ for not using
+    # @latest.
+    image_id, _, _ = vm_util.IssueCommand([
+        'aws',
+        'ssm',
+        'get-parameter',
+        '--name',
+        f'/aws/service/eks/optimized-ami/{self.cluster_version}/amazon-linux-2023/x86_64/standard/recommended/image_id',
+        '--region',
+        self.region,
+        '--query',
+        'Parameter.Value',
+    ])
+    image_id = image_id.strip().strip('"')
+    full_version, _, _ = vm_util.IssueCommand([
+        'aws',
+        'ec2',
+        'describe-images',
+        '--query',
+        'Images[0].Name',
+        '--image-ids',
+        image_id,
+        '--region',
+        self.region,
+    ])
+    alias_version = (
+        'v'
+        + full_version.strip().strip('"').split(f'{self.cluster_version}-v')[1]
+    )
+    kubernetes_commands.ApplyManifest(
+        'container/karpenter/nodepool.yaml.j2',
+        CLUSTER_NAME=self.name,
+        ALIAS_VERSION=alias_version,
+    )
+
+  def _Delete(self):
+    """Deletes the control plane and worker nodes."""
+    self._DeleteIngresses()
+    self._CleanupKarpenter()
+    super()._Delete()
+    vm_util.IssueCommand([
+        'aws',
+        'cloudformation',
+        'delete-stack',
+        '--stack-name',
+        self.stack_name,
+        '--region',
+        f'{self.region}',
+    ])
+
+  def _DeleteDependencies(self):
+    """Deletes the CloudFormation stack."""
+    super()._DeleteDependencies()
+    delete_stack_cmd = [
+        'aws',
+        'cloudformation',
+        'delete-stack',
+        '--stack-name',
+        self.stack_name,
+        '--region',
+        f'{self.region}',
+    ]
+    # Start deleting the stack but likely to fail to delete this role.
+    vm_util.IssueCommand(delete_stack_cmd)
+    node_role = f'KarpenterNodeRole-{self.name}'
+    out, _, _ = vm_util.IssueCommand([
+        'aws',
+        'iam',
+        'list-instance-profiles-for-role',
+        '--role-name',
+        node_role,
+        '--region',
+        f'{self.region}',
+    ])
+    profiles_json = json.loads(out)
+    for profile in profiles_json.get('InstanceProfiles', []):
+      profile_name = profile['InstanceProfileName']
+      vm_util.IssueCommand([
+          'aws',
+          'iam',
+          'remove-role-from-instance-profile',
+          '--instance-profile-name',
+          profile_name,
+          '--role-name',
+          node_role,
+          '--region',
+          f'{self.region}',
+      ])
+      vm_util.IssueCommand([
+          'aws',
+          'iam',
+          'delete-instance-profile',
+          '--instance-profile-name',
+          profile_name,
+          '--region',
+          f'{self.region}',
+      ])
+    # Finish deleting the stack after deleting the role.
+    vm_util.IssueCommand(delete_stack_cmd)
+
+  def _DeleteIngresses(self):
+    """Deletes all ingresses in all namespaces (to trigger ALB deletion)."""
+    kubectl.RunKubectlCommand(
+        [
+            'delete',
+            'ingress',
+            '--all',
+            '--all-namespaces',
+            '--timeout=600s',
+        ],
+        timeout=660,
+        suppress_failure=lambda stdout, stderr, retcode: (
+            'deleted' in stdout
+            and 'timed out waiting for the condition' in stderr
+        ),
+    )
+
+  def _CleanupKarpenter(self):
+    """Cleanup Karpenter managed nodes before cluster deletion."""
+    logging.info('Cleaning up Karpenter nodes...')
+    # Delete NodePool resources - this will trigger node termination
+    kubectl.RunKubectlCommand(
+        [
+            'delete',
+            'nodepool,ec2nodeclass',
+            '--all',
+            '--timeout=120s',
+        ],
+        suppress_failure=lambda stdout, stderr, retcode: (
+            'no resources found' in stderr.lower()
+            or 'not found' in stderr.lower()
+            or 'timed out waiting for the condition' in stderr.lower()
+        ),
+    )
+    # Wait for all Karpenter nodes to be deleted
+    kubectl.RunKubectlCommand(
+        [
+            'wait',
+            '--for=delete',
+            'node',
+            '-l',
+            'karpenter.sh/nodepool',
+            '--timeout=120s',
+        ],
+        suppress_failure=lambda stdout, stderr, retcode: (
+            'no matching resources found' in stderr.lower()
+            or 'timed out' in stderr.lower()
+        ),
+    )
+    # Force terminate remaining EC2 instances
+    stdout, _, _ = vm_util.IssueCommand(
+        [
+            'aws',
+            'ec2',
+            'describe-instances',
+            '--region',
+            self.region,
+            '--filters',
+            'Name=tag:karpenter.sh/nodepool,Values=*',
+            f'Name=tag:kubernetes.io/cluster/{self.name},Values=owned',
+            'Name=instance-state-name,Values=running,pending',
+            '--query',
+            'Reservations[].Instances[].InstanceId',
+            '--output',
+            'text',
+        ],
+    )
+    instance_ids = stdout.strip().split() if stdout and stdout.strip() else []
+    if instance_ids:
+      logging.info('Terminating %d remaining instances', len(instance_ids))
+      vm_util.IssueCommand(
+          [
+              'aws',
+              'ec2',
+              'terminate-instances',
+              '--region',
+              self.region,
+              '--instance-ids',
+              *instance_ids,
+          ],
+      )
+      vm_util.IssueCommand(
+          [
+              'aws',
+              'ec2',
+              'wait',
+              'instance-terminated',
+              '--region',
+              self.region,
+              '--instance-ids',
+              *instance_ids,
+          ],
+          timeout=180,
+      )
+    # Cleanup orphaned network interfaces
+    stdout, _, _ = vm_util.IssueCommand(
+        [
+            'aws',
+            'ec2',
+            'describe-network-interfaces',
+            '--region',
+            self.region,
+            '--filters',
+            f'Name=tag:cluster.k8s.amazonaws.com/name,Values={self.name}',
+            'Name=status,Values=available',
+            '--query',
+            'NetworkInterfaces[].NetworkInterfaceId',
+            '--output',
+            'text',
+        ],
+        suppress_failure=lambda stdout, stderr, retcode: (
+            'not found' in stderr.lower()
+        ),
+    )
+    eni_ids = stdout.strip().split() if stdout and stdout.strip() else []
+    if eni_ids:
+      logging.info('Deleting %d orphaned network interfaces', len(eni_ids))
+      for eni_id in eni_ids:
+        vm_util.IssueCommand(
+            [
+                'aws',
+                'ec2',
+                'delete-network-interface',
+                '--region',
+                self.region,
+                '--network-interface-id',
+                eni_id,
+            ],
+            suppress_failure=lambda stdout, stderr, retcode: (
+                'not found' in stderr.lower()
+                or 'does not exist' in stderr.lower()
+            ),
+        )
+
+  def _IsReady(self):
+    """Returns True if cluster is running. Autopilot defaults to 0 nodes."""
+    stdout, _, _ = kubectl.RunKubectlCommand(['cluster-info'])
+    # These two strings are printed in sequence, but with ansi color code
+    # escape characters in between.
+    return 'Kubernetes control plane' in stdout and 'is running at' in stdout
+
+  def GetDefaultStorageClass(self) -> str:
+    """Gets the default storage class for the provider."""
+    return aws_disk.GP2
+
+  def ResizeNodePool(
+      self, new_size: int, node_pool: str = container_cluster.DEFAULT_NODEPOOL
+  ):
+    """Change the number of nodes in the node group."""
+    raise NotImplementedError()
+
+  def GetNodeSelectors(self, machine_type: str | None = None) -> dict[str, str]:
+    """Gets the node selectors section of a yaml for the provider."""
+    selectors = {}
+    # If GPU is requested, use the GPU nodepool
+    if virtual_machine.GPU_TYPE.value:
+      selectors['karpenter.sh/nodepool'] = 'gpu'
+    else:
+      # Otherwise, use instance-family selector if machine_type is specified
+      machine_family = util.GetMachineFamily(machine_type)
+      if machine_family:
+        selectors['karpenter.k8s.aws/instance-family'] = machine_family
+    return selectors
+
+  def GetNodePoolNames(self) -> list[str]:
+    """Gets node pool names for the cluster.
+
+    Returns:
+      All CRD NodePool names created by Karpenter.
+    """
+    cmd = [
+        FLAGS.kubectl,
+        '--kubeconfig',
+        FLAGS.kubeconfig,
+        'get',
+        'nodepool',
+        '-o',
+        'json',
+    ]
+    stdout, stderr, retcode = vm_util.IssueCommand(cmd)
+    if retcode:
+      logging.warning(
+          'Failed to get Karpenter NodePools: %s, error: %s', stdout, stderr
+      )
+      return []
+    nodepools = json.loads(stdout)
+    return [item['metadata']['name'] for item in nodepools.get('items', [])]
+
+  def AddNodepool(self, batch_name, pool_id):
+    kubernetes_commands.ApplyManifest(
+        'provision_node_pools/karpenter/nodepool.yaml.j2',
+        batch_name=batch_name,
+        pool_id=pool_id,
+        cluster_name=self.name,
+    )

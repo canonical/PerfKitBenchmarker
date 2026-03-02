@@ -55,10 +55,10 @@ netperf_aggregate:
   description: simultaneous netperf to multiple endpoints
   vm_groups:
     servers:
-      vm_spec: *default_single_core
+      vm_spec: *default_dual_core
       vm_count: 2
     client:
-      vm_spec: *default_single_core
+      vm_spec: *default_dual_core
   flags:
     placement_group_style: closest_supported
 """
@@ -171,13 +171,11 @@ def RunNetperfAggregate(vm, server_ips):
 
   # setup remote hosts file
   vm.RemoteCommand(f'cd {netperf.NETPERF_EXAMPLE_DIR} && rm remote_hosts')
-  ip_num = 0
-  for ip in server_ips:
+  for ip_num, ip in enumerate(server_ips):
     vm.RemoteCommand(
         f"echo 'REMOTE_HOSTS[{ip_num}]={ip}' >> "
         f'{netperf.NETPERF_EXAMPLE_DIR}/remote_hosts'
     )
-    ip_num += 1
 
   vm.RemoteCommand(
       f"echo 'NUM_REMOTE_HOSTS={len(server_ips)}' >> "
@@ -253,7 +251,10 @@ def Run(benchmark_spec):
       break
 
   if run_internal:
-    server_ips = list(vm.internal_ip for vm in server_vms)
+    server_ips = []
+    for server_vm in server_vms:
+      for ip in server_vm.GetInternalIPs():
+        server_ips.append(ip)
     internal_ip_results = RunNetperfAggregate(client_vm, server_ips)
 
     for internal_ip_result in internal_ip_results:

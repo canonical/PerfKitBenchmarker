@@ -32,7 +32,7 @@ unixbench:
   description: Runs UnixBench.
   vm_groups:
     default:
-      vm_spec: *default_single_core
+      vm_spec: *default_dual_core
 """
 URI = 'ibmuri123'
 
@@ -79,6 +79,7 @@ class IbmCloudVirtualMachineTest(pkb_common_test_case.PkbCommonTestCase):
     spec = self._CreateBenchmarkSpecFromConfigDict(config, benchmark_name)
     spec.disable_interrupt_moderation = False
     spec.disable_rss = False
+    spec.boot_disk_size = None
     spec.zone = 'us-south-1'
     spec.cidr = '10.101.0.0/24'
     spec.machine_type = 'Test_machine_type'
@@ -87,6 +88,7 @@ class IbmCloudVirtualMachineTest(pkb_common_test_case.PkbCommonTestCase):
     spec.image = 'test-image'
     spec.install_packages = 'None'
     spec.assign_external_ip = True
+    spec.assign_external_ip_all_nics = False
     spec.background_cpu_threads = 'None'
     spec.background_network_mbits_per_sec = '1'
     spec.background_network_ip_type = 'None'

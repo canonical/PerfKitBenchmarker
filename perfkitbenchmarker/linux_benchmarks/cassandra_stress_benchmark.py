@@ -31,25 +31,31 @@ max op rate.
 
 import collections
 import copy
-import functools
+import dataclasses
 import logging
 import math
 import posixpath
 import re
 import time
-from typing import Union
+from typing import Any, Dict, List, Optional, Union
 
 from absl import flags
-
-from perfkitbenchmarker import (background_tasks, configs, data, errors,
-                                regex_util, sample, units, vm_util)
+import immutabledict
+from perfkitbenchmarker import background_tasks
+from perfkitbenchmarker import configs
+from perfkitbenchmarker import data
+from perfkitbenchmarker import errors
+from perfkitbenchmarker import regex_util
+from perfkitbenchmarker import sample
+from perfkitbenchmarker import units
+from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.linux_packages import cassandra
 
 NUM_KEYS_PER_CORE = 2000000
 # Adding wait between prefill and the test workload to give some time
 # for the data to propagate and for the cluster to stabilize.
 PROPAGATION_WAIT_TIME = 720
-WAIT_BETWEEN_COMPACTION_TASKS_CHECK = 720
+WAIT_BETWEEN_COMPACTION_TASKS_CHECK = 300
 
 # cassandra-stress command
 WRITE_COMMAND = 'write'
@@ -95,12 +101,6 @@ CASSANDRA_STRESS_NUM_KEYS = flags.DEFINE_integer(
     ' unset, this benchmark will use %s * NumCpusForBenchmark() on data nodes'
     ' as the value. Ignored if --cassandra_stress_run_duration is set.'
     % NUM_KEYS_PER_CORE,
-)
-
-flags.DEFINE_integer(
-    'num_cassandra_stress_threads',
-    150,
-    'Number of threads used in cassandra-stress tool on each loader node.',
 )
 
 flags.DEFINE_integer(
@@ -157,13 +157,34 @@ CASSANDRA_CLIENT_ZONES = flags.DEFINE_list(
 )
 CASSANDRA_CPU_UTILIZATION_LIMIT = flags.DEFINE_integer(
     'cassandra_cpu_utilization_limit',
-    70,
+    80,
     'Maximum cpu utilization percentage for the benchmark. ',
 )
 CASSANDRA_STRESS_MAX_RUNS = flags.DEFINE_integer(
     'cassandra_stress_max_runs',
     6,
     'Max Number of times to run cassandra-stress to optimize performance.',
+)
+
+CASSANDRA_REPLICATION_FACTOR = flags.DEFINE_integer(
+    'cassandra_replication_factor', 3, 'Num of replicas.'
+)
+CASSANDRA_CONCURRENT_READS = flags.DEFINE_integer(
+    'cassandra_concurrent_reads',
+    32,
+    'Concurrent read requests each server accepts.',
+)
+CASSANDRA_CONCURRENT_WRITES = flags.DEFINE_integer(
+    'cassandra_concurrent_writes',
+    None,
+    'Concurrent write requests each server accepts. Suggested number is'
+    ' Number of CPUs in the VM * 8',
+)
+
+CASSANDRA_STRESS_THREADS = flags.DEFINE_list(
+    'cassandra_stress_threads',
+    [],
+    'The list of threads to use for cassandra-stress. ',
 )
 # Use "./cassandra-stress help -pop" to get more details.
 # [dist=DIST(?)]: Seeds are selected from this distribution
@@ -249,6 +270,25 @@ flags.DEFINE_string(
     'Only valid if --cassandra_stress_command=user.',
 )
 
+CASSANDRA_COMPACTION_STRATEGY = flags.DEFINE_enum(
+    'cassandra_compaction_strategy',
+    'SizeTieredCompactionStrategy',  # Cassandra default.
+    ['SizeTieredCompactionStrategy', 'LeveledCompactionStrategy'],
+    'Compaction strategy to use for the cassandra server.',
+)
+
+CASSANDRA_CONCURRENT_COMPACTORS = flags.DEFINE_integer(
+    'cassandra_concurrent_compactors',
+    None,
+    'Number of concurrent compactors to use for the cassandra server.',
+)
+
+CASSANDRA_COMPACTION_THROUGHPUT_MB = flags.DEFINE_integer(
+    'cassandra_compaction_throughput_mb',
+    None,
+    'Compaction throughput in MB/sec to use for the cassandra server.',
+)
+
 FLAGS = flags.FLAGS
 
 BENCHMARK_NAME = 'cassandra_stress'
@@ -279,6 +319,19 @@ cassandra_stress:
         AWS:
           machine_type: m6i.xlarge
           zone: us-east-1
+  flags:
+    cassandra_stress_run_duration: 10m
+    is_row_cache_enabled: false
+    cassandra_replication_factor: 3
+    cassandra_stress_consistency_level: LOCAL_QUORUM
+    cassandra_client_zones: us-central1-a
+    cassandra_server_zones: us-central1-a,us-central1-b,us-central1-c
+    cassandra_stress_population_distribution: GAUSSIAN
+    client_vm_machine_type: c3-standard-4
+    db_machine_type: c3-standard-4
+    db_disk_type: hypderdisk-balanced
+    db_disk_size: 350
+    openjdk_version: 17
 """
 
 CASSANDRA_GROUP = 'workers'
@@ -323,7 +376,7 @@ MAXIMUM_METRICS = {'latency max'}
 THREAD_INCREMENT_COUNT = 50
 MAX_MEDIAN_LATENCY_MS = 20
 MAX_ACCEPTED_COMPACTION_TIME = 30
-STARTING_THREAD_COUNT = 25
+STARTING_THREAD_COUNT = 1
 SAR_CPU_UTILIZATION_INTERVAL = 10
 
 
@@ -335,50 +388,44 @@ def GetConfig(user_config):
   """Customize the config for the benchmark based on flags."""
   cloud = FLAGS.cloud
   config = configs.LoadConfig(BENCHMARK_CONFIG, user_config, BENCHMARK_NAME)
-  if FLAGS.client_vm_machine_type:
-    vm_spec = config['vm_groups'][CLIENT_GROUP]['vm_spec']
-    for cloud_value in vm_spec:
-      config['vm_groups'][CLIENT_GROUP]['vm_spec'][cloud_value][
-          'machine_type'
-      ] = FLAGS.client_vm_machine_type
-  if FLAGS.db_machine_type:
-    vm_spec = config['vm_groups'][CASSANDRA_GROUP]['vm_spec']
-    for cloud_value in vm_spec:
-      config['vm_groups'][CASSANDRA_GROUP]['vm_spec'][cloud_value][
-          'machine_type'
-      ] = FLAGS.db_machine_type
-  if FLAGS.db_disk_type:
-    disk_spec = config['vm_groups'][CASSANDRA_GROUP]['disk_spec']
-    for cloud_value in disk_spec:
-      config['vm_groups'][CASSANDRA_GROUP]['disk_spec'][cloud_value][
-          'disk_type'
-      ] = FLAGS.db_disk_type
-  if FLAGS.db_disk_size:
-    disk_spec = config['vm_groups'][CASSANDRA_GROUP]['disk_spec']
-    for cloud_value in disk_spec:
-      config['vm_groups'][CASSANDRA_GROUP]['disk_spec'][cloud_value][
-          'disk_size'
-      ] = FLAGS.db_disk_size
-  if FLAGS.db_disk_iops:
-    disk_spec = config['vm_groups'][CASSANDRA_GROUP]['disk_spec']
-    for cloud_value in disk_spec:
-      config['vm_groups'][CASSANDRA_GROUP]['disk_spec'][cloud_value][
-          'provisioned_iops'
-      ] = FLAGS.db_disk_iops
-  if FLAGS.db_disk_throughput:
-    disk_spec = config['vm_groups'][CASSANDRA_GROUP]['disk_spec']
-    for cloud_value in disk_spec:
-      config['vm_groups'][CASSANDRA_GROUP]['disk_spec'][cloud_value][
-          'provisioned_throughput'
-      ] = FLAGS.db_disk_throughput
-  ConfigureVmGroups(
-      config, CASSANDRA_SERVER_ZONES.value, CASSANDRA_GROUP, cloud
+  ConfigureVmSpec(
+      config,
+      CLIENT_GROUP,
+      'vm_spec',
+      'machine_type',
+      FLAGS.client_vm_machine_type,
   )
-  ConfigureVmGroups(config, CASSANDRA_CLIENT_ZONES.value, CLIENT_GROUP, cloud)
+  ConfigureVmSpec(
+      config,
+      CASSANDRA_GROUP,
+      'vm_spec',
+      'machine_type',
+      FLAGS.db_machine_type,
+  )
+  server_zones = (
+      FLAGS.cassandra_server_zones
+      or config['flags']['cassandra_server_zones'].split(',')
+  )
+  client_zones = (
+      FLAGS.cassandra_client_zones
+      or config['flags']['cassandra_client_zones'].split(',')
+  )
+  ConfigureVmZones(config, server_zones, CASSANDRA_GROUP, cloud)
+  ConfigureVmZones(config, client_zones, CLIENT_GROUP, cloud)
   return config
 
 
-def ConfigureVmGroups(config, flag, group_name, cloud):
+def ConfigureVmSpec(config, group_name, spec_type, property_name, value):
+  if value is None:
+    return
+  spec = config['vm_groups'][group_name][spec_type]
+  for cloud_value in spec:
+    config['vm_groups'][group_name][spec_type][cloud_value][
+        property_name
+    ] = value
+
+
+def ConfigureVmZones(config, flag, group_name, cloud):
   for index, zone in enumerate(flag):
     if index == 0:
       config['vm_groups'][group_name]['vm_spec'][cloud]['zone'] = zone
@@ -454,8 +501,7 @@ def GenerateMetadataFromFlags(benchmark_spec, cassandra_vms, client_vms):
       'concurrent_reads': FLAGS.cassandra_concurrent_reads,
       'concurrent_writes': FLAGS.cassandra_concurrent_writes,
       'num_data_nodes': len(cassandra_vms),
-      'num_loader_nodes': len(client_vms),
-      'num_cassandra_stress_threads': FLAGS.num_cassandra_stress_threads,
+      'num_client_vms': len(client_vms),
       'num_cassandra_stress_preload_threads': (
           CASSANDRA_STRESS_PRELOAD_THREADS.value
       ),
@@ -509,12 +555,11 @@ def PreloadCassandraServer(cassandra_vms, client_vms, metadata):
       metadata['num_preload_keys'],
       cassandra_stress_command,
   )
-  RunCassandraStressTest(
+  RunCassandraStressTestOnClients(
       cassandra_vms,
       client_vms,
-      metadata['num_preload_keys'],
       cassandra_stress_command,
-      CASSANDRA_STRESS_PRELOAD_THREADS.value,
+      metadata,
       is_preload=True,
   )
   logging.info('Waiting %s for keyspace to propagate.', PROPAGATION_WAIT_TIME)
@@ -543,7 +588,7 @@ def Prepare(benchmark_spec):
   cassandra_vms, client_vms = ParseVmGroups(vm_dict)
   logging.info('VM dictionary %s', vm_dict)
 
-  logging.info('Authorizing loader[0] permission to access all other vms.')
+  logging.info('Authorizing client[0] permission to access all other vms.')
   client_vms[0].AuthenticateVm()
 
   logging.info('Preparing data files and Java on all vms.')
@@ -559,20 +604,30 @@ def Prepare(benchmark_spec):
       lambda vm: vm.InstallPackages('sysstat'), cassandra_vms + client_vms
   )
   seed_vm = cassandra_vms[0]
-  configure = functools.partial(cassandra.Configure, seed_vms=[seed_vm])
-  background_tasks.RunThreaded(configure, cassandra_vms)
+  ConfigureCassandra(seed_vm, cassandra_vms)
   cassandra.StartCluster(seed_vm, cassandra_vms[1:])
   if FLAGS.cassandra_stress_command == USER_COMMAND:
     for vm in client_vms:
-      vm.PushFile(FLAGS.cassandra_stress_profile, TEMP_PROFILE_PATH)
+      vm.PushFile(FLAGS.cassandra_stress_profile, GetCassandraTempProfilePath())
   metadata = GenerateMetadataFromFlags(
       benchmark_spec, cassandra_vms, client_vms
   )
   if metadata['num_preload_keys']:
     CheckMetadata(metadata)
   cassandra.CreateKeyspace(
-      seed_vm, replication_factor=FLAGS.cassandra_replication_factor
+      seed_vm,
+      replication_factor=FLAGS.cassandra_replication_factor,
+      is_row_cache_enabled=IS_ROW_CACHE_ENABLED.value,
   )
+  for vm in cassandra_vms:
+    if CASSANDRA_CONCURRENT_COMPACTORS.value:
+      cassandra.UpdateCassandraConcurrentCompactorCount(
+          vm, CASSANDRA_CONCURRENT_COMPACTORS.value
+      )
+    if CASSANDRA_COMPACTION_THROUGHPUT_MB.value:
+      cassandra.UpdateCassandraCompactionThroughput(
+          vm, CASSANDRA_COMPACTION_THROUGHPUT_MB.value
+      )
   PreloadCassandraServer(cassandra_vms, client_vms, metadata)
   WaitForCompactionTasks(cassandra_vms)
 
@@ -581,154 +636,152 @@ def _ResultFilePath(vm):
   return posixpath.join(vm_util.VM_TMP_DIR, vm.hostname + '.stress_results.txt')
 
 
-def RunTestOnLoader(
-    vm,
-    loader_index,
-    operations_per_vm,
-    data_node_ips,
-    command,
-    user_operations,
-    population_per_vm,
-    population_dist,
-    population_params,
-    thread_count,
-    is_preload,
-):
-  """Run Cassandra-stress test on loader node.
+def ConfigureCassandra(seed_vm, cassandra_vms):
+  """Configure cassandra configuration files."""
+  configure_tasks = []
 
-  Args:
-    vm: The target vm.
-    loader_index: integer. The index of target vm in loader vms.
-    operations_per_vm: integer. The number of operations each loader vm
-      requests.
-    data_node_ips: list. List of IP addresses for all data nodes.
-    command: string. The cassandra-stress command to use.
-    user_operations: string. The operations to use with user mode.
-    population_per_vm: integer. Population per loader vm.
-    population_dist: string. The population distribution.
-    population_params: string. Representing additional population parameters.
-    thread_count: integer. The number of threads to use for cassandra-stress.
-    is_preload: boolean. Whether this is a preload run.
-  """
+  for vm in cassandra_vms:
+    # Cassandra concurrent reads and writes are explained here:
+    # https://cassandra.apache.org/doc/3.11/cassandra/configuration/cass_yaml_file.html#concurrent_reads
+    custom_cassandra_conf = {
+        'concurrent_reads': FLAGS.cassandra_concurrent_reads,
+        'concurrent_writes': (
+            FLAGS.cassandra_concurrent_writes
+            or 8 * vm.NumCpusForBenchmark()
+        ),
+        'row_cache_size': (
+            f'{ROW_CACHE_SIZE.value}MiB'
+            if IS_ROW_CACHE_ENABLED.value
+            else '0MiB'
+        ),
+    }
+    configure_tasks.append((
+        cassandra.Configure,
+        [vm, [seed_vm], custom_cassandra_conf],
+        {},
+    ))
+  background_tasks.RunParallelThreads(configure_tasks, max_concurrency=10)
+
+
+@dataclasses.dataclass
+class CassandraStressCommandSpec:
+  """Spec for a cassandra-stress command."""
+  client_vm: Any
+  client_index: int
+  total_clients: int
+  cassandra_vms: List[Any]
+  command: str
+  metadata: Dict[str, Any]
+  duration: Optional[str]
+  consistency_level: str
+  retries: int
+  mixed_ratio: Optional[str]
+  replication_factor: int
+  compaction_strategy: str
+  is_preload: bool = False
+
+
+def GenerateCassandraStressCommand(
+    spec: CassandraStressCommandSpec,
+):
+  """Generates a cassandra-stress command."""
+  num_keys = (
+      spec.metadata['num_keys']
+      if not spec.is_preload
+      else spec.metadata['num_preload_keys']
+  )
+  user_operations = spec.metadata.get('operations') or 'insert=1'
+  population_size = spec.metadata['population_size'] or num_keys
+  population_dist = spec.metadata['population_dist']
+  population_parameters = spec.metadata['population_parameters']
+  data_node_ips = [vm.internal_ip for vm in spec.cassandra_vms]
+  thread_count = (
+      spec.metadata['num_cassandra_stress_threads']
+      if not spec.is_preload
+      else spec.metadata['num_cassandra_stress_preload_threads']
+  )
+  command = spec.command
   if command == USER_COMMAND:
     command += r' profile={profile} ops\({ops}\)'.format(
-        profile=TEMP_PROFILE_PATH, ops=user_operations
+        profile=GetCassandraTempProfilePath(), ops=user_operations
     )
-
     schema_option = ''
   else:
     if command == MIXED_COMMAND:
-      command += r' ratio\({ratio}\)'.format(
-          ratio=FLAGS.cassandra_stress_mixed_ratio
-      )
-    # TODO: Support more complex replication strategy.
+      command += fr' ratio\({spec.mixed_ratio}\)'
     schema_option = (
-        r'-schema replication\(factor={replication_factor}\)'.format(
-            replication_factor=FLAGS.cassandra_stress_replication_factor
+        r'-schema replication\(factor={replication_factor}\)'
+        r' compaction\(strategy={compaction_strategy}\)'.format(
+            replication_factor=spec.replication_factor,
+            compaction_strategy=spec.compaction_strategy,
         )
     )
+  operations_per_vm = int(math.ceil(float(num_keys) / spec.total_clients))
+  population_per_vm = int(population_size / spec.total_clients)
+  if num_keys % spec.total_clients:
+    logging.warning(
+        'Total number of operations rounded to %s '
+        '(%s operations per client vm).',
+        operations_per_vm * spec.total_clients,
+        operations_per_vm,
+    )
+  # If there are multiple client VMs, distribute the population size among them.
   population_range = '%s..%s' % (
-      loader_index * population_per_vm + 1,
-      (loader_index + 1) * population_per_vm,
+      spec.client_index * population_per_vm + 1,
+      (spec.client_index + 1) * population_per_vm,
   )
-  if population_params:
-    population_params = '%s,%s' % (population_range, population_params)
+  if population_parameters:
+    population_params = '%s,%s' % (population_range, population_parameters)
   else:
     population_params = population_range
-  if population_dist:
+  if not spec.is_preload and population_dist:
     population_dist = r'-pop dist=%s\(%s\)' % (
         population_dist,
         population_params,
     )
   else:
+    # always use sequential distribution for preload.
     population_dist = '-pop seq=%s' % population_params
   duration = ''
   num_keys_parameter = 'n={num_keys}'.format(num_keys=operations_per_vm)
   # Duration specificies how long to run the test. If it is set, we don't need
   # to specify the number of keys.
-  if not is_preload and CASSANDRA_STRESS_RUN_DURATION.value:
-    duration = r'duration={duration}'.format(
-        duration=CASSANDRA_STRESS_RUN_DURATION.value
-    )
+  # Preload needs number of keys and not duration to make cassandra-stress
+  # writes all the keys before the test starts.
+  if not spec.is_preload and spec.duration:
+    duration = r'duration={duration}'.format(duration=spec.duration)
     num_keys_parameter = ''
-  vm.RobustRemoteCommand(
-      'sudo {cassandra_stress_command} {command} {duration}'
-      ' cl={consistency_level} {num_keys_parameter} -node {nodes} {schema}'
-      ' {population_dist} -log file={result_file} -rate threads={threads}'
-      ' -errors retries={retries}'.format(
-          cassandra_stress_command=cassandra.GetCassandraStressPath(vm),
-          command=command,
-          consistency_level=FLAGS.cassandra_stress_consistency_level,
-          num_keys_parameter=num_keys_parameter,
-          nodes=','.join(data_node_ips),
-          schema=schema_option,
-          population_dist=population_dist,
-          result_file=_ResultFilePath(vm),
-          retries=FLAGS.cassandra_stress_retries,
-          threads=int(thread_count),
-          duration=duration,
-      )
+  command_string = (
+      f'sudo {cassandra.GetCassandraStressPath(spec.client_vm)} {command} {duration}'
+      f' cl={spec.consistency_level} {num_keys_parameter} -node'
+      f' {",".join(data_node_ips)} {schema_option} {population_dist} -log'
+      f' file={GetResultFilePath(spec.client_vm)}'
+      f' -rate threads={int(thread_count)} -errors'
+      f' retries={spec.retries}'
   )
+  return command_string
 
 
-def RunCassandraStressTest(
+def RunCassandraStressTestOnClients(
     cassandra_vms,
-    loader_vms,
-    num_operations,
+    client_vms,
     command,
-    thread_count,
-    profile_operations='insert=1',
-    population_size=None,
-    population_dist=None,
-    population_params=None,
+    metadata,
     is_preload=False,
 ):
-  """Start all loader nodes as Cassandra clients and run stress test.
-
-  Args:
-    cassandra_vms: list. A list of vm objects. Cassandra servers.
-    load_vms: list. A list of vm objects. Cassandra clients.
-    num_keys: integer. The number of operations cassandra-stress clients should
-      issue.
-    command: string. The cassandra-stress command to use.
-    profile_operations: string. The operations to use with user mode.
-    population_size: integer. The population size.
-    population_dist: string. The population distribution.
-    population_params: string. Representing additional population parameters.
-    thread_count: integer. The number of threads to use for cassandra-stress.
-    is_preload: boolean. Whether this is a preload run.
-
-  Returns:
-    A list of cpu load for each cassandra node.
-  """
-  num_loaders = len(loader_vms)
-  data_node_ips = [vm.internal_ip for vm in cassandra_vms]
-  population_size = population_size or num_operations
-  operations_per_vm = int(math.ceil(float(num_operations) / num_loaders))
-  population_per_vm = int(population_size / num_loaders)
-  if num_operations % num_loaders:
-    logging.warn(
-        'Total number of operations rounded to %s '
-        '(%s operations per loader vm).',
-        operations_per_vm * num_loaders,
-        operations_per_vm,
-    )
+  """Start all loader nodes as Cassandra clients and run stress test."""
   logging.info('Executing the benchmark.')
   tasks = []
-  for i in range(0, len(loader_vms)):
+  for i in range(0, len(client_vms)):
     tasks.append((
-        RunTestOnLoader,
+        RunCassandraStressOnClient,
         [
-            loader_vms[i],
+            client_vms[i],
             i,
-            operations_per_vm,
-            data_node_ips,
+            len(client_vms),
+            cassandra_vms,
             command,
-            profile_operations,
-            population_per_vm,
-            population_dist,
-            population_params,
-            thread_count,
+            metadata,
             is_preload,
         ],
         {},
@@ -737,7 +790,41 @@ def RunCassandraStressTest(
     for vm in cassandra_vms:
       tasks.append((CPUUtilizationReporting, [vm], {}))
   background_tasks.RunParallelThreads(tasks, max_concurrency=10)
-  return background_tasks.RunThreaded(GetLoadAverage, cassandra_vms)
+  # uptime reports load average for the last 1, 5 and 15 minutes. It is
+  # important to get the average the moment test is done to avoid errors.
+  background_tasks.RunThreaded(
+      CpuLoadReporting, cassandra_vms
+  )
+
+
+def RunCassandraStressOnClient(
+    client_vm,
+    client_index,
+    total_clients,
+    cassandra_vms,
+    command,
+    metadata,
+    is_preload,
+):
+  """Run Cassandra-stress test on a client node."""
+  spec = CassandraStressCommandSpec(
+      client_vm=client_vm,
+      client_index=client_index,
+      total_clients=total_clients,
+      cassandra_vms=cassandra_vms,
+      command=command,
+      metadata=metadata,
+      duration=CASSANDRA_STRESS_RUN_DURATION.value,
+      consistency_level=FLAGS.cassandra_stress_consistency_level,
+      retries=FLAGS.cassandra_stress_retries,
+      mixed_ratio=FLAGS.cassandra_stress_mixed_ratio,
+      replication_factor=FLAGS.cassandra_replication_factor,
+      is_preload=is_preload,
+      compaction_strategy=CASSANDRA_COMPACTION_STRATEGY.value,
+  )
+  client_vm.RobustRemoteCommand(
+      GenerateCassandraStressCommand(spec)
+  )
 
 
 def CPUUtilizationReporting(vm):
@@ -762,7 +849,8 @@ def ParseAverageCpuUtilization(output) -> float:
   per_process_cpu_utilization = re.sub(
       ' +', ' ', average_cpu_utilization[0]
   ).split(' ')
-  return float(per_process_cpu_utilization[2].strip())
+  # 7th element idle percentage, return 100 - idle percentage for utilization.
+  return 100.0 - float(per_process_cpu_utilization[7].strip())
 
 
 def CalculateNumberOfSarRequestsFromDuration(duration, freq):
@@ -774,12 +862,6 @@ def CalculateNumberOfSarRequestsFromDuration(duration, freq):
   quantity = units.ParseExpression(duration)
   seconds = quantity.m_as(units.second)
   return int(seconds / freq)
-
-
-def GetLoadAverage(vm):
-  stdout, _ = vm.RemoteCommand('uptime')
-  load_last_5m = ParseUptimeOutput(stdout)
-  return load_last_5m
 
 
 def ParseResp(resp) -> dict[str, Union[float, int]]:
@@ -839,9 +921,9 @@ def CollectResultFile(vm, results):
   Args:
     vm: The target vm.
     results: A dictionary of lists. Each list contains results of a field
-      defined in RESULTS_METRICS collected from each loader machines.
+      defined in RESULTS_METRICS collected from each client machines.
   """
-  result_path = _ResultFilePath(vm)
+  result_path = GetResultFilePath(vm)
   vm.PullFile(vm_util.GetTempDir(), result_path)
   resp, _ = vm.RemoteCommand('tail -n 20 ' + result_path)
   metrics = ParseResp(resp)
@@ -853,11 +935,11 @@ def CollectResultFile(vm, results):
     results[metric].append(value)
 
 
-def CollectResults(loader_vms, metadata):
+def CollectResults(client_vms, metadata):
   """Collect and parse test results.
 
   Args:
-    loader_vms: client vms.
+    client_vms: client vms.
     metadata: dict. Contains metadata for this benchmark.
 
   Returns:
@@ -865,7 +947,7 @@ def CollectResults(loader_vms, metadata):
   """
   logging.info('Gathering results.')
   raw_results = collections.defaultdict(list)
-  args = [((vm, raw_results), {}) for vm in loader_vms]
+  args = [((vm, raw_results), {}) for vm in client_vms]
   background_tasks.RunThreaded(CollectResultFile, args)
   results = []
   for metric in RESULTS_METRICS:
@@ -874,7 +956,7 @@ def CollectResults(loader_vms, metadata):
     else:
       value = math.fsum(raw_results[metric])
       if metric not in AGGREGATED_METRICS:
-        value = value / len(loader_vms)
+        value = value / len(client_vms)
     unit = ''
     if metric.startswith('latency'):
       unit = 'ms'
@@ -886,8 +968,24 @@ def CollectResults(loader_vms, metadata):
   return results
 
 
+def CpuLoadReporting(vm):
+  vm.RemoteCommand(f'uptime > {GenerateCpuLoadFileName(vm)}')
+
+
+def GetCpuAverageLoad(cassandra_vms):
+  cpu_loads = []
+  for vm in cassandra_vms:
+    stdout, _ = vm.RemoteCommand(f'cat {GenerateCpuLoadFileName(vm)}')
+    cpu_loads.append(ParseUptimeOutput(stdout))
+  return cpu_loads
+
+
 def GenerateCpuUtilizationFileName(vm):
   return f'{vm_util.VM_TMP_DIR}/{vm.name}-cpu_utilization.log'
+
+
+def GenerateCpuLoadFileName(vm):
+  return f'{vm_util.VM_TMP_DIR}/{vm.name}-cpu_load.log'
 
 
 def Run(benchmark_spec):
@@ -907,6 +1005,13 @@ def Run(benchmark_spec):
   metadata['cassandra_version'] = cassandra.GetCassandraVersion(
       benchmark_spec.vm_groups[CASSANDRA_GROUP][0]
   )
+  if CASSANDRA_STRESS_THREADS.value:
+    return RunCassandraStressOnFixedThreads(
+        client_vms,
+        cassandra_vms,
+        metadata,
+        CASSANDRA_STRESS_THREADS.value,
+    )
   return RunTestNTimes(client_vms, cassandra_vms, metadata)
 
 
@@ -928,60 +1033,85 @@ def RunTestNTimes(client_vms, cassandra_vms, metadata):
   if the operation rate is lower than the previous run.
   """
   samples = []
-  last_operation_rate = 0
-  run_count = 0
-  thread_count = STARTING_THREAD_COUNT
+  left_thread_count = STARTING_THREAD_COUNT
+  # TODO(arushigaur) Remove hardcoded max thread count and just do double and
+  # half of the current thread count.
+  right_thread_count = 500
   max_op_rate = 0
   max_op_rate_metadata = None
-  while run_count < CASSANDRA_STRESS_MAX_RUNS.value:
-    logging.info('running thread count: %s', thread_count)
-    run_count += 1
-    cpu_loads = RunCassandraStressTest(
-        cassandra_vms,
-        client_vms,
-        metadata['num_keys'],
-        metadata['command'],
-        thread_count,
-        metadata.get('operations'),
-        metadata['population_size'],
-        metadata['population_dist'],
-        metadata['population_parameters'],
-        is_preload=False,
+  thread_data = {}
+  while (
+      left_thread_count < right_thread_count - 1
+  ):
+    current_thread_count = int((left_thread_count + right_thread_count) / 2)
+    # running with both left_left_thread_count and current_thread_count to
+    # understand where is the current_thread_count on the curve.
+    for threads in [left_thread_count, current_thread_count]:
+      # adding nodetool status to check the ownership of each node.
+      cassandra.GetNodetoolStatus(cassandra_vms)
+      if threads in thread_data:
+        logging.info('thread count %s already tested', threads)
+        continue
+      current_metadata = copy.deepcopy(metadata)
+      current_metadata['num_cassandra_stress_threads'] = threads
+      logging.info('running thread count: %s', threads)
+      RunCassandraStressTestOnClients(
+          cassandra_vms,
+          client_vms,
+          FLAGS.cassandra_stress_command,
+          immutabledict.immutabledict(current_metadata),
+          is_preload=False,
+      )
+      current_samples = CollectResults(
+          client_vms, current_metadata
+      )
+      samples.extend(current_samples)
+      thread_data[threads] = {
+          'operation_rate': GetOperationRate(
+              current_samples
+          ),
+          'median_latency': GetMedianLatency(
+              current_samples
+          ),
+          'cpu_loads': GetCpuAverageLoad(cassandra_vms),
+          'cpu_utilization': GetCpuUtilization(
+              cassandra_vms
+          ),
+          'metadata': current_metadata,
+      }
+      logging.info(
+          'details for thread count %s are %s',
+          threads,
+          thread_data[threads],
+      )
+      PerformanceReporting(
+          cassandra_vms, thread_data[threads], current_metadata
+      )
+      WaitForCompactionTasks(cassandra_vms)
+    left_thread_count, right_thread_count = (
+        GetNextThreadCount(
+            left_thread_count,
+            current_thread_count,
+            right_thread_count,
+            thread_data,
+            MAX_MEDIAN_LATENCY_MS,
+            CASSANDRA_CPU_UTILIZATION_LIMIT.value,
+        )
     )
-    cpu_utilization = GetCpuUtilization(cassandra_vms)
-    metadata['server_load_cpu_utilization'] = [
-        cpu_loads[i] / cassandra_vms[i].num_cpus * 100
-        for i in range(len(cassandra_vms))
-    ]
-    metadata['server_cpu_utilization'] = cpu_utilization
-    metadata['num_cassandra_stress_threads'] = thread_count
-    # Trackig disk and memory usage for auditing and debugging purposes.
-    for vm in cassandra_vms:
-      vm.RemoteCommand('df -H')
-      vm.RemoteCommand('free -h')
-    current_samples = CollectResults(client_vms, copy.deepcopy(metadata))
-    samples.extend(current_samples)
-    latest_operation_rate = GetOperationRate(current_samples)
-    median_latency = GetMedianLatency(current_samples)
-    max_cpu_usage = max(cpu_utilization)
-
-    if max_op_rate < latest_operation_rate:
-      max_op_rate = latest_operation_rate
-      max_op_rate_metadata = metadata
-
+    # TODO(arushigaur) Add a stopping condition that if op rate in the last x
+    # tests hasn't changed much then exit the while loop.
+    # If op rate at the current_thread_count meets latency and cpu utilization
+    # criteria, then record it as the max_op_rate.
     if (
-        int(median_latency) >= MAX_MEDIAN_LATENCY_MS
-        or max_cpu_usage > CASSANDRA_CPU_UTILIZATION_LIMIT.value
+        max_op_rate < thread_data[current_thread_count]['operation_rate']
+        and int(thread_data[current_thread_count]['median_latency'])
+        < MAX_MEDIAN_LATENCY_MS
+        and sum(thread_data[current_thread_count]['cpu_utilization'])
+        / len(thread_data[current_thread_count]['cpu_utilization'])
+        < CASSANDRA_CPU_UTILIZATION_LIMIT.value * 1.01
     ):
-      next_thread_count = thread_count - THREAD_INCREMENT_COUNT / 2
-    elif latest_operation_rate > last_operation_rate:
-      next_thread_count = thread_count + THREAD_INCREMENT_COUNT
-    else:
-      next_thread_count = thread_count - THREAD_INCREMENT_COUNT / 2
-
-    last_operation_rate = latest_operation_rate
-    thread_count = next_thread_count
-    WaitForCompactionTasks(cassandra_vms)
+      max_op_rate = thread_data[current_thread_count]['operation_rate']
+      max_op_rate_metadata = thread_data[current_thread_count]['metadata']
   samples.append(
       sample.Sample(
           'max_op_rate',
@@ -990,15 +1120,172 @@ def RunTestNTimes(client_vms, cassandra_vms, metadata):
           max_op_rate_metadata,
       )
   )
+  thread_run_data_metadata = copy.deepcopy(max_op_rate_metadata or {})
+  thread_run_data_metadata['thread_data'] = thread_data
+  samples.append(
+      sample.Sample(
+          'thread_run_data',
+          -1,
+          '',
+          thread_run_data_metadata,
+      )
+  )
   return samples
 
 
+def RunCassandraStressOnFixedThreads(
+    client_vms, cassandra_vms, metadata, client_threads_array
+):
+  """Run the cassandra stress test max_allowed_runs times.
+
+  Args:
+    client_vms: client vms.
+    cassandra_vms: cassandra server vms.
+    metadata: dict. Contains metadata for this benchmark.
+    client_threads_array: array of client threads to run the test with.
+
+  Returns:
+    A list of sample.Sample objects.
+  """
+  samples = []
+  thread_data = {}
+  for threads in client_threads_array:
+    cassandra.GetNodetoolStatus(cassandra_vms)
+    if threads in thread_data:
+      logging.info('thread count %s already tested', threads)
+      continue
+    current_metadata = copy.deepcopy(metadata)
+    current_metadata['num_cassandra_stress_threads'] = threads
+    logging.info('running thread count: %s', threads)
+    RunCassandraStressTestOnClients(
+        cassandra_vms,
+        client_vms,
+        FLAGS.cassandra_stress_command,
+        immutabledict.immutabledict(current_metadata),
+        is_preload=False,
+    )
+    current_samples = CollectResults(
+        client_vms, current_metadata
+    )
+    samples.extend(current_samples)
+    thread_data[threads] = {
+        'operation_rate': GetOperationRate(
+            current_samples
+        ),
+        'median_latency': GetMedianLatency(
+            current_samples
+        ),
+        'cpu_loads': GetCpuAverageLoad(cassandra_vms),
+        'cpu_utilization': GetCpuUtilization(
+            cassandra_vms
+        ),
+        'metadata': current_metadata,
+    }
+    logging.info(
+        'details for thread count %s are %s',
+        threads,
+        thread_data[threads],
+    )
+    PerformanceReporting(
+        cassandra_vms, thread_data[threads], current_metadata
+    )
+    WaitForCompactionTasks(cassandra_vms)
+  thread_run_data_metadata = copy.deepcopy(metadata or {})
+  thread_run_data_metadata['thread_data'] = thread_data
+  samples.append(
+      sample.Sample(
+          'thread_run_data',
+          -1,
+          '',
+          thread_run_data_metadata,
+      )
+  )
+  return samples
+
+
+def GetNextThreadCount(
+    left_thread_count,
+    current_thread_count,
+    right_thread_count,
+    thread_data,
+    max_median_latency,
+    max_cpu_utilization,
+):
+  """Gets the next thread count bounds based on the current metrics.
+
+  Args:
+    left_thread_count: The lower bound of the thread count for the binary
+      search.
+    current_thread_count: The current thread count used for the test.
+    right_thread_count: The upper bound of the thread count for the binary
+      search.
+    thread_data: A dict of thread data containing operation_rate,
+      median_latency and average_cpu_usage.
+    max_median_latency: The maximum acceptable median latency.
+    max_cpu_utilization: The maximum acceptable cpu utilization.
+
+  Returns:
+    A tuple of the new (left_thread_count, right_thread_count) for the next
+    iteration of the binary search.
+
+  We are trying to achieve a optimal thread count to maximize the operation
+  rate. The operation rate, latency and cpu utilization increase with threads
+  till op rate reaches a max and after that op rate drops while latency and cpu
+  keeps increasing.
+  """
+  # taking average cpu utilization to consider uneven load across nodes.
+  average_cpu_usage = sum(
+      thread_data[current_thread_count]['cpu_utilization']
+  ) / len(thread_data[current_thread_count]['cpu_utilization'])
+  median_latency = int(thread_data[current_thread_count]['median_latency'])
+  if (
+      median_latency
+      >= max_median_latency
+      or average_cpu_usage
+      >= max_cpu_utilization*1.01  # cpu utilization within 1% of the limit.
+  ):
+    # decrease thread count
+    logging.info(
+        'latency is %s and cpu utilization is %s for %s threads, decreasing'
+        ' threads',
+        median_latency,
+        average_cpu_usage,
+        current_thread_count,
+    )
+    right_thread_count = current_thread_count
+  elif (
+      thread_data[current_thread_count]['operation_rate']
+      < thread_data[left_thread_count]['operation_rate']
+  ):
+    # move left on the curve because op rate dropped from left to right.
+    right_thread_count = current_thread_count
+    logging.info(
+        'op rate %s is %s and %s is %s, decreasing threads',
+        left_thread_count,
+        thread_data[left_thread_count]['operation_rate'],
+        current_thread_count,
+        thread_data[current_thread_count]['operation_rate'],
+    )
+  else:
+    # move right on the curve because op rate increased from left to right.
+    left_thread_count = current_thread_count
+    logging.info(
+        'op rate %s is %s and %s is %s, increasing threads',
+        left_thread_count,
+        thread_data[left_thread_count]['operation_rate'],
+        current_thread_count,
+        thread_data[current_thread_count]['operation_rate'],
+    )
+  return int(left_thread_count), int(right_thread_count)
+
+
 @vm_util.Retry(
-    max_retries=10,
+    max_retries=20,
     retryable_exceptions=(
         CassandraCompactionNotCompletedError,
     ),
     poll_interval=WAIT_BETWEEN_COMPACTION_TASKS_CHECK,
+    timeout=-1,
 )
 def WaitForCompactionTasks(cassandra_vms):
   """Waits for cassandra's pending compaction tasks to be completed."""
@@ -1012,8 +1299,38 @@ def WaitForCompactionTasks(cassandra_vms):
   )
   if max_pending_compaction_tasks > 0:
     raise CassandraCompactionNotCompletedError(
-        f'{max_pending_compaction_tasks} compaction tasks not completed'
+        f'{max_pending_compaction_tasks} compaction tasks not completed,'
+        f' waiting for {WAIT_BETWEEN_COMPACTION_TASKS_CHECK} seconds'
     )
+
+
+def PerformanceReporting(cassandra_vms, thread_data, metadata):
+  AddMonitoringMetricsToMetadata(
+      metadata,
+      thread_data['cpu_loads'],
+      thread_data['cpu_utilization'],
+      cassandra_vms,
+  )
+  LogMemoryUsage(cassandra_vms)
+
+
+def AddMonitoringMetricsToMetadata(
+    metadata, cpu_loads, cpu_utilization, cassandra_vms
+):
+  """Adds monitoring metrics to metadata."""
+  metadata['server_load_cpu_utilization'] = [
+      cpu_loads[i] / cassandra_vms[i].num_cpus * 100
+      for i in range(len(cassandra_vms))
+  ]
+  metadata['server_cpu_utilization'] = cpu_utilization
+
+
+def LogMemoryUsage(cassandra_vms):
+  """Logs memory usage of cassandra nodes."""
+  # Trackig disk and memory usage for auditing and debugging purposes.
+  for vm in cassandra_vms:
+    vm.RemoteCommand('df -H')
+    vm.RemoteCommand('free -h')
 
 
 def GetCpuUtilization(cassandra_vms):
@@ -1063,14 +1380,22 @@ def GetOperationRate(samples):
   for s in samples:
     if s.metric == 'op rate':
       return s.value
-  return 0
+  return -1
 
 
 def GetMedianLatency(samples):
   for s in samples:
     if s.metric == 'latency median':
       return s.value
-  return 0
+  return -1
+
+
+def GetResultFilePath(vm):
+  return posixpath.join(vm_util.VM_TMP_DIR, vm.hostname + '.stress_results.txt')
+
+
+def GetCassandraTempProfilePath():
+  return posixpath.join(vm_util.VM_TMP_DIR, 'profile.yaml')
 
 
 def Cleanup(benchmark_spec):

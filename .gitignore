@@ -7,8 +7,10 @@
 *.swp
 /perfkitbenchmarker.egg-info
 /.tox
+/.venv
 *.iml
 /.idea
 /*git_ignore*
 *.snap
 .vscode/*
+.DS_Store

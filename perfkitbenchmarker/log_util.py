@@ -13,14 +13,18 @@
 # limitations under the License.
 """Utilities related to loggers and logging."""
 
+import collections
 from contextlib import contextmanager
-import datetime
+import functools
 import logging
 from logging import handlers
+import os
+import re
 import sys
 import threading
+import time
 from absl import flags
-from perfkitbenchmarker import vm_util
+from absl import logging as absl_logging
 
 try:
   import colorlog
@@ -39,47 +43,18 @@ LOG_LEVELS = {
     ERROR: logging.ERROR,
 }
 
+SHORT_LOGGER_NAME = 'short'
+
 # Paths for log writing and exporting.
 log_local_path = None
 LOG_FILE_NAME = 'pkb.log'
-
-GSUTIL_MV = 'mv'
-GSUTIL_CP = 'cp'
-GSUTIL_OPERATIONS = [GSUTIL_MV, GSUTIL_CP]
+SHORT_LOG_FILE_NAME = 'pkb_short.log'
 
 DEFAULT_LOG_ROTATING_INTERVAL = 1
 DEFAULT_LOG_ROTATING_UNIT = 'D'
 DEFAULT_LOG_ROTATING_BACKUP_COUNT = 5
 
 
-PKB_LOG_BUCKET = flags.DEFINE_string(
-    'pkb_log_bucket',
-    None,
-    'Name of the GCS bucket that PKB logs should route to. If this is not '
-    'specified, then PKB logs will remain on the VM. This bucket must exist '
-    'and the caller must have write permissions on the bucket for a successful '
-    'export.',
-)
-VM_LOG_BUCKET = flags.DEFINE_string(
-    'vm_log_bucket',
-    None,
-    'The GCS bucket to store VM logs in. If not provided, VM logs will go to '
-    'the calling machine only. This only applies if --capture_vm_logs is '
-    'set.',
-)
-_SAVE_LOG_TO_BUCKET_OPERATION = flags.DEFINE_enum(
-    'save_log_to_bucket_operation',
-    GSUTIL_MV,
-    GSUTIL_OPERATIONS,
-    'How to save the log to the bucket, available options are mv, cp',
-)
-_RELATIVE_GCS_LOG_PATH = flags.DEFINE_string(
-    'relative_gcs_log_path',
-    None,
-    'The relative path inside the GCS bucket where to save the log, e.g. '
-    '"root_dir/sub_dir", and the full file path would be '
-    'gs://<bucket>/<relative_gcs_log_path>',
-)
 flags.DEFINE_enum(
     'log_level',
     INFO,
@@ -91,6 +66,12 @@ flags.DEFINE_enum(
     DEBUG,
     list(LOG_LEVELS.keys()),
     'Anything logged at this level or higher will be written to the log file.',
+)
+TRUNCATE_DUPLICATE_LOGS = flags.DEFINE_boolean(
+    'truncate_duplicate_logs',
+    True,
+    'Whether to truncate duplicated logs. If True, consecutive identical logs '
+    'will be truncated instead of showing their full content.'
 )
 
 
@@ -167,14 +148,131 @@ def GetThreadLogContext():
   return thread_local.pkb_thread_log_context
 
 
+# Below patterns appear in common PKB IssueCommand messages but are not useful
+# for deduplication.
+_RETURN_CODE_PATTERN = re.compile(
+    r'WallTime:[\d:.]+s,\s+CPU:[\d.]+s,\s+MaxMemory:\d+kb\s*?'
+)
+_SSH_PATTERN = re.compile(r'ssh \-A \-p.*? \-o ControlPersist=[\d]+m')
+# If 1 character is 1 byte, then this is 100MB.
+_MAX_LENGTH = 1024 * 1024 * 100
+# Example: 0217 22:57:21
+_FALLBACK_TIME_FORMAT = '%m%d %H:%M:%S'
+
+
+class PkbLogRecord:
+  """Logging record with some additional fields to dedupe."""
+
+  def __init__(self, record: logging.LogRecord):
+    self.record = record
+    self._message = record.getMessage()
+    self.duplicates = 0
+    self.length = len(self._message)
+
+  @functools.cached_property
+  def message(self) -> str:
+    """Returns the message of the log record."""
+    if 'WallTime' in self._message:
+      # Remove common timing noise.
+      self._message = _RETURN_CODE_PATTERN.sub(
+          '...',
+          self._message,
+      )
+    return self._message
+
+  @functools.cached_property
+  def should_truncate(self) -> bool:
+    """Returns whether the message should be truncated."""
+    return (
+        '\n' in self.message
+        and self.length > 220
+        and ('DO NOT DEDUPLICATE' not in self.message)
+    )
+
+  @property
+  def is_too_long(self) -> bool:
+    """Returns whether the message is too long to be stored in the queue."""
+    return self.length > _MAX_LENGTH
+
+  @functools.cached_property
+  def truncated_message(self) -> str:
+    """Returns the truncated message of the log record."""
+    if 'ssh -A -p ' in self.message and '-o ControlPersist=' in self.message:
+      # Remove common ssh noise.
+      message = _SSH_PATTERN.sub(
+          'ssh ...',
+          self.message,
+      )
+    else:
+      message = self.message
+    if len(message) > 150:
+      return message[:150] + '...'
+    return message
+
+  @functools.cached_property
+  def created_time(self) -> str:
+    """Returns the created time of the log record."""
+    if hasattr(self.record, 'asctime'):
+      return self.record.asctime
+    # Convert nanoseconds to seconds
+    seconds_timestamp = self.record.created
+    return time.strftime(
+        _FALLBACK_TIME_FORMAT, time.localtime(seconds_timestamp)
+    )
+
+  def __eq__(self, other: 'PkbLogRecord') -> bool:
+    if type(self) != type(other):
+      return NotImplemented
+    return (
+        self.message == other.message
+        and self.record.pkb_label == other.record.pkb_label
+    )
+
+
 class PkbLogFilter(logging.Filter):
-  """Filter that injects a thread's ThreadLogContext label into log messages.
+  """Filter that truncates duplicate messages & adds thread context.
 
   Sets the LogRecord's pkb_label attribute with the ThreadLogContext label.
+  For each log, if it exactly matches a recent previous log, then the current
+  log is truncated and marked as duplicated.
   """
 
-  def filter(self, record):
+  def __init__(self):
+    super().__init__()
+    self.max_length = 5
+    self.last_records: collections.deque[PkbLogRecord] = collections.deque(
+        maxlen=self.max_length
+    )
+
+  def filter(self, record: logging.LogRecord) -> bool:
+    """Modifies the log record in-place to deduplicate and set pkb_label."""
     record.pkb_label = GetThreadLogContext().label
+    pkb_record = PkbLogRecord(record)
+    if not TRUNCATE_DUPLICATE_LOGS.value:
+      return True
+    if pkb_record.is_too_long:
+      # Return early to avoid storing too large records in the queue.
+      # Message will not be truncated.
+      return True
+    duplicate_record = None
+    last_records: list[PkbLogRecord] = list(self.last_records)
+    for last_record in last_records:
+      if pkb_record == last_record:
+        duplicate_record = last_record
+        break
+    if not duplicate_record:
+      self.last_records.append(pkb_record)
+      return True
+    duplicate_record.duplicates += 1
+    if duplicate_record.should_truncate:
+      record.msg = (
+          'Message from %s has been duplicated %s times. Truncating to:\n%s.'
+      )
+      record.args = (
+          duplicate_record.created_time,
+          duplicate_record.duplicates,
+          duplicate_record.truncated_message,
+      )
     return True
 
 
@@ -184,7 +282,7 @@ def ConfigureBasicLogging():
 
 
 def ConfigureLogging(
-    stderr_log_level, log_path, run_uri, file_log_level=logging.DEBUG
+    stderr_log_level, logs_dir, run_uri, file_log_level=logging.DEBUG
 ):
   """Configure logging.
 
@@ -194,7 +292,7 @@ def ConfigureLogging(
 
   Args:
     stderr_log_level: Messages at this level and above are emitted to stderr.
-    log_path: Path to the log file.
+    logs_dir: Path to the directory where logs should be written.
     run_uri: A string containing the run_uri to be appended to the log prefix
       labels.
     file_log_level: Messages at this level and above are written to the log
@@ -202,7 +300,7 @@ def ConfigureLogging(
   """
   # Set local log file path global variable so it can be used by PKB.
   global log_local_path
-  log_local_path = log_path
+  log_local_path = os.path.join(logs_dir, LOG_FILE_NAME)
 
   # Build the format strings for the stderr and log file message formatters.
   stderr_format = (
@@ -256,80 +354,45 @@ def ConfigureLogging(
   logging.getLogger('requests').setLevel(logging.ERROR)
 
 
-def CollectPKBLogs(run_uri: str) -> None:
-  """Move PKB log files over to a GCS bucket (`pkb_log_bucket` flag).
-
-  Args:
-    run_uri: The run URI of the benchmark run.
-  """
-  if PKB_LOG_BUCKET.value:
-    # Generate the log path to the cloud bucket based on the invocation date of
-    # this function.
-    gcs_log_path = GetLogCloudPath(PKB_LOG_BUCKET.value, f'{run_uri}-pkb.log')
-    vm_util.IssueRetryableCommand([
-        'gsutil',
-        '-h',
-        'Content-Type:text/plain',
-        _SAVE_LOG_TO_BUCKET_OPERATION.value,
-        '-Z',
-        log_local_path,
-        gcs_log_path,
-    ])
+def ConfigureDedupeLogging():
+  """Initializes logging with dedupe only filtering."""
+  logger = logging.getLogger()
+  for handler in logger.handlers:
+    handler.addFilter(PkbLogFilter())
 
 
-def CollectVMLogs(run_uri: str, source_path: str) -> None:
-  """Move VM log files over to a GCS bucket (`vm_log_bucket` flag).
-
-  Args:
-    run_uri: The run URI of the benchmark run.
-    source_path: The path to the log file.
-  """
-  if VM_LOG_BUCKET.value:
-    source_filename = source_path.split('/')[-1]
-    gcs_directory_path = GetLogCloudPath(VM_LOG_BUCKET.value, run_uri)
-    gcs_path = f'{gcs_directory_path}/{source_filename}'
-    vm_util.IssueRetryableCommand([
-        'gsutil',
-        '-h',
-        'Content-Type:text/plain',
-        'mv',
-        '-Z',
-        source_path,
-        gcs_path,
-    ])
-
-
-def GetLogCloudPath(log_bucket: str, path_suffix: str) -> str:
-  """Returns the GCS path, to where the logs should be saved.
-
-  Args:
-    log_bucket: The GCS bucket to save the logs to.
-    path_suffix: The suffix to append to the GCS path.
-
-  Returns:
-    The GCS path to where the logs should be saved.
-  """
-  run_date = datetime.date.today()
-  gcs_path_prefix = _GetGcsPathPrefix(log_bucket)
-  return (
-      f'{gcs_path_prefix}/'
-      + f'{run_date.year:04d}/{run_date.month:02d}/'
-      + f'{run_date.day:02d}/'
-      + path_suffix
+def ConfigureShortLogging(logs_dir, file_log_level=logging.DEBUG):
+  """Initializes short logging."""
+  short_logger = logging.getLogger(SHORT_LOGGER_NAME)
+  short_logger.setLevel(file_log_level)
+  # Don't propagate logs to parent loggers. Callsites will determine when to log
+  # to root (pkb.log / stdout / stderr) and when to log to the short log.
+  short_logger.propagate = False
+  handler = handlers.TimedRotatingFileHandler(
+      filename=os.path.join(logs_dir, SHORT_LOG_FILE_NAME),
+      when=DEFAULT_LOG_ROTATING_UNIT,
+      interval=DEFAULT_LOG_ROTATING_INTERVAL,
+      backupCount=DEFAULT_LOG_ROTATING_BACKUP_COUNT,
   )
+  handler.setLevel(file_log_level)
+  handler.setFormatter(absl_logging.PythonFormatter())
+  short_logger.addHandler(handler)
 
 
-def _GetGcsPathPrefix(bucket: str) -> str:
-  """Returns the GCS path prefix, to where the logs should be saved.
+def LogToShortLog(message: str, *args, **kwargs):
+  """Logs the message to the short log."""
+  if 'stacklevel' in kwargs:
+    kwargs['stacklevel'] += 1
+  else:
+    kwargs['stacklevel'] = 2
+  logging.getLogger(SHORT_LOGGER_NAME).info(message, *args, **kwargs)
 
-  Args:
-    bucket: The GCS bucket to save the logs to.
 
-  Returns:
-    The GCS path prefix, to where the logs should be saved. If
-    `relative_gcs_log_path` is specified, the prefix will be
-    gs://<bucket>/<relative_gcs_log_path>. Otherwise, it will be gs://<bucket>.
-  """
-  if _RELATIVE_GCS_LOG_PATH.value:
-    return f'gs://{bucket}/{_RELATIVE_GCS_LOG_PATH.value}'
-  return f'gs://{bucket}'
+def LogToShortLogAndRoot(message: str, *args, **kwargs):
+  """Logs the message to both the short log and root (PKB/stdout)."""
+  if 'stacklevel' in kwargs:
+    kwargs['stacklevel'] += 1
+  else:
+    kwargs['stacklevel'] = 2
+  logging.info(message, *args, **kwargs)
+  LogToShortLog(message, *args, **kwargs)

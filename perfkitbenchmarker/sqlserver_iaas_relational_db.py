@@ -17,6 +17,7 @@ This class is responsible to provide helper methods for IAAS relational
 database.
 """
 
+import logging
 import ntpath
 import os
 
@@ -118,7 +119,9 @@ class SQLServerIAASRelationalDb(iaas_relational_db.IAASRelationalDb):
       self.replica_vms = vm_groups["servers_replicas"]
       self.controller_vm = vm_groups["controller"][0]
 
-  def MoveSQLServerTempDb(self):
+  def MoveSQLServerTempDb(
+      self, tempdb_disk=TEMPDB_DISK_LETTER, restart_sql=True
+  ):
     """Moves the SQL Server temporary database to LocalSSD."""
     vms = [self.server_vm]
     if self.spec.high_availability_type == "AOAG" and self.replica_vms:
@@ -138,13 +141,16 @@ class SQLServerIAASRelationalDb(iaas_relational_db.IAASRelationalDb):
 
       if self.TEMPDB_DISK_LETTER in drive_list:
         stdout, _ = vm.RemoteCommand(
-            'sqlcmd -h -1 -Q "SET NOCOUNT '
+            'sqlcmd -C -h -1 -Q "SET NOCOUNT '
             " ON; select f.name + CASE WHEN "
             "f.type = 1 THEN '.ldf' "
             "ELSE '.mdf' END "
             "FROM sys.master_files "
             "f WHERE f.database_id"
             " = DB_ID('tempdb');\""
+            " -U {} -P {}".format(
+                self.spec.database_username, self.spec.database_password
+            )
         )
         tmp_db_files_list = [
             str(tmp_file.strip().replace("\r", ""))
@@ -155,14 +161,93 @@ class SQLServerIAASRelationalDb(iaas_relational_db.IAASRelationalDb):
         for tmp_db_file in tmp_db_files_list:
           tmp_db_name = tmp_db_file.split(".")[0]
           vm.RemoteCommand(
-              'sqlcmd -Q "ALTER DATABASE tempdb '
+              'sqlcmd -C -Q "ALTER DATABASE tempdb '
               "MODIFY FILE (NAME = [{}], "
-              "FILENAME = '{}:\\TEMPDB\\{}');\"".format(
-                  tmp_db_name, self.TEMPDB_DISK_LETTER, tmp_db_file
+              "FILENAME = '{}:\\TEMPDB\\{}');\" -U {} -P {}".format(
+                  tmp_db_name, tempdb_disk, tmp_db_file,
+                  self.spec.database_username, self.spec.database_password,
               )
           )
 
-        vm.RemoteCommand("Restart-Service MSSQLSERVER -Force")
+        if restart_sql:
+          vm.RemoteCommand("Restart-Service MSSQLSERVER -Force")
+
+  def MoveLogAndTempDbFiles(self):
+    """Moves the SQL Server log and tempdb to other available cluster disks."""
+    if (
+        self.spec.high_availability_type != "FCIMW"
+        or FLAGS.db_num_striped_disks == 1
+    ):
+      return
+
+    stdout, _ = self.server_vm.RemoteCommand(
+        """
+        Get-ClusterResource | ? { $_.ResourceType.Name -eq "Physical Disk" } | Where-Object {$_.OwnerGroup -eq "Available Storage"} | % {
+        $resourceName = $_.Name
+        $resource  = gwmi MSCluster_Resource -Namespace root/mscluster |
+              ? { $_.Name -eq $resourceName }
+        $disk = gwmi -Namespace root/mscluster -Query `
+              "ASSOCIATORS OF {$resource} WHERE ResultClass=MSCluster_Disk"
+        $partition = gwmi -Namespace root/mscluster -Query `
+              "ASSOCIATORS OF {$disk} WHERE ResultClass=MSCluster_DiskPartition"
+        $partition | select Path}
+        """
+    )
+
+    drive_list = [
+        str(drive.strip().replace("\r", ""))
+        for drive in stdout.split("\n")
+        if drive and drive.strip().endswith(":")
+    ]
+
+    if not drive_list:
+      logging.warning(
+          "No available cluster disks found. Skipping log and tempdb moves."
+      )
+      return
+    elif len(drive_list) == 1:
+      tempdb_disk = drive_list[0][:-1]
+      logdb_disk = tempdb_disk
+    else:
+      tempdb_disk = drive_list[0][:-1]
+      logdb_disk = drive_list[1][:-1]
+
+    # Adds all available cluster disks to the SQL Server role
+    # and adds dependency for SQL on the newly added disks
+    self.PushAndRunPowershellScript(
+        self.server_vm, "add_available_cluster_disks2_sql.ps1",
+    )
+
+    # Creates the LOGDB directory on the new logdb disk
+    self.server_vm.RemoteCommand(
+        f"$Path = '{logdb_disk}:\\MSSQL\\LOGDB'; "
+        'if (-not (Test-Path -Path $Path)) '
+        '{ New-Item -Path $Path -ItemType Directory }'
+    )
+
+    # Sets the default log database to the new log disk
+    self.server_vm.RemoteCommand(
+        f"sqlcmd -C -U {self.spec.database_username} "
+        f'-P {self.spec.database_password} -Q "EXEC xp_instance_regwrite'
+        " N'HKEY_LOCAL_MACHINE',"
+        " N'Software\\Microsoft\\MSSQLServer\\MSSQLServer', N'DefaultLog',"
+        f" REG_SZ, N'{logdb_disk}:\\MSSQL\\LOGDB'\""
+    )
+
+    # Creates the TEMPDB directory on the new tempdb disk
+    self.server_vm.RemoteCommand(
+        f"$Path = '{tempdb_disk}:\\TEMPDB'; "
+        'if (-not (Test-Path -Path $Path)) '
+        '{ New-Item -Path $Path -ItemType Directory }'
+    )
+
+    # Moves the SQL Server temporary database to the new cluster disk
+    self.MoveSQLServerTempDb(tempdb_disk, restart_sql=False)
+    # SQL Server service restart on clustered SQL server will automatically
+    # failover to the replica. Restarting cluster resource to ensure
+    # SQL Server service is restarted correctly on the primary.
+    self.server_vm.RemoteCommand("Stop-ClusterResource -Name 'SQL Server'")
+    self.server_vm.RemoteCommand("Get-ClusterGroup | Start-ClusterGroup")
 
   def _SetupWindowsUnamangedDatabase(self):
     self.spec.database_username = "sa"
@@ -172,6 +257,7 @@ class SQLServerIAASRelationalDb(iaas_relational_db.IAASRelationalDb):
       if (self.spec.high_availability_type == "FCIMW"
           or self.spec.high_availability_type == "FCIS2D"):
         self.ConfigureSQLServerHaFci()
+        self.MoveLogAndTempDbFiles()
       elif self.spec.high_availability_type == "AOAG":
         self.ConfigureSQLServerHaAoag()
         ConfigureSQLServer(
@@ -205,10 +291,17 @@ class SQLServerIAASRelationalDb(iaas_relational_db.IAASRelationalDb):
       mssql_name = "mssql2022"
     elif self.spec.engine_version == "2019":
       mssql_name = "mssql2019"
+    elif self.spec.engine_version == "2025":
+      mssql_name = "mssql2025"
     else:
       raise NotImplementedError(
           "Invalid database engine version: {}. "
           "Only 2019 and 2022 are supported.".format(self.spec.engine_version)
+      )
+
+    if self.server_vm.OS_TYPE == os_types.UBUNTU2404:
+      raise NotImplementedError(
+          "SQL Server is not supported on {}".format(self.server_vm.OS_TYPE)
       )
 
     self.spec.database_username = "sa"
@@ -248,7 +341,6 @@ class SQLServerIAASRelationalDb(iaas_relational_db.IAASRelationalDb):
         "/scratch/mssqllog"
     )
     # Enabling FUA I/O subsystem capability per MSFT
-    # https://learn.microsoft.com/en-us/sql/linux/sql-server-linux-performance-best-practices?view=sql-server-ver16
     self.server_vm.RemoteCommand(
         "sudo /opt/mssql/bin/mssql-conf set "
         "control.alternatewritethrough 0"
@@ -258,30 +350,35 @@ class SQLServerIAASRelationalDb(iaas_relational_db.IAASRelationalDb):
         "control.writethrough 1"
     )
     self.server_vm.RemoteCommand(
-        "sudo /opt/mssql/bin/mssql-conf set "
-        "traceflag.traceflag 3979"
+        "sudo /opt/mssql/bin/mssql-conf traceflag 3979 on"
+    )
+    self.server_vm.RemoteCommand(
+        "sudo /opt/mssql/bin/mssql-conf traceflag 9944 on"
     )
 
-    if self.server_vm.OS_TYPE == os_types.DEFAULT:
-      self.server_vm.Install("mssql_tools")
+    self.server_vm.Install("mssql_tools")
 
     self.MoveSQLServerTempDBLinux()
     self.server_vm.RemoteCommand("sudo systemctl restart mssql-server")
 
-    if self.server_vm.OS_TYPE == os_types.RHEL8:
+    if (
+        self.server_vm.OS_TYPE == os_types.RHEL8
+        or self.server_vm.OS_TYPE == os_types.RHEL9
+    ):
       _TuneForSQL(self.server_vm)
 
   def MoveSQLServerTempDBLinux(self):
     vm = self.server_vm
     stdout, _ = vm.RemoteCommand(
         "/opt/mssql-tools/bin/sqlcmd -C "
-        "-S localhost -U sa -P \'{}\' -h -1 -Q  \"SET NOCOUNT ON; "
+        "-S localhost -U sa -P '{}' -h -1 -Q  \"SET NOCOUNT ON; "
         "SELECT f.name + SUBSTRING(f.physical_name, "
         "CHARINDEX('.', f.physical_name), LEN(f.physical_name) -1) "
         "FROM sys.master_files f "
-        "WHERE f.database_id = DB_ID('tempdb');\""
-        .format(self.spec.database_password)
+        "WHERE f.database_id = DB_ID('tempdb');\"".format(
+            self.spec.database_password
         )
+    )
 
     tmp_db_files_list = [
         str(tmp_file.strip().replace("\r", ""))
@@ -455,7 +552,7 @@ class SQLServerIAASRelationalDb(iaas_relational_db.IAASRelationalDb):
     """Move server_vm as primary node in AOAG."""
     # Set first server vm as primary if necessary
     out, _ = self.server_vm.RemoteCommand(
-        """sqlcmd -Q \"
+        """sqlcmd -C -Q \"
         SELECT
           role_desc
         FROM
@@ -467,7 +564,7 @@ class SQLServerIAASRelationalDb(iaas_relational_db.IAASRelationalDb):
         """.format(sql_engine_utils.SQLSERVER_AOAG_NAME))
     if "PRIMARY" not in out:
       self.server_vm.RemoteCommand(
-          'sqlcmd -Q "ALTER AVAILABILITY GROUP [{}] FAILOVER"'.format(
+          'sqlcmd -C -Q "ALTER AVAILABILITY GROUP [{}] FAILOVER"'.format(
               sql_engine_utils.SQLSERVER_AOAG_NAME))
 
   def ConfigureSQLServerHaAoag(self):
@@ -552,8 +649,9 @@ class SQLServerIAASRelationalDb(iaas_relational_db.IAASRelationalDb):
     server_vm.RemoteCommand(r"mkdir F:\DATA; mkdir F:\Logs; mkdir F:\Backup")
     replica_vms[0].RemoteCommand(
         r"mkdir F:\DATA; mkdir F:\Logs; mkdir F:\Backup")
-
-    server_vm.RemoteCommand("""sqlcmd -Q \"
+    self.PushAndRunPowershellScript(
+        server_vm, "check_sql_server_status.ps1")
+    server_vm.RemoteCommand("""sqlcmd -C -Q \"
         USE [master]
         GO
         ALTER LOGIN [sa] ENABLE
@@ -597,8 +695,9 @@ class SQLServerIAASRelationalDb(iaas_relational_db.IAASRelationalDb):
     # create AOAG
     # running all the AOAG query from SQL server errors with Login
     # failed to for user 'NT AUTHORITY\ANONYMOUS LOGON double
+    self.PushAndRunPowershellScript(server_vm, "check_sql_server_status.ps1")
     server_vm.RemoteCommand(
-        """sqlcmd -Q \"--- YOU MUST EXECUTE THE FOLLOWING SCRIPT IN SQLCMD MODE.
+        """sqlcmd -C -Q \"--- YOU MUST EXECUTE THE FOLLOWING SCRIPT IN SQLCMD MODE.
         USE [master]
         GO
 
@@ -632,9 +731,10 @@ class SQLServerIAASRelationalDb(iaas_relational_db.IAASRelationalDb):
         GO\"
         """.format(perf_domain)
         )
-
+    self.PushAndRunPowershellScript(
+        replica_vms[0], "check_sql_server_status.ps1")
     replica_vms[0].RemoteCommand(
-        """sqlcmd -Q \"--- YOU MUST EXECUTE THE FOLLOWING SCRIPT IN SQLCMD MODE.
+        """sqlcmd -C -Q \"--- YOU MUST EXECUTE THE FOLLOWING SCRIPT IN SQLCMD MODE.
         USE [master]
         GO
 
@@ -671,9 +771,9 @@ class SQLServerIAASRelationalDb(iaas_relational_db.IAASRelationalDb):
         GO\"
         """.format(perf_domain)
         )
-
+    self.PushAndRunPowershellScript(server_vm, "check_sql_server_status.ps1")
     server_vm.RemoteCommand(
-        """sqlcmd -Q \"--- YOU MUST EXECUTE THE FOLLOWING SCRIPT IN SQLCMD MODE.
+        """sqlcmd -C -Q \"--- YOU MUST EXECUTE THE FOLLOWING SCRIPT IN SQLCMD MODE.
         USE [master]
         GO
 
@@ -692,9 +792,10 @@ class SQLServerIAASRelationalDb(iaas_relational_db.IAASRelationalDb):
                    sql_engine_utils.SQLSERVER_AOAG_DB_NAME,
                    sql_engine_utils.SQLSERVER_AOAG_NAME,
                    perf_domain))
-
+    self.PushAndRunPowershellScript(
+        replica_vms[0], "check_sql_server_status.ps1")
     replica_vms[0].RemoteCommand(
-        """sqlcmd -Q \"--- YOU MUST EXECUTE THE FOLLOWING SCRIPT IN SQLCMD MODE.
+        """sqlcmd -C -Q \"--- YOU MUST EXECUTE THE FOLLOWING SCRIPT IN SQLCMD MODE.
         ALTER AVAILABILITY GROUP [{0}] JOIN;
         GO
 
@@ -706,14 +807,16 @@ class SQLServerIAASRelationalDb(iaas_relational_db.IAASRelationalDb):
     server_vm.RemoteCommand("Restart-Service MSSQLSERVER -Force")
     replica_vms[0].RemoteCommand("Restart-Service MSSQLSERVER -Force")
 
+    self.PushAndRunPowershellScript(server_vm, "check_sql_server_status.ps1")
     # Add DNN listener
     self.PushAndRunPowershellScript(
         server_vm,
         "add_dnn_listener.ps1",
         [sql_engine_utils.SQLSERVER_AOAG_NAME, "fcidnn", "1533"])
 
+    self.PushAndRunPowershellScript(server_vm, "check_sql_server_status.ps1")
     server_vm.RemoteCommand(
-        """sqlcmd -Q \"
+        """sqlcmd -C -Q \"
         ALTER AVAILABILITY GROUP [{1}] REMOVE DATABASE [{0}];
         DROP DATABASE [{0}];\"
         """.format(sql_engine_utils.SQLSERVER_AOAG_DB_NAME,
@@ -796,28 +899,28 @@ class SQLServerIAASRelationalDb(iaas_relational_db.IAASRelationalDb):
 
 def ConfigureSQLServer(vm, username: str, password: str):
   """Update the username and password on a SQL Server."""
-  vm.RemoteCommand(f'sqlcmd -Q "ALTER LOGIN {username} ENABLE;"')
+  vm.RemoteCommand(f'sqlcmd -C -Q "ALTER LOGIN {username} ENABLE;"')
   vm.RemoteCommand(
-      f"sqlcmd -Q \"ALTER LOGIN sa WITH PASSWORD = '{password}' ;\""
+      f"sqlcmd -C -Q \"ALTER LOGIN sa WITH PASSWORD = '{password}' ;\""
   )
   vm.RemoteCommand(
-      "sqlcmd -Q \"EXEC xp_instance_regwrite N'HKEY_LOCAL_MACHINE', "
+      "sqlcmd -C -Q \"EXEC xp_instance_regwrite N'HKEY_LOCAL_MACHINE', "
       "N'Software\\Microsoft\\MSSQLServer\\MSSQLServer', "
       "N'LoginMode', REG_DWORD, 2\""
   )
   vm.RemoteCommand(
-      "sqlcmd -Q \"EXEC xp_instance_regwrite N'HKEY_LOCAL_MACHINE', "
+      "sqlcmd -C -Q \"EXEC xp_instance_regwrite N'HKEY_LOCAL_MACHINE', "
       "N'Software\\Microsoft\\MSSQLServer\\MSSQLServer', "
       "N'BackupDirectory', REG_SZ, N'C:\\scratch'\""
   )
 
   vm.RemoteCommand(
-      "sqlcmd -Q \"EXEC xp_instance_regwrite N'HKEY_LOCAL_MACHINE', "
+      "sqlcmd -C -Q \"EXEC xp_instance_regwrite N'HKEY_LOCAL_MACHINE', "
       "N'Software\\Microsoft\\MSSQLServer\\MSSQLServer', "
       f"N'DefaultData', REG_SZ, N'{vm.assigned_disk_letter}:\\'\""
   )
   vm.RemoteCommand(
-      "sqlcmd -Q \"EXEC xp_instance_regwrite N'HKEY_LOCAL_MACHINE', "
+      "sqlcmd -C -Q \"EXEC xp_instance_regwrite N'HKEY_LOCAL_MACHINE', "
       "N'Software\\Microsoft\\MSSQLServer\\MSSQLServer', "
       f"N'DefaultLog', REG_SZ, N'{vm.assigned_disk_letter}:\\'\""
   )

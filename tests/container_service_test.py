@@ -1,30 +1,21 @@
+import os
+import pickle
+import tempfile
 import time
 from typing import Callable, Iterable, Protocol, Tuple
 import unittest
 from unittest import mock
-from absl.testing import flagsaver
-from perfkitbenchmarker import container_service
+from absl.testing import parameterized
+from perfkitbenchmarker import data
 from perfkitbenchmarker import errors
-from perfkitbenchmarker import provider_info
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.configs import container_spec
+from perfkitbenchmarker.resources.container_service import kubectl
+from perfkitbenchmarker.resources.container_service import kubernetes_commands
+from perfkitbenchmarker.resources.container_service import kubernetes_events
 from perfkitbenchmarker.sample import Sample
+from tests import container_service_mock
 from tests import pkb_common_test_case
-
-
-# Use Mesos as a valid cloud we can override the implementation for.
-_CLUSTER_CLOUD = provider_info.UNIT_TEST
-
-
-class TestKubernetesCluster(container_service.KubernetesCluster):
-
-  CLOUD = _CLUSTER_CLOUD
-
-  def _Create(self):
-    pass
-
-  def _Delete(self):
-    pass
 
 
 kubectl_timeout_tuple = (
@@ -115,38 +106,96 @@ class ContainerServiceTest(pkb_common_test_case.PkbCommonTestCase):
 
   def setUp(self):
     super().setUp()
-    self.enter_context(flagsaver.flagsaver(kubeconfig='kubeconfig'))
-    self.enter_context(flagsaver.flagsaver(run_uri='123'))
-    self.kubernetes_cluster = TestKubernetesCluster(
-        container_spec.ContainerClusterSpec(
-            'test-cluster',
-            **{
-                'cloud': _CLUSTER_CLOUD,
-                'vm_spec': {
-                    _CLUSTER_CLOUD: {
-                        'machine_type': 'fake-machine-type',
-                        'zone': 'us-east2-a',
-                    },
-                },
-            },
-        )
+    container_service_mock.MockContainerInit(self)
+    self.kubernetes_cluster = (
+        container_service_mock.CreateTestKubernetesCluster()
     )
 
-  def test_apply_manifest_gets_deployment_name(self):
+  @parameterized.parameters('created', 'configured')
+  def test_apply_manifest_gets_deployment_name(self, suffix):
     self.MockIssueCommand(
-        {'apply -f': [('deployment.apps/test-deployment created', '', 0)]}
+        {'apply -f': [(f'deployment.apps/test-deployment {suffix}', '', 0)]}
     )
     self.enter_context(
         mock.patch.object(
-            container_service.data,
+            data,
             'ResourcePath',
             return_value='path/to/test-deployment.yaml',
         )
     )
-    deploy_ids = self.kubernetes_cluster.ApplyManifest(
+    deploy_ids = kubernetes_commands.ApplyManifest(
         'test-deployment.yaml',
     )
     self.assertEqual(next(deploy_ids), 'deployment.apps/test-deployment')
+
+  def test_apply_manifest_logs_jinja(self):
+    self.MockIssueCommand(
+        {'apply -f': [('deployment.apps/test-deployment hello', '', 0)]}
+    )
+    self.enter_context(
+        mock.patch.object(
+            data,
+            'ResourcePath',
+            return_value=os.path.join(
+                os.path.dirname(__file__), 'data', 'kube_apply.yaml.j2'
+            ),
+        )
+    )
+    with self.assertLogs(level='INFO') as logs:
+      kubernetes_commands.ApplyManifest(
+          'tests/data/kube_apply.yaml.j2',
+          should_log_file=True,
+          name='hello-world',
+          command=['echo', 'hello', 'world'],
+      )
+    # Asserting on logging isn't very important, but is easier than reading the
+    # written file.
+    full_logs = ';'.join(logs.output)
+    self.assertIn('name: hello-world', full_logs)
+    self.assertIn('echo', full_logs)
+
+  def test_apply_manifest_yaml_logs(self):
+    self.MockIssueCommand(
+        {'apply -f': [('deployment.apps/test-deployment hello', '', 0)]}
+    )
+    self.enter_context(
+        mock.patch.object(
+            data,
+            'ResourcePath',
+            return_value=os.path.join(
+                os.path.dirname(__file__), 'data', 'kube_apply.yaml.j2'
+            ),
+        )
+    )
+    self.enter_context(
+        mock.patch.object(
+            vm_util,
+            'GetTempDir',
+            return_value=tempfile.gettempdir(),
+        )
+    )
+    with self.assertLogs(level='INFO') as logs:
+      yamls = kubernetes_commands.ConvertManifestToYamlDicts(
+          'tests/data/kube_apply.yaml.j2',
+          name='hello-world',
+          command=[],
+      )
+      self.assertEqual(yamls[0]['kind'], 'Namespace')
+      yamls[1]['spec']['selector']['app'] = 'hi-world'
+      yamls[1]['spec']['template']['spec']['containers'].append(
+          {'name': 'second-container'}
+      )
+      kubernetes_commands.ApplyYaml(
+          yamls,
+          should_log_file=True,
+      )
+    full_logs = ';'.join(logs.output)
+    self.assertIn('app: hi-world', full_logs)
+    self.assertIn('name: hello-world', full_logs)
+    self.assertIn('name: second-container', full_logs)
+    # Check for no python artifacts.
+    self.assertNotIn('dict', full_logs)
+    self.assertNotIn('null', full_logs)
 
   @mock.patch.object(
       vm_util,
@@ -156,7 +205,7 @@ class ContainerServiceTest(pkb_common_test_case.PkbCommonTestCase):
   )
   def test_retriable_kubectl_command_fails_on_random_error(self, _):
     with self.assertRaises(errors.VmUtil.IssueCommandError):
-      container_service.RunRetryableKubectlCommand(['get', 'podpatchwork'])
+      kubectl.RunRetryableKubectlCommand(['get', 'podpatchwork'])
 
   @mock.patch.object(
       vm_util,
@@ -171,9 +220,7 @@ class ContainerServiceTest(pkb_common_test_case.PkbCommonTestCase):
   def test_retriable_kubectl_command_retries_on_retriable_error(
       self, sleep_mock, issue_command_mock
   ):
-    out, err, ret = container_service.RunRetryableKubectlCommand(
-        ['get', 'pods']
-    )
+    out, err, ret = kubectl.RunRetryableKubectlCommand(['get', 'pods'])
     self.assertEqual(out, 'pod1, pod2')
     self.assertEqual(err, '')
     self.assertEqual(ret, 0)
@@ -194,13 +241,11 @@ class ContainerServiceTest(pkb_common_test_case.PkbCommonTestCase):
       return 'ok', '', 0
 
     with mock.patch.object(vm_util, 'IssueCommand', _VerifyTimeout):
-      container_service.RunRetryableKubectlCommand(['get', 'pods'], timeout=1)
+      kubectl.RunRetryableKubectlCommand(['get', 'pods'], timeout=1)
 
   def test_retriable_kubectl_command_fails_with_raise_on_timeout(self):
     with self.assertRaises(ValueError):
-      container_service.RunRetryableKubectlCommand(
-          ['get', 'pods'], raise_on_timeout=True
-      )
+      kubectl.RunRetryableKubectlCommand(['get', 'pods'], raise_on_timeout=True)
 
   def test_GetNumReplicasSamples_found(self):
     resource_name = 'deployment/my_deployment'
@@ -224,9 +269,7 @@ class ContainerServiceTest(pkb_common_test_case.PkbCommonTestCase):
       )
 
     samples = _ClearTimestamps(
-        container_service.KubernetesClusterCommands.GetNumReplicasSamples(
-            resource_name, namespace
-        )
+        kubernetes_commands.GetNumReplicasSamples(resource_name, namespace)
     )
     self.assertCountEqual(
         samples,
@@ -246,7 +289,7 @@ class ContainerServiceTest(pkb_common_test_case.PkbCommonTestCase):
         ]
     })
 
-    samples = container_service.KubernetesClusterCommands.GetNumReplicasSamples(
+    samples = kubernetes_commands.GetNumReplicasSamples(
         resource_name, namespace
     )
     self.assertEmpty(samples)
@@ -267,9 +310,7 @@ class ContainerServiceTest(pkb_common_test_case.PkbCommonTestCase):
           timestamp=0,
       )
 
-    samples = _ClearTimestamps(
-        container_service.KubernetesClusterCommands.GetNumNodesSamples()
-    )
+    samples = _ClearTimestamps(kubernetes_commands.GetNumNodesSamples())
     self.assertCountEqual(
         samples,
         [
@@ -280,6 +321,83 @@ class ContainerServiceTest(pkb_common_test_case.PkbCommonTestCase):
         ],
     )
 
+  @parameterized.named_parameters(
+      ('aks default', 'aks-default-30566860-vmss000000', 'default'),
+      ('gke default', 'gke-pkb-8ee57c86-default-pool-232fa391-34qh', 'default'),
+      ('gke servers', 'gke-pkb-8ee57c86-servers-2cd25dd3-1r9l', 'servers'),
+      ('check none', 'gke-pkb-8ee57c86-someother-2cd25dd3-1r9l', None),
+  )
+  def testGetNodepoolFromNodeName(
+      self, node_name: str, expected_nodepool_name: str | None
+  ):
+    vm_spec = {
+        container_service_mock.TEST_CLOUD: {
+            'machine_type': 'fake-machine-type',
+            'zone': 'us-east2-a',
+        },
+    }
+    nodepool_cluster = container_service_mock.TestKubernetesCluster(
+        container_spec.ContainerClusterSpec(
+            'test-cluster',
+            **{
+                'cloud': container_service_mock.TEST_CLOUD,
+                'vm_spec': vm_spec,
+                'nodepools': {
+                    'servers': {
+                        'vm_spec': vm_spec,
+                    },
+                    'clients': {
+                        'vm_spec': vm_spec,
+                    },
+                },
+            },
+        )
+    )
+    nodepool = nodepool_cluster.GetNodePoolFromNodeName(node_name)
+    if expected_nodepool_name is None:
+      self.assertIsNone(nodepool)
+    else:
+      assert nodepool is not None
+      self.assertEqual(nodepool.name, expected_nodepool_name)
+
+  def testGetNodepoolFromNodeName_raisesIfMultipleNodepoolsFound(self):
+    vm_spec = {
+        container_service_mock.TEST_CLOUD: {
+            'machine_type': 'fake-machine-type',
+            'zone': 'us-east2-a',
+        },
+    }
+    nodepool_cluster = container_service_mock.TestKubernetesCluster(
+        container_spec.ContainerClusterSpec(
+            'test-cluster',
+            **{
+                'cloud': container_service_mock.TEST_CLOUD,
+                'vm_spec': vm_spec,
+                'nodepools': {
+                    'default-for-serving': {
+                        'vm_spec': vm_spec,
+                    },
+                },
+            },
+        )
+    )
+    with self.assertRaises(ValueError):
+      nodepool_cluster.GetNodePoolFromNodeName(
+          'gke-pkb-8ee57c86-default-for-serving-232fa391-34qh'
+      )
+
+  @parameterized.named_parameters(
+      ('eks_auto', 'hostname', 'k8s-fib-fib-123.elb.us-east-1.amazonaws.com'),
+      ('gke', 'ip', '34.16.24.55'),
+  )
+  def testGetIpFromIngress(self, field_name, address):
+    # ex after f-string resolution: {"ip":"34.16.24.55"}
+    ingress_out = f'{{"{field_name}":"{address}"}}'
+    self.assertEqual(
+        self.kubernetes_cluster._GetAddressFromIngress(ingress_out),
+        f'http://{address}',
+    )
+
   @mock.patch.object(
       vm_util,
       'IssueCommand',
@@ -287,9 +405,7 @@ class ContainerServiceTest(pkb_common_test_case.PkbCommonTestCase):
       autospec=True,
   )
   def test_RunKubectlCommand(self, issue_command_mock):
-    stdout, stderr, status = container_service.RunKubectlCommand(
-        ['get', 'pods']
-    )
+    stdout, stderr, status = kubectl.RunKubectlCommand(['get', 'pods'])
     self.assertEqual(stdout, 'stdout')
     self.assertEqual(stderr, 'stderr')
     self.assertEqual(status, 0)
@@ -302,10 +418,10 @@ class ContainerServiceTest(pkb_common_test_case.PkbCommonTestCase):
   )
   def test_RunKubectlCommand_CommandTimeoutPropagated(self, issue_command_mock):
     with self.assertRaises(errors.VmUtil.IssueCommandTimeoutError):
-      container_service.RunKubectlCommand(['get', 'pods'])
+      kubectl.RunKubectlCommand(['get', 'pods'])
 
   def test_RunKubectlCommand_KubectlTimeoutRaisesCommandTimeout(self):
-    for err in container_service._RETRYABLE_KUBECTL_ERRORS:
+    for err in kubectl.RETRYABLE_KUBECTL_ERRORS:
       with mock.patch.object(
           vm_util, 'IssueCommand', _MockedIssueCommandSuppressing(stderr=err)
       ):
@@ -313,12 +429,12 @@ class ContainerServiceTest(pkb_common_test_case.PkbCommonTestCase):
             errors.VmUtil.IssueCommandTimeoutError,
             msg=f'Failed to raise timeout for error: {err}',
         ):
-          container_service.RunKubectlCommand(['get', 'pods'])
+          kubectl.RunKubectlCommand(['get', 'pods'])
 
   def test_RunKubectlCommand_KubectlTimeoutWithSuppressFailureRaisesCommandTimeout(
       self,
   ):
-    for err in container_service._RETRYABLE_KUBECTL_ERRORS:
+    for err in kubectl.RETRYABLE_KUBECTL_ERRORS:
       with mock.patch.object(
           vm_util, 'IssueCommand', _MockedIssueCommandSuppressing(stderr=err)
       ):
@@ -326,34 +442,195 @@ class ContainerServiceTest(pkb_common_test_case.PkbCommonTestCase):
             errors.VmUtil.IssueCommandTimeoutError,
             msg=f'Failed to raise timeout for error: {err}',
         ):
-          container_service.RunKubectlCommand(
+          kubectl.RunKubectlCommand(
               ['get', 'pods'], suppress_failure=lambda x, y, z: True
           )
 
   @mock.patch.object(vm_util, 'IssueCommand', _MockedIssueCommandFailure)
   def test_RunKubectlCommand_KubectlFailWithSuppressFailure(self):
-    _, _, status = container_service.RunKubectlCommand(
+    _, _, status = kubectl.RunKubectlCommand(
         ['get', 'pods'], suppress_failure=lambda x, y, z: True
     )
     self.assertEqual(status, 0)
+
+  def test_PickleKubernetesCluster(self):
+    cluster = container_service_mock.CreateTestKubernetesCluster()
+    self.assertIsNotNone(cluster.event_poller)
+    dumped = pickle.dumps(cluster)
+    new_cluster = pickle.loads(dumped)
+    self.assertIsNotNone(new_cluster.event_poller)
 
   @mock.patch.object(
       vm_util, 'IssueCommand', return_value=(_ELECTION_EVENT_NO_NAME, '', 0)
   )
   def test_GetKubectlEvents_Success(self, unused_mock):
-    events = container_service.KubernetesClusterCommands._GetEvents()
+    events = kubernetes_commands.GetEvents()
     self.assertLen(events, 1)
     self.assertEqual(
         events.pop(),
-        container_service.KubernetesEvent(
-            container_service.KubernetesEventResource(
+        kubernetes_events.KubernetesEvent(
+            kubernetes_events.KubernetesEventResource(
                 kind='ConfigMap', name=None
             ),
             message='gke-49fe-vm became leader',
             reason='LeaderElection',
+            type='Normal',
             timestamp=1739209338,
         ),
     )
+
+  def test_KubernetesEventParsing(self):
+    event = kubernetes_events.KubernetesEvent.FromDict({
+        'eventTime': '2025-10-03T18:05:56.272315Z',
+        'involvedObject': {
+            'apiVersion': 'v1',
+            'kind': 'Pod',
+            'name': 'kubernetes-scaleup-5d6c5f45cf-wtbmv',
+            'namespace': 'default',
+            'uid': '8c0f9844-cb1f-4563-a3bc-fc75e3a2fc3f',
+        },
+        'kind': 'Event',
+        'lastTimestamp': None,
+        'message': 'Successfully assigned default/deploy-pod to gke-node',
+        'metadata': {
+            'creationTimestamp': '2025-10-03T18:05:56Z',
+        },
+        'reason': 'Scheduled',
+        'reportingComponent': 'default-scheduler',
+        'type': 'Normal',
+    })
+    self.assertIsNotNone(event)
+    self.assertEqual(
+        event.message, 'Successfully assigned default/deploy-pod to gke-node'
+    )
+    self.assertEqual(event.reason, 'Scheduled')
+    self.assertEqual(event.type, 'Normal')
+    self.assertEqual(event.timestamp, 1759514756)
+
+  def test_GetPodNamesForResource_success(self):
+    resource_name = 'deployment/my-app'
+    namespace = 'default'
+    selector = '{"app":"my-app"}'
+    pod_names = 'pod-1 pod-2'
+    self.MockIssueCommand({
+        f"get {resource_name} -n {namespace} -o=jsonpath='{{.spec.selector.matchLabels}}'": [
+            (f"'{selector}'", '', 0)
+        ],
+        f'get pods -l app=my-app -n {namespace} -o=jsonpath={{.items[*].metadata.name}}': [
+            (pod_names, '', 0)
+        ],
+    })
+    names = kubernetes_commands._GetPodNamesForResource(
+        resource_name, namespace
+    )
+    self.assertEqual(names, ['pod-1', 'pod-2'])
+
+  def test_GetPodNamesForResource_no_selector(self):
+    resource_name = 'deployment/my-app'
+    namespace = 'default'
+    self.MockIssueCommand({
+        f"get {resource_name} -n {namespace} -o=jsonpath='{{.spec.selector.matchLabels}}'": [
+            ("''", '', 0)
+        ],
+    })
+    with self.assertRaises(ValueError):
+      kubernetes_commands._GetPodNamesForResource(resource_name, namespace)
+
+  def test_GetPodNamesForResource_resource_not_found(self):
+    resource_name = 'deployment/my-app'
+    namespace = 'default'
+    self.MockIssueCommand({
+        f"get {resource_name} -n {namespace} -o=jsonpath='{{.spec.selector.matchLabels}}'": [(
+            '',
+            'Error from server (NotFound): deployments.apps "my-app" not found',
+            1,
+        )],
+    })
+    names = kubernetes_commands._GetPodNamesForResource(
+        resource_name, namespace
+    )
+    self.assertEqual(names, [])
+
+  def test_GetCPURequestSamples_success(self):
+    resource_name = 'deployment/my-app'
+    namespace = 'default'
+    pod_names = ['pod-1', 'pod-2']
+    with mock.patch.object(
+        kubernetes_commands,
+        '_GetPodNamesForResource',
+        return_value=pod_names,
+    ):
+      self.MockIssueCommand({
+          f'get pod pod-1 -n {namespace} -o=jsonpath={{.spec.containers[*].resources.requests.cpu}}': [
+              ('500m', '', 0)
+          ],
+          f'get pod pod-2 -n {namespace} -o=jsonpath={{.spec.containers[*].resources.requests.cpu}}': [
+              ('1', '', 0)
+          ],
+      })
+      samples = kubernetes_commands.GetCPURequestSamples(
+          resource_name, namespace
+      )
+      self.assertLen(samples, 2)
+      self.assertEqual(samples[0].metric, 'kubernetes_cpu_request')
+      self.assertEqual(samples[0].value, 0.5)
+      self.assertEqual(samples[0].metadata['pod'], 'pod-1')
+      self.assertEqual(samples[1].metric, 'kubernetes_cpu_request')
+      self.assertEqual(samples[1].value, 1.0)
+      self.assertEqual(samples[1].metadata['pod'], 'pod-2')
+
+  def test_GetCPURequestSamples_no_pods(self):
+    with mock.patch.object(
+        kubernetes_commands,
+        '_GetPodNamesForResource',
+        return_value=[],
+    ):
+      samples = kubernetes_commands.GetCPURequestSamples(
+          'deployment/my-app', 'default'
+      )
+      self.assertEmpty(samples)
+
+  def test_GetCPUUsageSamples_success(self):
+    resource_name = 'deployment/my-app'
+    namespace = 'default'
+    pod_names = ['pod-1']
+    top_output = """
+POD_NAME   NAME      CPU(cores)   MEMORY(bytes)
+pod-1      my-app    123m         456Mi
+"""
+    with mock.patch.object(
+        kubernetes_commands,
+        '_GetPodNamesForResource',
+        return_value=pod_names,
+    ):
+      self.MockIssueCommand({
+          f'top pod pod-1 --namespace {namespace} --containers': [
+              (top_output, '', 0)
+          ],
+      })
+      samples = kubernetes_commands.GetCPUUsageSamples(resource_name, namespace)
+      self.assertLen(samples, 1)
+      self.assertEqual(samples[0].metric, 'kubernetes_cpu_usage')
+      self.assertEqual(samples[0].value, 0.123)
+      self.assertEqual(samples[0].metadata['pod'], 'pod-1')
+      self.assertEqual(samples[0].metadata['container'], 'my-app')
+
+  def test_GetCPUUsageSamples_top_fails(self):
+    resource_name = 'deployment/my-app'
+    namespace = 'default'
+    pod_names = ['pod-1']
+    with mock.patch.object(
+        kubernetes_commands,
+        '_GetPodNamesForResource',
+        return_value=pod_names,
+    ):
+      self.MockIssueCommand({
+          f'top pod pod-1 --namespace {namespace} --containers': [
+              ('', 'error: metrics not available yet', 1)
+          ],
+      })
+      samples = kubernetes_commands.GetCPUUsageSamples(resource_name, namespace)
+      self.assertEmpty(samples)
 
 
 def _ClearTimestamps(samples: Iterable[Sample]) -> Iterable[Sample]:

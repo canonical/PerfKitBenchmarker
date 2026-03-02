@@ -14,7 +14,7 @@
 
 """Set of utility functions for working with virtual machines."""
 
-
+import collections
 import contextlib
 import enum
 import logging
@@ -28,13 +28,15 @@ import subprocess
 import tempfile
 import threading
 import time
-from typing import Callable, Dict, Iterable, Tuple
+from typing import Any, Callable, Dict, Iterable, Literal, Tuple
 
 from absl import flags
 import jinja2
 from perfkitbenchmarker import data
 from perfkitbenchmarker import errors
+from perfkitbenchmarker import log_util
 from perfkitbenchmarker import temp_dir
+import yaml
 
 FLAGS = flags.FLAGS
 # Using logger rather than logging.info to avoid stack_level problems.
@@ -149,6 +151,7 @@ _SSH_PRIVATE_KEY = flags.DEFINE_string(
     None,
     'File path to the SSH private key. If None, use the newly generated one.',
 )
+_SSH_KEY_TYPE = flags.DEFINE_string('ssh_key_type', 'rsa', 'SSH key type.')
 
 
 class RetryError(Exception):
@@ -259,7 +262,7 @@ def SSHKeyGen():
     create_cmd = [
         'ssh-keygen',
         '-t',
-        'rsa',
+        _SSH_KEY_TYPE.value,
         '-N',
         '',
         '-m',
@@ -281,6 +284,26 @@ def GetPublicKeyPath():
   if UseProvidedSSHKeys():
     return _SSH_PUBLIC_KEY.value
   return PrependTempDir(PUBLIC_KEYFILE)
+
+
+def IncrementStackLevel(**kwargs: Any) -> Any:
+  """Increments the stack_level variable stored in kwargs.
+
+  This method should be called from "helper" functions whose usage is not
+  particularly interesting, but whose callers are.
+  A default of 1 (before being incremented) represents the caller of the
+  "helper" function.
+  Args:
+    **kwargs: The dictionary of arguments to modify, which may or may not
+      contain stack_level.
+
+  Returns:
+    The modified dictionary of arguments.
+  """
+  if 'stack_level' not in kwargs:
+    kwargs['stack_level'] = 1
+  kwargs['stack_level'] += 1
+  return kwargs
 
 
 def GetSshOptions(ssh_key_filename, connect_timeout=None):
@@ -428,6 +451,7 @@ def IssueCommand(
     suppress_logging: bool = False,
     raise_on_timeout: bool = True,
     stack_level: int = 1,
+    log_to_short_log: bool = True,
 ) -> Tuple[str, str, int]:
   """Tries running the provided command once.
 
@@ -456,6 +480,8 @@ def IssueCommand(
       timeout being hit should raise a IssueCommandTimeoutError
     stack_level: Number of stack frames to skip & get an "interesting" caller,
       for logging. 1 skips this function, 2 skips this & its caller, etc..
+    log_to_short_log: A boolean indicating if the command should be logged to
+      the short log.
 
   Returns:
     A tuple of stdout, stderr, and retcode from running the provided command.
@@ -578,6 +604,8 @@ def IssueCommand(
       and process.returncode
   ):
     logger.info(debug_text, stacklevel=stack_level)
+    if log_to_short_log:
+      log_util.LogToShortLog(full_cmd, stacklevel=stack_level)
 
   # Raise timeout error regardless of raise_on_failure - as the intended
   # semantics is to ignore expected errors caused by invoking the command
@@ -602,7 +630,9 @@ def IssueCommand(
       # since some callers assume either is a failure e.g.
       # perfkitbenchmarker.providers.aws.util.IssueRetryableCommand()
       return stdout, '', 0
-    raise errors.VmUtil.IssueCommandError(debug_text)
+    # raise only when raise_on_failure=True, even if suppress_failure was passed
+    if raise_on_failure:
+      raise errors.VmUtil.IssueCommandError(debug_text)
 
   return stdout, stderr, process.returncode
 
@@ -896,9 +926,105 @@ def DictionaryToEnvString(dictionary, joiner=' '):
   )
 
 
-def CreateRemoteFile(vm, file_contents, file_path):
+def WriteTemporaryFile(
+    file_contents: str,
+    origin: str = '',
+    should_log_file: bool = True,
+    stack_level: int = 1,
+) -> str:
+  """Writes the string file_contents to a temporary file.
+
+  Args:
+    file_contents: string. The contents of the file to write.
+    origin: str. The origin of the file, used for logging.
+    should_log_file: bool. Whether to log the file before writing.
+    stack_level: int. The stack level to use for logging.
+
+  Returns:
+    The name of the temporary file.
+  """
+  stack_level += 1
+  prefix = 'pkb-'
+  with NamedTemporaryFile(
+      prefix=prefix, dir=GetTempDir(), delete=False, mode='w'
+  ) as tf:
+    if origin:
+      origin = f'from {origin}'
+    if should_log_file:
+      logging.info(
+          'Writing temporary file %s to name %s with contents:\n%s',
+          origin,
+          tf.name,
+          file_contents,
+          stacklevel=stack_level,
+      )
+    tf.write(file_contents)
+    tf.close()
+    return tf.name
+
+
+def RenderTemplate(
+    template_path,
+    context,
+    trim_spaces: bool = False,
+    **logging_kwargs: dict[str, Any],
+) -> str:
+  """Renders a local Jinja2 template and returns its file name.
+
+  The template will be provided variables defined in 'context'.
+
+  Args:
+    template_path: string. Local path to jinja2 template.
+    context: dict. Variables to pass to the Jinja2 template during rendering.
+    trim_spaces: bool. Value for both trim_blocks and lstrip_blocks.
+    **logging_kwargs: dict. Keyword arguments passed to WriteTemporaryFile.
+
+  Raises:
+    jinja2.UndefinedError: if template contains variables not present in
+      'context'.
+
+  Returns:
+    The name of the temporary file containing the rendered template.
+  """
+  rendered_template = ReadAndRenderJinja2Template(
+      template_path, trim_spaces, **context
+  )
+  IncrementStackLevel(**logging_kwargs)
+  return WriteTemporaryFile(
+      rendered_template,
+      origin=f'jinja2 template {template_path}',
+      **logging_kwargs,
+  )
+
+
+def ReadAndRenderJinja2Template(
+    file_path: str, trim_spaces: bool = False, **kwargs
+) -> str:
+  """Reads & renders a .j2 file, returning the whole thing as a string."""
+  filename = data.ResourcePath(file_path)
+  with open(filename) as template_file:
+    contents = template_file.read()
+  if kwargs:
+    if not file_path.endswith('.j2'):
+      logging.warning(
+          'kwargs were provided when reading %s, but it is not a jinja2'
+          ' template. Rename file to end with .j2.',
+          file_path,
+      )
+    environment = jinja2.Environment(
+        undefined=jinja2.StrictUndefined,
+        trim_blocks=trim_spaces,
+        lstrip_blocks=trim_spaces,
+    )
+    contents = environment.from_string(contents).render(kwargs)
+  return contents
+
+
+def CreateRemoteFile(
+    vm, file_contents, file_path, write_mode: Literal['w', 'wb'] = 'w'
+):
   """Creates a file on the remote server."""
-  with NamedTemporaryFile(mode='w') as tf:
+  with NamedTemporaryFile(mode=write_mode) as tf:
     tf.write(file_contents)
     tf.close()
     parent_dir = posixpath.dirname(file_path)
@@ -911,3 +1037,94 @@ def ReadLocalFile(filename: str) -> str:
   file_path = posixpath.join(GetTempDir(), filename)
   stdout, _, _ = IssueCommand(['cat', file_path])
   return stdout
+
+
+def RecursiveDict() -> dict[str, Any]:
+  """Creates a new dictionary with auto nesting keys.
+
+  See https://stackoverflow.com/a/10218517/2528472.
+
+  Returns:
+    A new dictionary that automatically sets the value for any nested missing
+    keys.
+  """
+  return collections.defaultdict(RecursiveDict)
+
+
+def ReadYamlAsDicts(file_contents: str) -> list[dict[str, Any]]:
+  """Reads file contents & converts it to a list of recursive YAML doc dicts.
+
+  Args:
+    file_contents: The yaml string.
+
+  Returns:
+    The various YAML documents as a list of recursive dictionaries.
+  """
+  yaml_docs = yaml.safe_load_all(file_contents)
+  return_yamls = []
+  for yaml_doc in yaml_docs:
+    return_yamls.append(ConvertToDictType(yaml_doc, RecursiveDict))
+  return return_yamls
+
+
+def ConvertToDictType(yaml_doc: Any, dict_lambda: Any) -> dict[str, Any] | Any:
+  """Converts a YAML document to the given dictionary type.
+
+  In particular a recursive defaultdict can be more easily accessed with e.g.
+  my_dict['a']['b'] = value rather than my_dict.setdefault('a', {})['b'] =
+  value.
+
+  Args:
+    yaml_doc: The YAML document to convert.
+    dict_lambda: A constructor for the dictionary type to convert to.
+
+  Returns:
+    The remade dictionary.
+  """
+  if not isinstance(yaml_doc, dict) and not isinstance(yaml_doc, list):
+    return yaml_doc
+
+  def _ConvertPossiblyEmptyValue(value: Any) -> Any | None:
+    """Converts a given value to the dictionary type, or None if empty."""
+    if not bool(value) and value != 0:
+      return None
+    converted_value = ConvertToDictType(value, dict_lambda)
+    if not bool(converted_value) and converted_value != 0:
+      return None
+    return converted_value
+
+  yaml_list = []
+  if isinstance(yaml_doc, list):
+    for item in yaml_doc:
+      converted_value = _ConvertPossiblyEmptyValue(item)
+      if converted_value is None:
+        continue
+      yaml_list.append(converted_value)
+    return yaml_list
+  yaml_dict = dict_lambda()
+  for key, value in yaml_doc.items():
+    converted_value = _ConvertPossiblyEmptyValue(value)
+    if converted_value is None:
+      continue
+    yaml_dict[key] = converted_value
+  return yaml_dict
+
+
+def WriteYaml(yaml_dicts: list[dict[str, Any]], **kwargs) -> str:
+  """Writes yaml to a file & returns the name of that file.
+
+  Args:
+    yaml_dicts: A list of YAML documents.
+    **kwargs: Keyword arguments passed to file writing.
+
+  Returns:
+    Names of the written file.
+  """
+  normal_dicts = []
+  # Convert back to a normal dict because yaml.dump otherwise adds random
+  # "dictitems:" keys & other python artifacts.
+  for yaml_dict in yaml_dicts:
+    normal_dicts.append(ConvertToDictType(yaml_dict, dict))
+  manifest = yaml.dump_all(normal_dicts)
+  IncrementStackLevel(**kwargs)
+  return WriteTemporaryFile(manifest, origin='yaml', **kwargs)

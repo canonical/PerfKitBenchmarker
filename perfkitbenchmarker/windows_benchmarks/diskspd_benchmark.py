@@ -26,7 +26,7 @@ diskspd:
   description: Run diskspd on a single machine
   vm_groups:
     default:
-      vm_spec: *default_single_core
+      vm_spec: *default_dual_core
       vm_count: 1
       disk_spec: *default_500_gb
 """
@@ -39,6 +39,8 @@ def GetConfig(user_config):
 def Prepare(benchmark_spec):
   vm = benchmark_spec.vms[0]
   vm.Install('diskspd')
+  if diskspd.EnablePrefill():
+    diskspd.Prefill(vm)
 
 
 def Run(benchmark_spec):
@@ -51,7 +53,6 @@ def Run(benchmark_spec):
   Returns:
     A list of sample.Sample objects with the benchmark results.
   """
-
   vm = benchmark_spec.vms[0]
   results = []
   results.extend(diskspd.RunDiskSpd(vm))

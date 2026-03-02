@@ -332,14 +332,19 @@ class TestRemoteCommand(pkb_common_test_case.PkbCommonTestCase):
       self.vm.RemoteCommand('foo')
     self.assertEqual(
         logs.output,
-        ['INFO:root:Running on %s via ssh: %s' % ('pkb-test', 'foo')],
+        [
+            'INFO:root:Running on pkb-test via ssh: foo',
+            'INFO:short:Running on pkb-test via ssh: foo',
+        ],
     )
     self.issue_cmd_mock.assert_called_once_with(
         matchers.HASALLOF('ssh', 'PasswordAuthentication=no', 'foo'),
         timeout=None,
         should_pre_log=False,
         raise_on_failure=False,
+        suppress_logging=False,
         stack_level=mock.ANY,
+        log_to_short_log=False,
     )
 
   def testIssueCommanndCalledWithStackLevel(self):
@@ -349,7 +354,9 @@ class TestRemoteCommand(pkb_common_test_case.PkbCommonTestCase):
         timeout=None,
         should_pre_log=False,
         raise_on_failure=False,
+        suppress_logging=False,
         stack_level=4,
+        log_to_short_log=False,
     )
 
   @parameterized.parameters(
@@ -362,7 +369,7 @@ class TestRemoteCommand(pkb_common_test_case.PkbCommonTestCase):
     method = getattr(self.vm, method_name)
     with self.assertLogs() as logs:
       method('foo')
-    self.assertLen(logs.output, 1)
+    self.assertLen(logs.output, 2)
     self.assertIn('linux_virtual_machine_test', logs.records[0].pathname)
 
   def testLoginShellAppendsBash(self):
@@ -372,7 +379,9 @@ class TestRemoteCommand(pkb_common_test_case.PkbCommonTestCase):
         timeout=None,
         should_pre_log=False,
         raise_on_failure=False,
+        suppress_logging=False,
         stack_level=mock.ANY,
+        log_to_short_log=False,
     )
 
   def testNonZeroReturnCodeRaises(self):
@@ -495,6 +504,13 @@ class LinuxVirtualMachineTestCase(pkb_common_test_case.PkbCommonTestCase):
       'Thread(s) per core: 1',
       'Socket(s): 1',
   ])
+  lscpu_output_smt_enabled = '\n'.join([
+      'NUMA node(s): 1',
+      'Core(s) per socket: 1',
+      'Thread(s) per core: 2',
+      'Socket(s): 1',
+  ])
+
   normal_boot_responses = {
       'cat /proc/sys/net/ipv4/tcp_congestion_control': 'cubic',
       'grep PRETTY_NAME /etc/os-release': f'PRETTY_NAME="{os_info}"',
@@ -505,6 +521,7 @@ class LinuxVirtualMachineTestCase(pkb_common_test_case.PkbCommonTestCase):
           pkb_common_test_case.IP_LINK_TEXT
       ),
       'cat /proc/cpuinfo | grep processor | wc -l': '16',
+      'cat /proc/cmdline': 'test kernel flags'
   }
 
   def CreateVm(
@@ -522,7 +539,7 @@ class LinuxVirtualMachineTestCase(pkb_common_test_case.PkbCommonTestCase):
         # AttributeError which is retried until the test times out.
         # See b/271465182 for more discussion.
         if cmd not in run_cmd_response:
-          raise SystemExit(f'Define response for {cmd}')
+          raise SystemExit(f'Define response for [{cmd}]')
         stdout = run_cmd_response[cmd]
       else:
         raise NotImplementedError()
@@ -545,19 +562,21 @@ class LinuxVirtualMachineTestCase(pkb_common_test_case.PkbCommonTestCase):
     return vm
 
   @parameterized.named_parameters(
-      ('hasSMT_want_real', 32, 'regular', 16),
-      ('noSMT_want_real', 32, 'nosmt', 32),
+      ('hasSMT_want_real', 32, True, 16),
+      ('noSMT_want_real', 32, False, 32),
   )
   def testNumCpusForBenchmarkNoSmt(
-      self, vcpus, kernel_command_line, expected_num_cpus
+      self, vcpus, is_smt_enabled, expected_num_cpus
   ):
     FLAGS['use_numcpu_multi_files'].parse(True)
+    if is_smt_enabled:
+      self.lscpu_output = self.lscpu_output_smt_enabled
     responses = {
         'ls /sys/fs/cgroup/cpuset.cpus.effective >> /dev/null 2>&1 || echo file_not_exist': (
             ''
         ),
         'cat /sys/fs/cgroup/cpuset.cpus.effective': f'0-{vcpus-1}',
-        'cat /proc/cmdline': kernel_command_line,
+        'cat /proc/cmdline': 'regular',
     }
     responses.update(self.normal_boot_responses)
     vm = self.CreateVm(responses, metadata=True)
@@ -596,12 +615,9 @@ class LinuxVirtualMachineTestCase(pkb_common_test_case.PkbCommonTestCase):
         'ls /sys/fs/cgroup/cpuset.cpus.effective >> /dev/null 2>&1 || echo file_not_exist': (
             'file_not_exist'
         ),
-        'ls /dev/cgroup/cpuset.cpus.effective >> /dev/null 2>&1 || echo file_not_exist': (
-            'file_not_exist'
-        ),
         'ls /proc/self/status >> /dev/null 2>&1 || echo file_not_exist': '',
-        'cat /proc/self/status | grep Cpus_allowed_list': (
-            'Cpus_allowed_list:\t0-3,7-8'
+        'cat /proc/self/status | grep Cpus_allowed_list |cut -d: -f2': (
+            '0-3,7-8'
         ),
     }
     responses.update(self.normal_boot_responses)
@@ -611,14 +627,12 @@ class LinuxVirtualMachineTestCase(pkb_common_test_case.PkbCommonTestCase):
         'ls /sys/fs/cgroup/cpuset.cpus.effective >> /dev/null 2>&1 || echo file_not_exist': (
             'file_not_exist'
         ),
-        'ls /dev/cgroup/cpuset.cpus.effective >> /dev/null 2>&1 || echo file_not_exist': (
-            'file_not_exist'
-        ),
         'ls /proc/self/status >> /dev/null 2>&1 || echo file_not_exist': (
             'file_not_exist'
         ),
         'ls /proc/cpuinfo >> /dev/null 2>&1 || echo file_not_exist': '',
-        'cat /proc/cpuinfo | grep processor | wc -l': '16',
+        r"""cat /proc/cpuinfo | sed -n 's/processor\s*\:\s*\([0-9]*\)/\1/p'"""
+        """| paste -sd,""": '0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15',
     }
     responses.update(self.normal_boot_responses)
     vm = self.CreateVm(responses, metadata=True)
@@ -674,6 +688,7 @@ class LinuxVirtualMachineTestCase(pkb_common_test_case.PkbCommonTestCase):
         'os_info': self.os_info,
         'cpu_arch': self.cpu_arch,
         'threads_per_core': 1,
+        'kernel_command_line': 'test kernel flags',
     }
     self.assertEqual(expected_os_metadata, vm.os_metadata)
 
@@ -840,6 +855,72 @@ class LinuxVirtualMachineTestCase(pkb_common_test_case.PkbCommonTestCase):
     with self.assertRaisesRegex(ValueError, expected_error):
       vm._DisableCstates()
     self.assertNotIn('disabled_cstates', vm.os_metadata)
+
+  @mock.patch.object(
+      pkb_common_test_case.TestLinuxVirtualMachine, 'RemoteCommand'
+  )
+  def test_get_nvme_device_info_with_devices(self, mock_remote_command):
+    vm = CreateTestLinuxVm()
+    nvme_list_output = """Node                  Generic               SN                   Model                                    Namespace  Usage                      Format           FW Rev
+--------------------- --------------------- -------------------- ---------------------------------------- ---------- -------------------------- ---------------- --------
+/dev/nvme0n1          /dev/ng0n1            vol06948076c9c135a44 Amazon Elastic Block Store               0x1          8.59  GB /   8.59  GB    512   B +  0 B   1.0
+/dev/nvme1n1          /dev/ng1n1            vol06d22d4fd149a2e68 Amazon Elastic Block Store               0x1         10.74  GB /  10.74  GB    512   B +  0 B   1.0
+"""
+    mock_remote_command.side_effect = [
+        ('nvme version 2.13', ''),  # nvme --version
+        (nvme_list_output, ''),  # nvme list
+    ]
+
+    expected_result = [
+        {
+            'DevicePath': '/dev/nvme0n1',
+            'SerialNumber': 'vol06948076c9c135a44',
+            'ModelNumber': 'Amazon Elastic Block Store',
+        },
+        {
+            'DevicePath': '/dev/nvme1n1',
+            'SerialNumber': 'vol06d22d4fd149a2e68',
+            'ModelNumber': 'Amazon Elastic Block Store',
+        },
+    ]
+
+    result = vm.GetNVMEDeviceInfo()
+
+    self.assertEqual(result, expected_result)
+    mock_remote_command.assert_any_call('sudo nvme --version')
+    mock_remote_command.assert_any_call('sudo nvme list')
+
+
+class RangeListUtilTest(parameterized.TestCase):
+
+  @parameterized.named_parameters(
+      ('empty', '', set()),
+      ('single_int', '1', set([1])),
+      ('range', '1-10', set(range(1, 11))),
+      ('multiple_ints', '1,2,3', set([1, 2, 3])),
+      ('multiple_ranges', '1-10,20-30', set(range(1, 11)) | set(range(20, 31))),
+      ('multiple_ints_and_ranges', '1,2,3-5', set([1, 2, 3, 4, 5])),
+      (
+          'multiple_ints_and_ranges_with_empty_spaces',
+          '1, 2, 3-5',
+          set([1, 2, 3, 4, 5]),
+      ),
+  )
+  def testParseRangeList(self, csv_list, expected_set):
+    self.assertEqual(linux_virtual_machine.ParseRangeList(csv_list),
+                     expected_set)
+
+  def testParseRangeListInvalidRange(self):
+    with self.assertRaises(ValueError):
+      linux_virtual_machine.ParseRangeList('10-1')
+
+  def testParseRangeListInvalidInt(self):
+    with self.assertRaises(ValueError):
+      linux_virtual_machine.ParseRangeList('x')
+
+  def testParseRangeListRangeParseError(self):
+    with self.assertRaises(ValueError):
+      linux_virtual_machine.ParseRangeList('10-x')
 
 
 if __name__ == '__main__':

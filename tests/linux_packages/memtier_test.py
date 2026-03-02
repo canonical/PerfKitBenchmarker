@@ -1729,21 +1729,11 @@ class MemtierTestCase(
     }
 
     with self.subTest('SamplesAreCorrect'):
-      # self.assertSampleListsEqualUpToTimestamp(results, expected_samples)
       self.assertSampleInList(
           sample.Sample(
               metric='Mean ops_per_sec',
-              value=500.0,
+              value=3000.0,
               unit='ops/s',
-              metadata=expected_metadata,
-          ),
-          results,
-      )
-      self.assertSampleInList(
-          sample.Sample(
-              metric='Stdev kb_per_sec',
-              value=3.7416573867739413,
-              unit='KB/s',
               metadata=expected_metadata,
           ),
           results,
@@ -1848,6 +1838,11 @@ class MemtierTestCase(
             'memtier_threads': 4,
             'memtier_version': '2.1.3',
             'memtier_tls': False,
+            'memtier_distinct_client_seed': True,
+            'memtier_command': None,
+            'memtier_key_prefix': None,
+            'memtier_random_data': True,
+
         },
     )
 

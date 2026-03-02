@@ -19,7 +19,8 @@ from typing import Any, Dict, List
 from absl import flags
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import linux_packages
-from perfkitbenchmarker import os_types
+from perfkitbenchmarker import provider_info
+from perfkitbenchmarker import vm_util
 
 
 class RedisEvictionPolicy:
@@ -87,13 +88,19 @@ REDIS_AOF = flags.DEFINE_bool(
     False,
     'If true, use disks on the server for aof backups.',
 )
+REDIS_AOF_VERIFY = flags.DEFINE_bool(
+    'redis_aof_verify',
+    False,
+    'If true, execute redis-check-aof to verify the AOF backups. This depends'
+    ' on enabling --redis_aof. Default is set to False.',
+)
 
 
 # Default port for Redis
 DEFAULT_PORT = 6379
 REDIS_PID_FILE = 'redis.pid'
 FLAGS = flags.FLAGS
-REDIS_GIT = 'https://github.com/antirez/redis.git'
+REDIS_GIT = 'https://github.com/redis/redis.git'
 REDIS_BACKUP = 'scratch'
 CURRENT_IO_THREADS = None
 
@@ -141,6 +148,37 @@ def CheckPrerequisites():
   return True
 
 
+def PrepareSystem(vm) -> None:
+  """Set system-wide parameters on the VM."""
+  CheckPrerequisites()
+
+  if vm.PLATFORM == provider_info.KUBERNETES:
+    logging.info('Skipping system preparation for Kubernetes VMs.')
+    return
+
+  num_processes = _GetNumProcesses(vm)
+  # 10 is an arbituary multiplier that ensures this value is high enough.
+  mux_sessions = 10 * num_processes
+  vm.RemoteCommand(
+      f'echo "\nMaxSessions {mux_sessions}" | sudo tee -a /etc/ssh/sshd_config'
+  )
+  # Redis tuning parameters, see
+  # https://www.techandme.se/performance-tips-for-redis-cache-server/.
+  # This command works on 2nd generation of VMs only.
+  update_sysvtl = vm.TryRemoteCommand(
+      'echo "'
+      'vm.overcommit_memory = 1\n'
+      'net.core.somaxconn = 65535\n'
+      '" | sudo tee -a /etc/sysctl.conf'
+  )
+  # /usr/sbin/sysctl is not applicable on certain distros.
+  commit_sysvtl = vm.TryRemoteCommand(
+      'sudo /usr/sbin/sysctl -p || sudo sysctl -p'
+  )
+  if not (update_sysvtl and commit_sysvtl):
+    logging.info('Fail to optimize overcommit_memory and socket connections.')
+
+
 def _Install(vm) -> None:
   """Installs the redis package on the VM."""
   CheckPrerequisites()
@@ -154,31 +192,17 @@ def _Install(vm) -> None:
 
 def YumInstall(vm) -> None:
   """Installs the redis package on the VM."""
-  if vm.OS_TYPE in os_types.CENTOS_TYPES:
-    vm.InstallPackages('tcl-devel')
-    vm.InstallPackages('scl-utils centos-release-scl')
-    vm.InstallPackages('devtoolset-7 libuuid-devel')
-    vm.InstallPackages(
-        'openssl openssl-devel curl-devel '
-        'devtoolset-7-libatomic-devel tcl '
-        'tcl-devel git wget epel-release'
-    )
-    vm.InstallPackages('tcltls libzstd procps-ng')
-    vm.RemoteCommand(
-        'echo "source scl_source enable devtoolset-7" | sudo tee -a'
-        ' $HOME/.bashrc'
-    )
-
-  elif vm.BASE_OS_TYPE == os_types.RHEL:
-    vm.RemoteCommand('sudo yum group install -y "Development Tools"')
-  else:
-    raise NotImplementedError()
+  vm.InstallPackages('tcl-devel')
+  if REDIS_AOF_VERIFY.value:
+    vm.InstallPackages('redis')
   _Install(vm)
 
 
 def AptInstall(vm) -> None:
   """Installs the redis package on the VM."""
   vm.InstallPackages('tcl-dev')
+  if REDIS_AOF_VERIFY.value:
+    vm.InstallPackages('redis-tools')
   _Install(vm)
 
 
@@ -192,6 +216,19 @@ def _GetIOThreads(vm) -> int:
     return max(num_cpus - 1, 1)
   else:
     return num_cpus // 2
+
+
+def _GetRedisAofFilename(port) -> str:
+  return f'backup_{port}'
+
+
+def _GetRedisConfigDir(vm, localhost, port) -> str:
+  """Returns the directory where redis files are stored."""
+  stdout, _ = vm.RemoteCommand(
+      f'sudo {GetRedisDir()}/src/redis-cli -h {localhost} -p {port} CONFIG'
+      ' GET dir'
+  )
+  return stdout.strip().split('\n')[-1]
 
 
 def _BuildStartCommand(vm, port: int) -> str:
@@ -220,7 +257,7 @@ def _BuildStartCommand(vm, port: int) -> str:
   if REDIS_AOF.value:
     cmd_args += [
         '--appendonly yes',
-        f'--appendfilename backup_{port}',
+        f'--appendfilename {_GetRedisAofFilename(port)}',
         f'--dir /{REDIS_BACKUP}',
     ]
   # Add check for the MADV_FREE/fork arm64 Linux kernel bug
@@ -257,49 +294,57 @@ def _BuildStartCommand(vm, port: int) -> str:
   return cmd.format(redis_dir=redis_dir, args=' '.join(cmd_args))
 
 
+@vm_util.Retry(poll_interval=5, timeout=60)
+def _WaitForRedisUp(vm, port):
+  """Wait until redis server is up on a given port."""
+  localhost = vm.GetLocalhostAddr()
+  vm.RemoteCommand(
+      f'sudo {GetRedisDir()}/src/redis-cli -h {localhost} -p {port} ping | grep'
+      ' PONG'
+  )
+
+
 def Start(vm) -> None:
   """Start redis server process."""
-  num_processes = _GetNumProcesses(vm)
-  # 10 is an arbituary multiplier that ensures this value is high enough.
-  mux_sessions = 10 * num_processes
-  vm.RemoteCommand(
-      f'echo "\nMaxSessions {mux_sessions}" | sudo tee -a /etc/ssh/sshd_config'
-  )
-  # Redis tuning parameters, see
-  # https://www.techandme.se/performance-tips-for-redis-cache-server/.
-  # This command works on 2nd generation of VMs only.
-  update_sysvtl = vm.TryRemoteCommand(
-      'echo "'
-      'vm.overcommit_memory = 1\n'
-      'net.core.somaxconn = 65535\n'
-      '" | sudo tee -a /etc/sysctl.conf'
-  )
-  # /usr/sbin/sysctl is not applicable on certain distros.
-  commit_sysvtl = vm.TryRemoteCommand(
-      'sudo /usr/sbin/sysctl -p || sudo sysctl -p'
-  )
-  if not (update_sysvtl and commit_sysvtl):
-    logging.info('Fail to optimize overcommit_memory and socket connections.')
-  for port in GetRedisPorts(vm):
+  ports = GetRedisPorts(vm)
+  for port in ports:
     vm.RemoteCommand(_BuildStartCommand(vm, port))
+    # The redis-server command starts in the background, so we need to wait for
+    # it to be up before issuing commands to it.
+    _WaitForRedisUp(vm, port)
 
 
 def Stop(vm) -> None:
   """Stops redis server processes, flushes all keys, and resets the cluster."""
   redis_dir = GetRedisDir()
   ports = GetRedisPorts(vm)
-
-  for port in ports:
-    vm.TryRemoteCommand(f'sudo {redis_dir}/src/redis-cli -p {port} flushall')
+  localhost = vm.GetLocalhostAddr()
 
   for port in ports:
     vm.TryRemoteCommand(
-        f'sudo {redis_dir}/src/redis-cli -p {port} cluster reset hard'
+        f'sudo {redis_dir}/src/redis-cli -h {localhost} -p {port} flushall'
     )
 
-  vm.TryRemoteCommand(
-      'sudo pkill -f redis-server || echo "No Redis server processes found"'
-  )
+  for port in ports:
+    vm.TryRemoteCommand(
+        f'sudo {redis_dir}/src/redis-cli -h {localhost} -p {port} cluster reset'
+        ' hard'
+    )
+
+  for port in ports:
+    # Gracefully send SHUTDOWN command to redis server.
+    vm.TryRemoteCommand(
+        f'sudo {redis_dir}/src/redis-cli -h {localhost} -p {port} shutdown'
+    )
+
+  for port in ports:
+    # Check that redis server is not running anymore.
+    _, stderr, return_code = vm.RemoteCommandWithReturnCode(
+        f'sudo {redis_dir}/src/redis-cli -h {localhost} -p {port} ping',
+        ignore_failure=True,
+    )
+    if return_code == 0 or 'Could not connect to Redis' not in stderr:
+      raise errors.Error(f'Redis on port {port} failed to shut down.')
 
 
 def StartCluster(server_vms) -> None:
@@ -331,3 +376,24 @@ def GetRedisPorts(vm=None) -> List[int]:
   """Returns a list of redis port(s)."""
   num_processes = _GetNumProcesses(vm)
   return [DEFAULT_PORT + i for i in range(num_processes)]
+
+
+def VerifyRedisAof(vm) -> None:
+  """Apply data validation to the AOF backups."""
+  localhost = vm.GetLocalhostAddr()
+  ports = GetRedisPorts(vm)
+  for port in ports:
+    redis_config_dir = _GetRedisConfigDir(vm, localhost, port)
+    _, stderr, return_code = vm.RemoteCommandWithReturnCode(
+        f'sudo redis-check-aof {redis_config_dir}/{_GetRedisAofFilename(port)}'
+    )
+    if return_code == 0:
+      logging.info(
+          'Validation succeeded for the AOF backup file %s',
+          f'{redis_config_dir}/{_GetRedisAofFilename(port)}',
+      )
+    else:
+      raise errors.Error(
+          'Validation failed with the AOF backup file'
+          f' {redis_config_dir}/{_GetRedisAofFilename(port)}, stderr: {stderr}'
+      )

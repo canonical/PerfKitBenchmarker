@@ -319,6 +319,52 @@ class GceVirtualMachineTestCase(pkb_common_test_case.PkbCommonTestCase):
         min_cpu_platform_in_command, gcloud_cmd.flags.get('min-cpu-platform')
     )
 
+  def testLocalSsdsSet(
+      self,
+  ):
+    spec = gce_virtual_machine.GceVmSpec(
+        _COMPONENT,
+        machine_type='n2-standard-16',
+        num_local_ssds=8,
+        project='fakeproject',
+    )
+    vm = pkb_common_test_case.TestGceVirtualMachine(spec)
+    self.assertEqual(8, vm.max_local_disks)
+    gcloud_cmd = vm._GenerateCreateCommand('x')
+    self.assertEqual(['interface=NVME'] * 8, gcloud_cmd.flags.get('local-ssd'))
+    metadata = vm.GetResourceMetadata()
+    self.assertEqual(8, metadata['gce_local_ssd_count'])
+
+  def testLocalSsdFixedMachineTypeC4Standard8FlagOverride(
+      self,
+  ):
+    spec = gce_virtual_machine.GceVmSpec(
+        _COMPONENT,
+        machine_type='c4-standard-8-lssd',
+        num_local_ssds=200,
+        project='fakeproject',
+    )
+    # Assert lssd count is overriden to 1.
+    vm = pkb_common_test_case.TestGceVirtualMachine(spec)
+    self.assertEqual(1, vm.max_local_disks)
+    gcloud_cmd = vm._GenerateCreateCommand('x')
+    self.assertNotIn('local-ssd', gcloud_cmd.flags)
+    metadata = vm.GetResourceMetadata()
+    self.assertEqual(1, metadata['gce_local_ssd_count'])
+
+  def testLocalSsdFixedMachineTypeC4Standard16FlagNotSpecified(
+      self,
+  ):
+    spec = gce_virtual_machine.GceVmSpec(
+        _COMPONENT,
+        machine_type='c4-standard-16-lssd',
+        project='fakeproject',
+    )
+    vm = pkb_common_test_case.TestGceVirtualMachine(spec)
+    self.assertEqual(2, vm.max_local_disks)
+    metadata = vm.GetResourceMetadata()
+    self.assertEqual(2, metadata['gce_local_ssd_count'])
+
   def testUpdateInterruptibleVmStatus(self):
     spec = gce_virtual_machine.GceVmSpec(
         _COMPONENT,
@@ -694,6 +740,16 @@ class GCEVMFlagsTestCase(pkb_common_test_case.PkbCommonTestCase):
     self.assertEqual(call_count, 1)
     self.assertIn('--preemptible', cmd)
 
+  def testMigrateOnMaintenanceFlagNotPresent(self):
+    print('GCEVMFlagsTestCase testMigrateOnMaintenanceFlagNotPresent')
+    cmd, call_count = self._CreateVmCommand(
+        # gce_migrate_on_maintenance is None
+    )
+    self.assertEqual(call_count, 1)
+    self.assertNotIn('--maintenance-policy', cmd)
+    self.assertNotIn('TERMINATE', cmd)
+    self.assertNotIn('MIGRATE', cmd)
+
   def testMigrateOnMaintenanceFlagTrueWithGpus(self):
     with self.assertRaises(errors.Config.InvalidValue) as cm:
       self._CreateVmCommand(
@@ -702,16 +758,30 @@ class GCEVMFlagsTestCase(pkb_common_test_case.PkbCommonTestCase):
     self.assertEqual(
         str(cm.exception),
         (
-            'Cannot set flag gce_migrate_on_maintenance on instances with GPUs '
-            'or network placement groups, as it is not supported by GCP.'
+            'Cannot set flag gce_migrate_on_maintenance on instances with GPUs,'
+            ' network placement groups, or preemption, as it is not supported'
+            ' by GCP.'
         ),
     )
 
   def testMigrateOnMaintenanceFlagFalseWithGpus(self):
-    _, call_count = self._CreateVmCommand(
+    cmd, call_count = self._CreateVmCommand(
         gce_migrate_on_maintenance=False, gpu_count=1, gpu_type='k80'
     )
     self.assertEqual(call_count, 1)
+    self.assertIn('--maintenance-policy', cmd)
+    self.assertIn('TERMINATE', cmd)
+
+  def testMigrateOnMaintenanceFlagTrueWithSev(self):
+    cmd, call_count = self._CreateVmCommand(
+        gce_migrate_on_maintenance=True,
+        gce_confidential_compute=True,
+        gce_confidential_compute_type='sev',
+        machine_type='n2d-standard-2',
+    )
+    self.assertEqual(call_count, 1)
+    self.assertIn('--maintenance-policy', cmd)
+    self.assertIn('MIGRATE', cmd)
 
   def testAcceleratorTypeOverrideFlag(self):
     cmd, call_count = self._CreateVmCommand(
@@ -779,7 +849,7 @@ class GCEVMFlagsTestCase(pkb_common_test_case.PkbCommonTestCase):
     self.assertIn('total-egress-bandwidth-tier=TIER_1', cmd)
 
   def testAlphaMaintenanceFlag(self):
-    """Tests that egress bandwidth can be set as tier 1."""
+    """Tests that migrate on maintenance sets the correct flag in alpha."""
     gcloud_init = util.GcloudCommand.__init__
 
     def InitAndSetAlpha(self, resource, *args):
@@ -787,9 +857,7 @@ class GCEVMFlagsTestCase(pkb_common_test_case.PkbCommonTestCase):
       self.use_alpha_gcloud = True
 
     with mock.patch.object(util.GcloudCommand, '__init__', InitAndSetAlpha):
-      cmd, call_count = self._CreateVmCommand(
-          gce_egress_bandwidth_tier='TIER_1', gpu_count=1, gpu_type='k80'
-      )
+      cmd, call_count = self._CreateVmCommand(gce_migrate_on_maintenance=True)
     self.assertEqual(call_count, 1)
     self.assertIn('--on-host-maintenance', cmd)
 
@@ -1042,15 +1110,18 @@ class GCEVMCreateTestCase(pkb_common_test_case.PkbCommonTestCase):
   @parameterized.named_parameters(
       {
           'testcase_name': 'old_message',
-          'fake_stderr': """\
+          'fake_stderr': (
+              """\
 "The zone 'projects/fake-project/zones/fake-zone' does not have enough \
 resources available to fulfill the request. Try a different zone, or try again \
 later."
-""",
+"""
+          ),
       },
       {
           'testcase_name': 'new_message',
-          'fake_stderr': """\
+          'fake_stderr': (
+              """\
 code: ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS
 errorDetails:
 - help:
@@ -1074,7 +1145,8 @@ errorDetails:
       zonesAvailable: us-central1-f,us-central1-a,us-central1-c
     reason: stockout
 message: The zone 'projects/artemis-prod/zones/us-central1-b' does not have enough
-  resources available to fulfill the request.  '(resource type:compute)'.""",
+  resources available to fulfill the request.  '(resource type:compute)'."""
+          ),
       },
   )
   def testInsufficientCapacityCloudFailure(self, fake_stderr):
@@ -1122,8 +1194,24 @@ message: The zone 'projects/artemis-prod/zones/us-central1-b' does not have enou
       self.assertIn(
           'type=nvidia-tesla-k80,count=2', issue_command.call_args[0][0]
       )
-      self.assertIn('--maintenance-policy', issue_command.call_args[0][0])
-      self.assertIn('TERMINATE', issue_command.call_args[0][0])
+
+
+class UtilsTestCase(pkb_common_test_case.PkbCommonTestCase):
+
+  @parameterized.parameters(
+      ('h100', 8, 'type=nvidia-h100-80gb,count=8'),
+      ('l4', 1, 'type=nvidia-l4,count=1'),
+      ('k80', 1, 'type=nvidia-tesla-k80,count=1'),
+  )
+  def testGenerateAcceleratorSpecString(
+      self, accelerator_type, accelerator_count, expected
+  ):
+    self.assertEqual(
+        expected,
+        gce_virtual_machine.GenerateAcceleratorSpecString(
+            accelerator_type, accelerator_count
+        ),
+    )
 
 
 class GceFirewallRuleTest(pkb_common_test_case.PkbCommonTestCase):
@@ -1195,8 +1283,10 @@ class GceNetworkTest(pkb_common_test_case.PkbCommonTestCase):
   def testGetNetwork(self):
     project = 'myproject'
     zone = 'us-east1-a'
-    vm = mock.Mock(zone=zone, project=project, cidr=None, subnet_names=None)
-    net = gce_network.GceNetwork.GetNetwork(vm)
+    vm_spec = gce_virtual_machine.GceVmSpec(
+        'test_component', project=project, zone=zone
+    )
+    net = gce_network.GceNetwork.GetNetwork(vm_spec)
     self.assertEqual(project, net.project)
     self.assertEqual(zone, net.zone)
 

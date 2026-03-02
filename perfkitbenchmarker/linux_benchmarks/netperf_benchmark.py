@@ -92,6 +92,11 @@ flags.DEFINE_integer(
     131072,
     'Send size to use for TCP_STREAM tests (netperf -m flag)',
 )
+_SCTP_SEND_SIZE = flags.DEFINE_integer(
+    'netperf_sctp_stream_send_size_in_bytes',
+    131072,
+    'Send size to use for SCTP_STREAM tests (netperf -m flag)',
+)
 flags.DEFINE_integer(
     'netperf_mss',
     None,
@@ -132,9 +137,10 @@ TCP_CRR = 'TCP_CRR'
 TCP_STREAM = 'TCP_STREAM'
 UDP_RR = 'UDP_RR'
 UDP_STREAM = 'UDP_STREAM'
+SCTP_STREAM = 'SCTP_STREAM'
 
 TCP_BENCHMARKS = [TCP_RR, TCP_CRR, TCP_STREAM]
-ALL_BENCHMARKS = TCP_BENCHMARKS + [UDP_RR, UDP_STREAM]
+ALL_BENCHMARKS = TCP_BENCHMARKS + [UDP_RR, UDP_STREAM, SCTP_STREAM]
 
 flags.DEFINE_list(
     'netperf_benchmarks', TCP_BENCHMARKS, 'The netperf benchmark(s) to run.'
@@ -149,9 +155,10 @@ flags.DEFINE_list(
 
 _HISTOGRAM_PERCENTILES = flags.DEFINE_multi_float(
     'netperf_histogram_percentiles',
-    [10, 50, 90, 99, 99.9],
+    [10, 50, 90, 99, 99.9, 99.99, 99.999],
     'Percentiles to calculate and report using the histogram. '
-    'Default histogram percentiles are p10, p50, p90, p99 and p99.9.',
+    'Default histogram percentiles are '
+    'p10, p50, p90, p99, p99.9, p99.99, and p99.999.',
 )
 
 FLAGS = flags.FLAGS
@@ -164,9 +171,9 @@ netperf:
   vpc_peering: True
   vm_groups:
     vm_1:
-      vm_spec: *default_single_core
+      vm_spec: *default_dual_core
     vm_2:
-      vm_spec: *default_single_core
+      vm_spec: *default_dual_core
   flags:
     placement_group_style: closest_supported
 """
@@ -220,7 +227,11 @@ def Prepare(benchmark_spec):
           (PrepareClientVM, [client_vm], {}),
           (
               PrepareServerVM,
-              [server_vm, client_vm.internal_ip, client_vm.ip_address],
+              [
+                  server_vm,
+                  client_vm.GetInternalIPs(),
+                  client_vm.GetExternalIPs(),
+              ],
               {},
           ),
       ],
@@ -241,12 +252,12 @@ def PrepareClientVM(client_vm):
   client_vm.RemoteCommand(f'sudo chmod 755 {REMOTE_SCRIPT}')
 
 
-def PrepareServerVM(server_vm, client_vm_internal_ip, client_vm_ip_address):
+def PrepareServerVM(server_vm, client_vm_internal_ips, client_vm_ip_address):
   """Install netperf and start netserver processes on server_vm.
 
   Args:
     server_vm: The VM that runs the netserver binary.
-    client_vm_internal_ip: Internal IP address of client_vm.
+    client_vm_internal_ips: Internal IP addresses of client_vm.
     client_vm_ip_address: All IP addresses of client_vm.
   """
   num_streams = max(FLAGS.netperf_num_streams) * max(
@@ -255,7 +266,8 @@ def PrepareServerVM(server_vm, client_vm_internal_ip, client_vm_ip_address):
 
   # See comments where _COS_RE is defined.
   if server_vm.image and re.search(_COS_RE, server_vm.image):
-    _SetupHostFirewall(server_vm, client_vm_internal_ip, client_vm_ip_address)
+    for internal_ip in client_vm_internal_ips:
+      _SetupHostFirewall(server_vm, internal_ip, client_vm_ip_address)
 
   # Start the netserver processes
   if vm_util.ShouldRunOnExternalIpAddress():
@@ -280,7 +292,7 @@ def _SetupHostFirewall(server_vm, client_vm_internal_ip, client_vm_ip_address):
   """
   ip_addrs = [client_vm_internal_ip]
   if vm_util.ShouldRunOnExternalIpAddress():
-    ip_addrs.append(client_vm_ip_address)
+    ip_addrs.extend(client_vm_ip_address)
 
   logging.info(
       'setting up host firewall on %s running %s for client at %s',
@@ -376,20 +388,21 @@ def ParseNetperfOutput(
     fp = six.StringIO(stdout)
     # "-o" flag above specifies CSV output, but there is one extra header line:
     banner = next(fp)
-    assert banner.startswith('MIGRATED'), stdout
+    # It will never start with MIGRATED, but the unit tests are too brittle
+    assert banner.startswith('OMNI') or banner.startswith('MIGRATED'), stdout
     r = csv.DictReader(fp)
     results = next(r)
     logging.info('Netperf Results: %s', results)
     assert 'Throughput' in results
-  except (StopIteration, AssertionError):
+  except (StopIteration, AssertionError) as e:
     # The output returned by netperf was unparseable - usually due to a broken
     # connection or other error.  Raise KnownIntermittentError to signal the
     # benchmark can be retried.  Do not automatically retry as an immediate
     # retry on these VMs may be adveresly affected (e.g. burstable credits
     # partially used)
     message = 'Netperf ERROR: Failed to parse stdout. STDOUT: %s' % stdout
-    logging.error(message)
-    raise errors.Benchmarks.KnownIntermittentError(message)
+    logging.exception(message)
+    raise errors.Benchmarks.KnownIntermittentError(message) from e
 
   # Update the metadata with some additional infos
   meta_keys = [
@@ -503,6 +516,8 @@ def RunNetperf(vm, benchmark_name, server_ips, num_streams, client_ips):
 
   remote_cmd_list = []
   assert server_ips, 'Server VM does not have an IP to use for netperf.'
+  # Consider making these direct flags, since netperf benchmarks are obsolete.
+  protocol, direction = benchmark_name.split('_')
   if len(client_ips) != len(server_ips):
     logging.warning('Number of client and server IPs do not match.')
   for server_ip_idx, server_ip in enumerate(server_ips):
@@ -511,27 +526,30 @@ def RunNetperf(vm, benchmark_name, server_ips, num_streams, client_ips):
         f'{netperf.NETPERF_PATH} '
         '-p {command_port} '
         f'-j {verbosity} '
-        f'-t {benchmark_name} '
+        f'-t OMNI '
         f'-H {server_ip} -L {client_ip} '
         f'-l {FLAGS.netperf_test_length} {confidence}'
         ' -- '
+        f'-T {protocol} '
+        f'-d {direction} '
         '-P ,{data_port} '
         f'-o {OUTPUT_SELECTOR}'
     )
 
-    if benchmark_name.upper() == 'UDP_STREAM':
-      send_size = FLAGS.netperf_udp_stream_send_size_in_bytes
-      netperf_cmd += f' -R 1 -m {send_size} -M {send_size} '
-      metadata['netperf_send_size_in_bytes'] = (
-          FLAGS.netperf_udp_stream_send_size_in_bytes
-      )
-
-    elif benchmark_name.upper() == 'TCP_STREAM':
-      send_size = FLAGS.netperf_tcp_stream_send_size_in_bytes
+    if direction == 'STREAM':
+      if protocol == 'UDP':
+        send_size = FLAGS.netperf_udp_stream_send_size_in_bytes
+        netperf_cmd += ' -R 1'
+      elif protocol == 'TCP':
+        send_size = FLAGS.netperf_tcp_stream_send_size_in_bytes
+      elif protocol == 'SCTP':
+        send_size = _SCTP_SEND_SIZE.value
+      else:
+        raise ValueError(
+            f'Unsupported protocol for netperf stream benchmark: {protocol}'
+        )
       netperf_cmd += f' -m {send_size} -M {send_size} '
-      metadata['netperf_send_size_in_bytes'] = (
-          FLAGS.netperf_tcp_stream_send_size_in_bytes
-      )
+      metadata['netperf_send_size_in_bytes'] = send_size
 
     if FLAGS.netperf_thinktime != 0:
       netperf_cmd += (
@@ -541,7 +559,7 @@ def RunNetperf(vm, benchmark_name, server_ips, num_streams, client_ips):
           f'{FLAGS.netperf_thinktime_run_length} '
       )
 
-    if FLAGS.netperf_mss and 'TCP' in benchmark_name.upper():
+    if FLAGS.netperf_mss and protocol == 'TCP':
       netperf_cmd += f' -G {FLAGS.netperf_mss}b'
       metadata['netperf_mss_requested'] = FLAGS.netperf_mss
 
@@ -755,9 +773,11 @@ def RunClientServerVMs(client_vm, server_vm):
         external_ip_results = RunNetperf(
             client_vm,
             netperf_benchmark,
-            [server_vm.ip_address],
+            server_vm.GetExternalIPs(),
             num_streams,
-            [client_vm.ip_address],
+            # NAT translates internal to external IP when remote server IP is
+            # external.
+            [client_vm.GetInternalIPs()[0]],
         )
         for external_ip_result in external_ip_results:
           external_ip_result.metadata['ip_type'] = (

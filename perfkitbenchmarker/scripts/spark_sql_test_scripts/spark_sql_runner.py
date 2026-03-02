@@ -39,6 +39,7 @@ def parse_args(args=None):
   """Parse argv."""
 
   parser = argparse.ArgumentParser(description=__doc__)
+  parser.add_argument('--run-uri', help='Run ID to name the application after.')
   parser.add_argument(
       '--sql-queries',
       action='append',
@@ -134,33 +135,81 @@ def parse_args(args=None):
           'purposes.'
       ),
   )
+  parser.add_argument(
+      '--catalog',
+      help='Spark catalog to look for data in.',
+  )
   if args is None:
     return parser.parse_args()
   return parser.parse_args(args)
 
 
-def _load_file(spark, object_path):
-  """Load an HCFS file into a string."""
-  return '\n'.join(spark.sparkContext.textFile(object_path).collect())
-
-
-def get_results_logger(spark_context):
+def get_results_logger(spark_session):
   """Gets results logger.
 
   Injected into main fn to be replaceable by wrappers.
 
   Args:
-    spark_context: Spark API context.
+    spark_session: Spark Session object.
 
   Returns:
     A python logger object.
   """
-  del spark_context
+  del spark_session
   return _results_logger
 
 
+def _has_spark_context(spark):
+  """Detects if spark session has sparkContext.
+
+  Newer Spark environments might use Spark Connect, which errors out when trying
+  to access sparkContext.
+
+  Args:
+    spark: The spark session.
+
+  Returns:
+    Whether sparkContext can be accessed from spark version.
+  """
+  try:
+    spark.sparkContext
+  except AttributeError:
+    return False
+  return True
+
+
+def get_query_annotator_fn(spark):
+  """Gets query annotator function appropriate for the env for debugging."""
+  if _has_spark_context(spark):
+    return set_job_description
+  return set_tag
+
+
+def set_job_description(spark, description):
+  """Sets spark context job description for debugging in Spark UI."""
+  spark.sparkContext.setJobDescription(description)
+
+
+def set_tag(spark, tag):
+  """Set operation tag for debugging in Spark UI.
+
+  Requires spark connect or Spark version >=4.0.0.
+
+  Args:
+    spark: The spark session.
+    tag: str. The tag to set.
+  """
+  spark.clearTags()
+  spark.addTag(tag)
+
+
 def main(args, results_logger_getter=get_results_logger):
-  builder = sql.SparkSession.builder.appName('Spark SQL Query')
+  app_name = (
+      f'spark_sql_runner_{args.run_uri}'
+      if args.run_uri
+      else 'spark_sql_runner'
+  )
+  builder = sql.SparkSession.builder.appName(app_name)
   if args.enable_hive:
     builder = builder.enableHiveSupport()
   query_streams = args.sql_queries
@@ -168,6 +217,11 @@ def main(args, results_logger_getter=get_results_logger):
     # this guarantees all query streams will use more or less the same resources
     builder = builder.config('spark.scheduler.mode', 'FAIR')
   spark = builder.getOrCreate()
+  # Queries supplied to this script by default are not ANSI-compliant, so we are
+  # disabling ANSI SQL explictly, since new Spark versions default to it.
+  spark.conf.set('spark.sql.ansi.enabled', 'false')
+  if args.catalog:
+    spark.catalog.setCurrentCatalog(args.catalog)
   if args.database:
     spark.catalog.setCurrentDatabase(args.database)
   for name, (fmt, options) in get_table_metadata(args).items():
@@ -186,8 +240,7 @@ def main(args, results_logger_getter=get_results_logger):
         'Dumping the spark conf properties to %s', args.dump_spark_conf
     )
     props = [
-        sql.Row(key=key, val=val)
-        for key, val in spark.sparkContext.getConf().getAll()
+        sql.Row(key=key, val=val) for key, val in spark.conf.getAll().items()
     ]
     spark.createDataFrame(props).coalesce(1).write.mode('append').json(
         args.dump_spark_conf
@@ -212,7 +265,7 @@ def main(args, results_logger_getter=get_results_logger):
         json.dumps(results),
         '----@spark_sql_runner:results_end@----',
     ])
-    results_logger = results_logger_getter(spark.sparkContext)
+    results_logger = results_logger_getter(spark)
     results_logger.info(dumped_results)
   else:
     logging.info('Writing results to %s', args.report_dir)
@@ -251,12 +304,14 @@ def run_sql_query(
 ):
   """Runs a SQL query stream, returns list[dict] with durations."""
 
+  annotate_query = get_query_annotator_fn(spark_session)
   results = []
   for query_id in query_stream:
     query = QUERIES[query_id]
 
     try:
       logging.info('Running query %s', query_id)
+      annotate_query(spark_session, f'q{query_id}')
       start = time.time()
       df = spark_session.sql(query)
       df.collect()

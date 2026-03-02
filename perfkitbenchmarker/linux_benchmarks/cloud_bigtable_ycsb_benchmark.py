@@ -26,8 +26,8 @@ import datetime
 import json
 import logging
 import os
-import pipes
 import posixpath
+import shlex
 import subprocess
 from typing import Any, Dict, List
 from absl import flags
@@ -81,13 +81,14 @@ _MONITORING_ADDRESS = flags.DEFINE_string(
 _USE_JAVA_VENEER_CLIENT = flags.DEFINE_boolean(
     'google_bigtable_use_java_veneer_client',
     False,
-    'If true, will use the googlebigtableclient with ycsb.',
+    'If true, will use the googlebigtable binding with ycsb rather than the '
+    'hbase* bindings using an HBase adapter client.',
 )
 # Temporary until old driver is deprecated.
 _USE_UPGRADED_DRIVER = flags.DEFINE_boolean(
     'google_bigtable_use_upgraded_driver',
     False,
-    'If true, will use the googlebigtableclient2 with ycsb. Requires'
+    'If true, will use the googlebigtable2 binding with ycsb. Requires'
     ' --google_bigtable_use_java_veneer_client to be true.',
 )
 _ENABLE_DIRECT_PATH = flags.DEFINE_boolean(
@@ -99,18 +100,18 @@ _ENABLE_TRAFFIC_DIRECTOR = flags.DEFINE_boolean(
     'google_bigtable_enable_traffic_director',
     False,
     'If true, will use the googlebigtable'
-    'client with ycsb to enable traffic through traffic director.',
+    'binding with ycsb to enable traffic through traffic director.',
 )
 _ENABLE_RLS_ROUTING = flags.DEFINE_boolean(
     'google_bigtable_enable_rls_routing',
     False,
-    'If true, will use the googlebigtableclient with ycsb to enable traffic'
+    'If true, will use the googlebigtable binding with ycsb to enable traffic'
     'through RLS with direct path',
 )
 _ENABLE_EXPERIMENTAL_LB_POLICY = flags.DEFINE_boolean(
     'google_bigtable_enable_experimental_lb_policy',
     False,
-    'If true, will use the googlebigtableclient with ycsb to enable beta LB'
+    'If true, will use the googlebigtable binding with ycsb to enable beta LB'
     'policy.',
 )
 _CHANNEL_COUNT = flags.DEFINE_integer(
@@ -118,7 +119,8 @@ _CHANNEL_COUNT = flags.DEFINE_integer(
     None,
     (
         'If specified, will use this many channels (i.e. connections) for '
-        'Bigtable RPCs instead of the default number.'
+        'Bigtable RPCs instead of the default number. Note: has no effect on '
+        'the googlebigtable binding.'
     ),
 )
 
@@ -134,14 +136,12 @@ cloud_bigtable_ycsb:
   vm_groups:
     default:
       os_type: ubuntu2204  # Python 2
-      vm_spec: *default_single_core
+      vm_spec: *default_dual_core
       vm_count: null
   flags:
     openjdk_version: 8
-    gcloud_scopes: >
-      https://www.googleapis.com/auth/monitoring.write
-      https://www.googleapis.com/auth/bigtable.admin
-      https://www.googleapis.com/auth/bigtable.data"""
+    gcloud_scopes: cloud-platform
+"""
 
 METRICS_CORE_JAR = 'metrics-core-3.1.2.jar'
 DROPWIZARD_METRICS_CORE_URL = posixpath.join(
@@ -151,12 +151,6 @@ DROPWIZARD_METRICS_CORE_URL = posixpath.join(
 )
 HBASE_SITE = 'cloudbigtable/hbase-site.xml.j2'
 HBASE_CONF_FILES = [HBASE_SITE]
-
-REQUIRED_SCOPES = (
-    'https://www.googleapis.com/auth/monitoring.write',
-    'https://www.googleapis.com/auth/bigtable.admin',
-    'https://www.googleapis.com/auth/bigtable.data',
-)
 
 # TODO(user): Make table parameters configurable.
 COLUMN_FAMILY = 'cf'
@@ -196,16 +190,6 @@ def CheckPrerequisites(benchmark_config: Dict[str, Any]) -> None:
     hbase.CheckPrerequisites()
 
   ycsb.CheckPrerequisites()
-
-  for scope in REQUIRED_SCOPES:
-    if scope not in FLAGS.gcloud_scopes:
-      if (
-          scope == 'https://www.googleapis.com/auth/monitoring.write'
-          and not _USE_JAVA_VENEER_CLIENT.value
-      ):
-        # Client side metrics are only required with the Veneer client.
-        continue
-      raise ValueError('Scope {} required.'.format(scope))
 
   if ycsb.CPU_OPTIMIZATION.value and (
       ycsb.CPU_OPTIMIZATION_MEASUREMENT_MINS.value
@@ -419,7 +403,7 @@ def _GetYcsbExecutor(
 ) -> ycsb.YCSBExecutor:
   """Gets the YCSB executor class for loading and running the benchmark."""
   ycsb_memory = min(vms[0].total_memory_kb // 1024, 4096)
-  jvm_args = pipes.quote(f' -Xmx{ycsb_memory}m')
+  jvm_args = shlex.quote(f' -Xmx{ycsb_memory}m')
   env = {}
   if _ENABLE_DIRECT_PATH.value:
     env['CBT_ENABLE_DIRECTPATH'] = str(_ENABLE_DIRECT_PATH.value)
@@ -524,6 +508,8 @@ def _CommonArgs(instance: _Bigtable) -> Dict[str, str]:
           gcp_bigtable.ENDPOINT.value + ':443'
       )
       kwargs.pop('columnfamily')
+      if _CHANNEL_COUNT.value:
+        kwargs['googlebigtable2.channel-pool-size'] = str(_CHANNEL_COUNT.value)
     else:
       kwargs['google.bigtable.instance.id'] = instance.name
       kwargs['google.bigtable.app_profile.id'] = (

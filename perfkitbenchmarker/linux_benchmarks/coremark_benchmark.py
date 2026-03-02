@@ -37,7 +37,7 @@ coremark:
   description: Run Coremark a simple processor benchmark
   vm_groups:
     default:
-      vm_spec: *default_single_core
+      vm_spec: *default_dual_core
 """
 
 COREMARK_DIR = posixpath.join(linux_packages.INSTALL_DIR, 'coremark-1.01')

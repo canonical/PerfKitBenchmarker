@@ -54,6 +54,7 @@ disk_to_hdfs_map = {
     'pd-standard': 'HDD',
     'pd-balanced': 'SSD (Balanced)',
     'pd-ssd': 'SSD',
+    'hyperdisk-balanced': 'Hyperdisk (Balanced)',
 }
 serverless_disk_to_hdfs_map = {
     'standard': 'HDD',
@@ -87,10 +88,13 @@ class GcpDpbBaseDataproc(dpb_service.BaseDpbService):
     self.region = self.dpb_service_zone.rsplit('-', 1)[0]
     self.storage_service = gcs.GoogleCloudStorageService()
     self.storage_service.PrepareService(location=self.region)
-    self.persistent_fs_prefix = 'gs://'
     self._cluster_create_time: float | None = None
     self._cluster_ready_time: float | None = None
     self._cluster_delete_time: float | None = None
+
+  @property
+  def persistent_fs_prefix(self) -> str | None:
+    return 'gs://'
 
   def GetDpbVersion(self) -> str | None:
     return FLAGS.dpb_dataproc_image_version or super().GetDpbVersion()
@@ -167,10 +171,13 @@ class GcpDpbDataproc(GcpDpbBaseDataproc):
   SERVICE_TYPE = 'dataproc'
   SUPPORTS_NO_DYNALLOC = True
 
-  def __init__(self, dpb_service_spec):
-    super().__init__(dpb_service_spec)
-    if self.user_managed and not FLAGS.dpb_service_bucket:
-      self.bucket = self._GetCluster()['config']['tempBucket']
+  def _InitializeMetadata(self) -> None:
+    super()._InitializeMetadata()
+    self.metadata['dataproc_tier'] = gcp_flags.GCP_DATAPROC_TIER.value
+    self.metadata['dataproc_engine'] = gcp_flags.GCP_DATAPROC_ENGINE.value
+    self.metadata['dataproc_lightning_engine_runtime'] = (
+        gcp_flags.GCP_DATAPROC_LIGHTNING_ENGINE_RUNTIME.value
+    )
 
   def GetClusterCreateTime(self) -> float | None:
     """Returns the cluster creation time.
@@ -260,6 +267,8 @@ class GcpDpbDataproc(GcpDpbBaseDataproc):
     if FLAGS.dpb_initialization_actions:
       cmd.flags['initialization-actions'] = FLAGS.dpb_initialization_actions
 
+    cmd.flags['tier'] = gcp_flags.GCP_DATAPROC_TIER.value
+
     # Ideally DpbServiceSpec would have a network spec, which we would create to
     # Resolve the name, but because EMR provisions its own VPC and we are
     # generally happy using pre-existing networks for Dataproc. Just use the
@@ -267,11 +276,18 @@ class GcpDpbDataproc(GcpDpbBaseDataproc):
     if FLAGS.gce_network_name:
       cmd.flags['network'] = FLAGS.gce_network_name[0]
 
+    if gcp_flags.GCE_VM_SERVICE_ACCOUNT.value:
+      cmd.flags['service-account'] = gcp_flags.GCE_VM_SERVICE_ACCOUNT.value
+
     metadata = util.GetDefaultTags()
     metadata.update(flag_util.ParseKeyValuePairs(FLAGS.gcp_instance_metadata))
-    if gcp_flags.SPARK_BIGQUERY_CONNECTOR.value:
+    if gcp_flags.SPARK_BIGQUERY_CONNECTOR_URL.value:
       metadata['SPARK_BQ_CONNECTOR_URL'] = (
-          gcp_flags.SPARK_BIGQUERY_CONNECTOR.value
+          gcp_flags.SPARK_BIGQUERY_CONNECTOR_URL.value
+      )
+    if gcp_flags.SPARK_BIGQUERY_CONNECTOR_VERSION.value:
+      metadata['SPARK_BQ_CONNECTOR_VERSION'] = (
+          gcp_flags.SPARK_BIGQUERY_CONNECTOR_VERSION.value
       )
     cmd.flags['metadata'] = util.FormatTags(metadata)
     cmd.flags['labels'] = util.MakeFormattedDefaultTags()
@@ -370,7 +386,7 @@ class GcpDpbDataproc(GcpDpbBaseDataproc):
     cmd.flags['cluster'] = self.cluster_id
     cmd.flags['labels'] = util.MakeFormattedDefaultTags()
 
-    job_jars = job_jars or []
+    job_jars = (job_jars or []) + dpb_service.DPB_EXTRA_JARS.value
     if classname:
       if jarfile:
         # Dataproc does not support both a main class and a main jar so just
@@ -431,6 +447,15 @@ class GcpDpbDataproc(GcpDpbBaseDataproc):
         pending_time=(start_time - pending_time).total_seconds(),
     )
 
+  def GetJobProperties(self) -> Dict[str, str]:
+    """Returns a dict of job properties."""
+    properties = super().GetJobProperties()
+    properties['spark.dataproc.engine'] = gcp_flags.GCP_DATAPROC_ENGINE.value
+    properties['spark.dataproc.lightningEngine.runtime'] = (
+        gcp_flags.GCP_DATAPROC_LIGHTNING_ENGINE_RUNTIME.value
+    )
+    return properties
+
   def _AddToCmd(self, cmd, cmd_property, cmd_value):
     flag_name = cmd_property
     cmd.flags[flag_name] = cmd_value
@@ -490,8 +515,6 @@ class GcpDpbDpgke(GcpDpbDataproc):
     # spec parameters containing '='
     cmd.flags['pools'] = self.spec.gke_cluster_nodepools.replace(':', '=')
     cmd.flags['gke-cluster-location'] = self.spec.gke_cluster_location
-    if FLAGS.dpb_service_bucket:
-      cmd.flags['staging-bucket'] = FLAGS.dpb_service_bucket
     if self.project is not None:
       cmd.flags['project'] = self.project
     cmd.flags['image-version'] = self.spec.version
@@ -599,6 +622,8 @@ class GcpDpbDataprocServerless(
     if FLAGS.gcp_dataproc_image:
       cmd.flags['container-image'] = FLAGS.gcp_dataproc_image
 
+    cmd.flags['ttl'] = f't{FLAGS.timeout_minutes}m'
+
     all_properties = self.GetJobProperties()
     all_properties.update(properties or {})
     if all_properties:
@@ -703,6 +728,23 @@ class GcpDpbDataprocServerless(
       )
     if self.spec.dataproc_serverless_runtime_engine == 'native':
       result['spark.dataproc.runtimeEngine'] = 'native'
+    if (
+        self.spec.dataproc_serverless_engine
+        == dpb_constants.DATAPROC_LIGHTNING_ENGINE
+    ):
+      result['dataproc.tier'] = 'premium'
+      result['spark.dataproc.engine'] = dpb_constants.DATAPROC_LIGHTNING_ENGINE
+      result['spark.dataproc.lightningEngine.runtime'] = (
+          self.spec.dataproc_serverless_lightning_engine_runtime
+      )
+    if gcp_flags.SPARK_BIGQUERY_CONNECTOR_URL.value:
+      result['dataproc.sparkBqConnector.uri'] = (
+          gcp_flags.SPARK_BIGQUERY_CONNECTOR_URL.value
+      )
+    if gcp_flags.SPARK_BIGQUERY_CONNECTOR_VERSION.value:
+      result['dataproc.sparkBqConnector.version'] = (
+          gcp_flags.SPARK_BIGQUERY_CONNECTOR_VERSION.value
+      )
     result.update(super().GetJobProperties())
     return result
 
@@ -731,11 +773,13 @@ class GcpDpbDataprocServerless(
         or 'default'
     )
 
+    basic_data = self.metadata
+
     self.metadata = {
-        'dpb_service': self.metadata['dpb_service'],
-        'dpb_version': self.metadata['dpb_version'],
-        'dpb_service_version': self.metadata['dpb_service_version'],
-        'dpb_batch_id': self.metadata['dpb_cluster_id'],
+        'dpb_service': basic_data['dpb_service'],
+        'dpb_version': basic_data['dpb_version'],
+        'dpb_service_version': basic_data['dpb_service_version'],
+        'dpb_batch_id': basic_data['dpb_cluster_id'],
         'dpb_cluster_shape': cluster_shape,
         'dpb_cluster_size': cluster_size,
         'dpb_cluster_min_executors': min_executors,
@@ -751,12 +795,21 @@ class GcpDpbDataprocServerless(
         'dpb_off_heap_memory_per_node': (
             self.spec.dataproc_serverless_off_heap_memory or 'default'
         ),
-        'dpb_hdfs_type': self.metadata['dpb_hdfs_type'],
-        'dpb_disk_size': self.metadata['dpb_disk_size'],
-        'dpb_service_zone': self.metadata['dpb_service_zone'],
-        'dpb_job_properties': self.metadata['dpb_job_properties'],
+        'dpb_hdfs_type': basic_data['dpb_hdfs_type'],
+        'dpb_disk_size': basic_data['dpb_disk_size'],
+        'dpb_service_zone': basic_data['dpb_service_zone'],
+        'dpb_job_properties': basic_data['dpb_job_properties'],
         'dpb_runtime_engine': self.spec.dataproc_serverless_runtime_engine,
-    }
+    } | self._GetRunStorageLocationMetadata()
+
+    if (
+        self.spec.dataproc_serverless_engine
+        == dpb_constants.DATAPROC_LIGHTNING_ENGINE
+    ):
+      self.metadata['dpb_runtime_engine'] = self.spec.dataproc_serverless_engine
+      self.metadata['dataproc_lightning_engine_runtime'] = (
+          self.spec.dataproc_serverless_lightning_engine_runtime
+      )
 
   def CalculateLastJobCosts(self) -> dpb_service.JobCosts:
     fetch_batch_cmd = self.DataprocGcloudCommand(
@@ -764,7 +817,7 @@ class GcpDpbDataprocServerless(
     )
 
     @vm_util.Retry(
-        timeout=180,
+        timeout=15 * 60,
         poll_interval=15,
         fuzz=0,
         retryable_exceptions=(MetricNotReadyError,),

@@ -6,11 +6,9 @@ import time
 from typing import Any, Dict, List, Type, TypeVar
 
 from absl import flags
-from perfkitbenchmarker import errors
 from perfkitbenchmarker import resource
 from perfkitbenchmarker import sample
 from perfkitbenchmarker import virtual_machine
-from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.configs import option_decoders
 from perfkitbenchmarker.configs import spec
 from perfkitbenchmarker.linux_packages import http_poller
@@ -22,7 +20,10 @@ flags.DEFINE_string(
     'appservice_region', None, 'Region of deployed app service.'
 )
 flags.DEFINE_string(
-    'appservice_backend', None, 'Backend instance type of app service uses.'
+    'appservice_backend', None, 'Backend memory of app service uses.'
+)
+flags.DEFINE_string(
+    'appservice_cpu', None, 'Backend cpu of app service uses.'
 )
 flags.DEFINE_string(
     'app_runtime',
@@ -62,6 +63,8 @@ class BaseAppServiceSpec(spec.BaseSpec):
     SPEC_ATTRS: Required field(s) for subclasses.
     appservice_region: The region to run in.
     appservice_backend: Amount of memory to use.
+    appservice_cpu: Amount of CPU to use. Optional / backend memory takes
+      precedence.
     appservice: Name of the service (e.g. googlecloudfunction).
   """
 
@@ -69,6 +72,7 @@ class BaseAppServiceSpec(spec.BaseSpec):
   SPEC_ATTRS: List[str] = ['SERVICE']
   appservice_region: str
   appservice_backend: str
+  appservice_cpu: str | None
   appservice: str
 
   @classmethod
@@ -82,6 +86,8 @@ class BaseAppServiceSpec(spec.BaseSpec):
       config_values['appservice_region'] = flag_values.appservice_region
     if flag_values['appservice_backend'].present:
       config_values['appservice_backend'] = flag_values.appservice_backend
+    if flag_values['appservice_cpu'].present:
+      config_values['appservice_cpu'] = flag_values.appservice_cpu
     if flag_values['appservice'].present:
       config_values['appservice'] = flag_values.appservice
 
@@ -94,6 +100,10 @@ class BaseAppServiceSpec(spec.BaseSpec):
             {'default': None, 'none_ok': True},
         ),
         'appservice_backend': (
+            option_decoders.StringDecoder,
+            {'default': None, 'none_ok': True},
+        ),
+        'appservice_cpu': (
             option_decoders.StringDecoder,
             {'default': None, 'none_ok': True},
         ),
@@ -149,6 +159,7 @@ class BaseAppService(resource.BaseResource):
     self.name: str = self._GenerateName()
     self.region: str = base_app_service_spec.appservice_region
     self.backend: str = base_app_service_spec.appservice_backend
+    self.cpu: str | None = base_app_service_spec.appservice_cpu
     self.builder: Any = None
     self.endpoint: str | None = None
     self.poller: http_poller.HttpPoller = http_poller.HttpPoller()
@@ -190,16 +201,6 @@ class BaseAppService(resource.BaseResource):
   def Update(self):
     """Updates a deployed app instance."""
 
-    @vm_util.Retry(
-        poll_interval=self._POLL_INTERVAL,
-        fuzz=0,
-        timeout=self.READY_TIMEOUT,
-        retryable_exceptions=(errors.Resource.RetryableCreationError,),
-    )
-    def WaitUntilReady():
-      if not self._IsReady():
-        raise errors.Resource.RetryableCreationError('Not yet ready')
-
     if self.user_managed:
       return
     self._UpdateDependencies()
@@ -211,7 +212,7 @@ class BaseAppService(resource.BaseResource):
         'Ending the update timer with %.5fs elapsed. Ready still going.',
         self.update_end_time - self.update_start_time,
     )
-    WaitUntilReady()
+    self._WaitUntilReady()
     self.update_ready_time = time.time()
     self.samples.append(
         sample.Sample(
@@ -243,11 +244,23 @@ class BaseAppService(resource.BaseResource):
       An object containing success, response string, & latency. Latency is
       also negative in the case of a failure.
     """
-    return self.poller.Run(
-        self.vm,
-        self.endpoint,
-        retries=retries,
-        expected_response=self.builder.GetExpectedResponse(),
+    cmd = self.builder.InvokeCommand(self.endpoint)
+    if not cmd:
+      return self.poller.Run(
+          self.vm,
+          self.endpoint,
+          retries=retries,
+          expected_response=self.builder.GetExpectedResponse(),
+      )
+    start_time = time.time()
+    out, err = self.vm.RemoteCommand(cmd, ignore_failure=True)
+    # Assert error is empty & out is not.
+    success = (not bool(err)) and bool(out) and ('timeout' not in out)
+    end_time = time.time()
+    return http_poller.PollingResponse(
+        success=success,
+        response=out,
+        latency=end_time - start_time,
     )
 
   def _IsReady(self) -> bool:
@@ -266,7 +279,7 @@ class BaseAppService(resource.BaseResource):
         response.success,
         response.latency,
     )
-    return response.latency > 0
+    return response.latency > 0 and response.success
 
   def _CreateDependencies(self):
     """Creates dependencies needed before _CreateResource() is called."""
@@ -293,6 +306,12 @@ class BaseAppService(resource.BaseResource):
     for s in self.samples:
       s.metadata.update(self.metadata)
     return self.samples
+
+  def IsAppLongRunning(self) -> bool:
+    """Returns true if the app is long running."""
+    if not self.builder:
+      return False
+    return self.builder.IsAppLongRunning()
 
   def _PostCreate(self):
     """Method called after _CreateResource."""

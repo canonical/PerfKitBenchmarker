@@ -60,7 +60,6 @@ DEFAULT_INSTALL_URL = (
     'https://download.aerospike.com/artifacts/aerospike-server-{}/{}/aerospike-server-{}-{}-{}'
 )
 
-
 # Link could be found here
 # https://aerospike.com/download/#servers
 

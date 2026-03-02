@@ -16,12 +16,15 @@
 Classes to wrap specific backend services are in the corresponding provider
 directory as a subclass of BaseEdwService.
 """
-import logging
+
+import datetime
 import os
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List
 
 from absl import flags
+from absl import logging
 from perfkitbenchmarker import resource
+from perfkitbenchmarker.resources.container_service import kubernetes_cluster
 
 flags.DEFINE_integer(
     'edw_service_cluster_concurrency',
@@ -73,6 +76,17 @@ flags.DEFINE_string(
     'Named Snowflake connection defined in SnowSQL config file.'
     'https://docs.snowflake.net/manuals/user-guide/snowsql-start.html#using-named-connections',
 )  # pylint: disable=line-too-long
+TRINO_CATALOG = flags.DEFINE_string(
+    'trino_catalog', 'dpms', 'Catalog for Trino.'
+)
+TRINO_SCHEMA = flags.DEFINE_string(
+    'trino_schema', 'imt_tpcds_10t', 'Trino schema to use.'
+)
+TRINO_MEMORY = flags.DEFINE_integer(
+    'trino_worker_memory',
+    200,
+    'Amount of memory in GiB used by each Trino worker.',
+)
 flags.DEFINE_integer(
     'edw_suite_iterations', 1, 'Number of suite iterations to perform.'
 )
@@ -102,6 +116,12 @@ flags.DEFINE_multi_string(
     'stream should be passed in separately and the queries should be comma '
     'separated, e.g. --concurrency_streams=1,2,3 --concurrency_streams=3,2,1',
 )
+flags.DEFINE_boolean(
+    'edw_warmup_tolerate_failure',
+    False,
+    'If set, the benchmark will tolerate query failures during the warmup '
+    'phase. Mostly useful for testing.',
+)
 flags.DEFINE_string(
     'snowflake_warehouse',
     None,
@@ -119,11 +139,33 @@ flags.DEFINE_string(
     None,
     'The schema of the hosted snowflake database to use during the benchmark.',
 )
+flags.DEFINE_string(
+    'snowflake_account',
+    None,
+    'The Snowflake account to use during the benchmark. Must follow the format'
+    ' "<org_id>-<account_name>".',
+)
+flags.DEFINE_string(
+    'snowflake_user',
+    None,
+    'The Snowflake user to use during the benchmark.',
+)
 flags.DEFINE_enum(
     'snowflake_client_interface',
     'JDBC',
-    ['JDBC'],
+    ['JDBC', 'PYTHON'],
     'The Runtime Interface used when interacting with Snowflake.',
+)
+flags.DEFINE_string(
+    'snowflake_jdbc_client_jar',
+    None,
+    'Local location of the snowflake_jdbc_client_jar.',
+)
+flags.DEFINE_string(
+    'snowflake_jdbc_key_file',
+    None,
+    'Local location of the Private key file for Snowflake authentication. '
+    'Must be named snowflake_keyfile.p8',
 )
 flags.DEFINE_boolean(
     'edw_get_service_auxiliary_metrics',
@@ -142,13 +184,42 @@ flags.DEFINE_enum(
     'Only supported for Python client.',
 )
 
+# MARK: index flags
+# Flags for EDW search index benchmarks.
+EDW_SEARCH_TABLE_NAME = flags.DEFINE_string(
+    'edw_search_table_name',
+    None,
+    'Table name to use for edw search index benchmarks.',
+)
+EDW_SEARCH_INIT_DATA_LOCATION = flags.DEFINE_string(
+    'edw_search_init_data_location',
+    None,
+    'Cloud directory of bucket to source initialization data '
+    'for EDW search benchmarks.',
+)
+EDW_SEARCH_DATA_LOCATION = flags.DEFINE_string(
+    'edw_search_data_location',
+    None,
+    'Cloud directory of bucket to source ongoing load data '
+    'for EDW search benchmarks (without rare token).',
+)
+EDW_SEARCH_INDEX_NAME = flags.DEFINE_string(
+    'edw_search_index_name',
+    None,
+    'Name of index for edw search index benchmarks',
+)
+
 
 FLAGS = flags.FLAGS
+
+EDW_PYTHON_DRIVER_LIB_FILE = 'edw_python_driver_lib.py'
+EDW_PYTHON_DRIVER_LIB_DIR = 'edw/common/clients/python'
 
 TYPE_2_PROVIDER = dict([
     ('athena', 'aws'),
     ('redshift', 'aws'),
     ('spectrum', 'aws'),
+    ('trino', 'gcp'),
     ('snowflake_aws', 'aws'),
     ('snowflake_azure', 'azure'),
     ('snowflakeexternal_aws', 'aws'),
@@ -165,6 +236,7 @@ TYPE_2_MODULE = dict([
     ('athena', 'perfkitbenchmarker.providers.aws.athena'),
     ('redshift', 'perfkitbenchmarker.providers.aws.redshift'),
     ('spectrum', 'perfkitbenchmarker.providers.aws.spectrum'),
+    ('trino', 'perfkitbenchmarker.providers.gcp.trino'),
     ('snowflake_aws', 'perfkitbenchmarker.providers.aws.snowflake_aws'),
     (
         'snowflake_azure',
@@ -342,29 +414,12 @@ class EdwClientInterface:
     """Returns the client interface metadata."""
     raise NotImplementedError
 
-  def _LogAndStripQueryResults(
-      self, query_results: tuple[float, dict[str, Union[str, dict[Any, Any]]]]
-  ) -> None:
-    """Logs first 100 characters of query output, then removes from metadata.
-
-    Args:
-      query_results: A tuple[float, dict[str, str]] representing the result of a
-        query run via an EDW driver. If a key named 'output' exists in the dict,
-        then the first 100 characters of the associated value are printed, and
-        the key is deleted from the dict.
-    """
-    if 'output' in query_results[1]:
-      logging.info(
-          'query results (first 100 chars): %s',
-          str(query_results[1]['output'])[:100],
-      )
-      del query_results[1]['output']
-
 
 class EdwService(resource.BaseResource):
   """Object representing a EDW Service."""
 
   SERVICE_TYPE = 'abstract'
+  QUERY_SET = 'abstract'
 
   def __init__(self, edw_service_spec):
     """Initialize the edw service object.
@@ -407,6 +462,7 @@ class EdwService(resource.BaseResource):
     # resource workflow management
     self.supports_wait_on_delete = True
     self.client_interface: EdwClientInterface
+    self.container_cluster: kubernetes_cluster.KubernetesCluster | None = None
 
   def GetClientInterface(self) -> EdwClientInterface:
     """Gets the active Client Interface."""
@@ -445,6 +501,7 @@ class EdwService(resource.BaseResource):
         'edw_cluster_identifier': self.cluster_identifier,
         'edw_cluster_node_type': self.node_type,
         'edw_cluster_node_count': self.node_count,
+        'edw_query_set': self.QUERY_SET,
     }
     return basic_data
 
@@ -471,6 +528,12 @@ class EdwService(resource.BaseResource):
 
   def SetDestinationTable(self, dataset: str):
     pass
+
+  def SetContainerCluster(
+      self, container_cluster: kubernetes_cluster.KubernetesCluster
+  ):
+    """Sets the container cluster if one is applicable."""
+    self.container_cluster = container_cluster
 
   def ExtractDataset(
       self, dest_bucket, dataset=None, tables=None, dest_format='CSV'
@@ -565,8 +628,232 @@ class EdwService(resource.BaseResource):
 
     Returns:
       A dictionary of the following format:
-        { 'metric_1': { 'value': 1, 'unit': 'imperial femtoseconds' },
-          'metric_2': { 'value': 2, 'unit': 'metric dollars' }
+        { 'metric_1': { 'value': 1, 'unit': 'imperial femtoseconds'},
+          'metric_2': { 'value': 2, 'unit': 'metric dollars'}
         ...}
     """
+    logging.info(
+        'Per-iteration auxiliary metrics are not supported for this service.'
+    )
+    del iter_run_key
+    return {}
+
+  def GetTimeBoundAuxiliaryMetrics(
+      self, start_timestamp: float, end_timestamp: float
+  ) -> List[Dict[str, Any]]:
+    """Returns service-specific metrics from a set time range.
+
+    Whenever possible, the service should return metrics only from the compute
+    cluster used for the current benchmark run.
+
+    Args:
+      start_timestamp: Start of the time range to retrieve metrics for.
+      end_timestamp: End of the time range to retrieve metrics for.
+
+    Returns:
+      A list of the following format:
+        [{'metric_1': 'value': 1, 'unit': 'imperial nanoseconds', metadata: {}},
+         {'metric_2': 'value': 2, 'unit': 'metric dollars', metadata: {}}
+        ...]
+    """
+    logging.info(
+        'Time-bound auxiliary metrics are not supported for this service.'
+    )
+    del start_timestamp, end_timestamp
+    return []
+
+  def CreateSearchIndex(
+      self, table_path: str, index_name: str
+  ) -> tuple[float, dict[str, Any]]:
+    """Create a search index on a table.
+
+    Create a text search index across all supported columns in a table.
+    Search indexes generally build asynchronously. Expect this to return
+    immediately, and then use GetSearchIndexStatus to monitor indexing
+    progression.
+
+    The `index_name` parameter should be provided, but some services may
+    discard it if they do not support named indexes. In this case, an unnamed
+    index will be created on the given table.
+
+    Metadata returned by this method is arbitrary, and is for the purpose of
+    inclusion in benchmark result metadata. The presence or absence of specific
+    values should not be relied on. Example returned metadata:
+    {'query_results_loaded':True,'results_load_time':0.873234,'rows_returned':1}
+
+    Args:
+      table_path: The name of the table to create the index on.
+      index_name: The name for the new search index.
+
+    Returns:
+      A tuple of execution time in seconds and a dictionary of metadata.
+    """
     raise NotImplementedError
+
+  def DropSearchIndex(
+      self, table_path: str, index_name: str
+  ) -> tuple[float, dict[str, Any]]:
+    """Deletes a search index from a table.
+
+    The `index_name` parameter should be provided, but some services may
+    discard it if they do not support named indexes. In this case, all indexes
+    will be deleted from the given table.
+
+    Metadata returned by this method is arbitrary, and is for the purpose of
+    inclusion in benchmark result metadata. The presence or absence of specific
+    values should not be relied on. Example returned metadata:
+    {'query_results_loaded':True,'results_load_time':0.072512,'rows_returned':1}
+
+    Args:
+      table_path: The name of the table to delete the index from.
+      index_name: The name of the search index to delete.
+
+    Returns:
+      A tuple of execution time in seconds and a dictionary of metadata.
+    """
+    raise NotImplementedError
+
+  def GetSearchIndexCompletionPercentage(
+      self, table_path: str, index_name: str
+  ) -> tuple[int, dict[str, Any]]:
+    """Gets the status of a search index.
+
+    Returns the completion status of a search index on a table, expressed as an
+    integer percentage.
+
+    Metadata returned by this method is arbitrary, and is for the purpose of
+    inclusion in benchmark result metadata. The presence or absence of specific
+    values should not be relied on.
+
+    Args:
+      table_path: The name of the table to get index status from.
+      index_name: The name of the search index.
+
+    Returns:
+      A tuple containing the index coverage percentage (int) and a dictionary
+      of metadata.
+    """
+    raise NotImplementedError
+
+  def InitializeSearchStarterTable(
+      self, table_path: str, storage_path: str
+  ) -> tuple[float, dict[str, Any]]:
+    """Initializes a table for search index benchmarks.
+
+    Creates a table using the standard search index benchmark init template
+    for a given service.
+
+    Metadata returned by this method is arbitrary, and is for the purpose of
+    inclusion in benchmark result metadata. The presence or absence of specific
+    values should not be relied on.
+
+    Args:
+      table_path: The full path or name of the table to initialize.
+      storage_path: The path to the data source for initialization.
+
+    Returns:
+      A tuple of execution time in seconds and a dictionary of metadata.
+    """
+    raise NotImplementedError
+
+  def InsertSearchData(
+      self, table_path: str, storage_path: str
+  ) -> tuple[float, dict[str, Any]]:
+    """Inserts data into a table for search index benchmarks.
+
+    Metadata returned by this method is arbitrary, and is for the purpose of
+    inclusion in benchmark result metadata. The presence or absence of specific
+    values should not be relied on.
+
+    Args:
+      table_path: The full path or name of the table to insert data into.
+      storage_path: The path to the data source to load.
+
+    Returns:
+      A tuple of execution time in seconds and a dictionary of metadata.
+    """
+    raise NotImplementedError
+
+  def GetTableRowCount(self, table_path: str) -> tuple[int, dict[str, Any]]:
+    """Gets the total number of rows in a table.
+
+    Metadata returned by this method is arbitrary, and is for the purpose of
+    inclusion in benchmark result metadata. The presence or absence of specific
+    values should not be relied on.
+
+    Args:
+      table_path: The full path or name of the table.
+
+    Returns:
+      A tuple containing the total row count (int) and a dictionary of metadata.
+    """
+    raise NotImplementedError
+
+  def TextSearchQuery(
+      self,
+      table_path: str,
+      search_keyword: str,
+      order_by: str | None = None,
+      limit: int | None = None,
+      date_between: tuple[datetime.date, datetime.date] | None = None,
+  ) -> tuple[float, dict[str, Any]]:
+    """Executes a text search query against a table.
+
+    Typically used on tables with a search index.
+
+    The metadata returned by implementations of this method should include the
+    following k-v pairs:
+
+    {edw_search_index_coverage_percentage: int|None,
+     edw_search_result_rows: int|None,
+     edw_search_total_row_count: int|None}
+
+    Other arbitrary values may also be returned by the service, and callers
+    should not rely on the presence or absence of specific values beyond
+    those specified above.
+
+    Args:
+      table_path: The full path or name of the table to query.
+      search_keyword: The text to search for within the indexed columns.
+      order_by: The column to order the results by.
+      limit: The maximum number of rows to return.
+      date_between: A tuple of two dates to filter the results by.
+
+    Returns:
+      A tuple of execution time in seconds and a dictionary of metadata.
+    """
+    raise NotImplementedError
+
+  def InjectTokenIntoTable(
+      self, table_path: str, token: str, token_count: int
+  ) -> tuple[float, dict[str, Any]]:
+    """Updates N rows to append a token to a well-known string column.
+
+    Metadata returned by this method is arbitrary, and is for the purpose of
+    inclusion in benchmark result metadata. The presence or absence of specific
+    values should not be relied on.
+
+    Args:
+      table_path: The full path or name of the table to insert data into.
+      token: The token to append to the column.
+      token_count: The number of rows to update.
+
+    Returns:
+      A tuple of execution time in seconds and a dictionary of metadata.
+    """
+    raise NotImplementedError
+
+  @staticmethod
+  def ColsToRows(col_res: dict[str, list[Any]]) -> list[dict[str, Any]]:
+    """Converts a dictionary of columns to a list of rows.
+
+    Args:
+      col_res: A dictionary of columns to convert to a list of rows.
+
+    Returns:
+      A list of dictionaries, where each dictionary represents a row.
+
+      e.g. {'col1': [1, 2, 3], 'col2': [4, 5, 6]} -> [{'col1': 1, 'col2': 4},
+        {'col1': 2, 'col2': 5}, {'col1': 3, 'col2': 6}].
+    """
+    return [dict(zip(col_res.keys(), row)) for row in zip(*col_res.values())]

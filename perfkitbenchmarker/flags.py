@@ -143,6 +143,9 @@ RESTORE_PATH = flags.DEFINE_string(
 FREEZE_PATH = flags.DEFINE_string(
     'freeze', None, 'Path to freeze resources to.'
 )
+COLLECT_LSMEM = flags.DEFINE_bool(
+    'collect_lsmem', False, 'Whether to collect lsmem size.'
+)
 COLLECT_MEMINFO = flags.DEFINE_bool(
     'collect_meminfo', False, 'Whether to collect /proc/meminfo stats.'
 )
@@ -163,7 +166,13 @@ flags.DEFINE_string(
     'static_virtual_machine.py for a description of this file.',
 )
 flags.DEFINE_boolean(
-    'version', False, 'Display the version and exit.', allow_override_cpp=True
+    'version',
+    False,
+    'Display the version and exit.',
+    allow_override_cpp=True,
+    # Race condition with absl.flags.
+    # absl defends against it, but in rare cases it can still happen.
+    allow_override=True,
 )
 flags.DEFINE_boolean('time_commands', False, 'Times each command issued.')
 flags.DEFINE_string(
@@ -486,7 +495,7 @@ flags.DEFINE_bool(
 ALWAYS_CALL_CLEANUP = flags.DEFINE_boolean(
     'always_call_cleanup',
     False,
-    'Indicates that this benchmark run should always run the Cleanup phase.'
+    'Indicates that this benchmark run should always run the Cleanup phase.',
 )
 SKIP_TEARDOWN_CONDITIONS = flags.DEFINE_list(
     'skip_teardown_conditions',
@@ -530,4 +539,12 @@ CAPTURE_VM_LOGS = flags.DEFINE_bool(
     False,
     'Enables capture of VM logs. Currently limited to Linux syslogs, '
     'journalctl, and sos report.',
+)
+GENERATE_VM_CREATE_CMD_INFO_LOG = flags.DEFINE_boolean(
+    'generate_vm_create_cmd_info_log',
+    False,
+    'Whether to generate an info log for the VM create command. This will log '
+    'the full output to the PKB log, but will not save it anywhere else. Add '
+    'the --capture_vm_logs and --vm_log_bucket flags to save the log to a '
+    'bucket.',
 )

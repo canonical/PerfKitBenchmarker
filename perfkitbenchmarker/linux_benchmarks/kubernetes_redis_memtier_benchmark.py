@@ -28,11 +28,11 @@ from absl import flags
 from perfkitbenchmarker import background_tasks
 from perfkitbenchmarker import benchmark_spec
 from perfkitbenchmarker import configs
-from perfkitbenchmarker import kubernetes_helper
 from perfkitbenchmarker import sample
 from perfkitbenchmarker.linux_benchmarks import redis_memtier_benchmark
 from perfkitbenchmarker.linux_packages import memtier
 from perfkitbenchmarker.linux_packages import redis_server
+from perfkitbenchmarker.resources.container_service import kubernetes_commands
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string(
@@ -66,7 +66,7 @@ kubernetes_redis_memtier:
         vm_count: 1
   vm_groups:
     clients:
-      vm_spec: *default_single_core
+      vm_spec: *default_dual_core
       vm_count: 1
 """
 
@@ -91,7 +91,7 @@ def _PrepareCluster(bm_spec: _BenchmarkSpec):
   """Prepares a cluster to run the Redis benchmark."""
   redis_port = redis_server.GetRedisPorts()[0]
   replicas = bm_spec.container_cluster.nodepools['redis'].num_nodes * 2
-  with kubernetes_helper.CreateRenderedManifestFile(
+  with kubernetes_commands.CreateRenderedManifestFile(
       'container/kubernetes_redis_memtier/kubernetes_redis_memtier.yaml.j2',
       {
           'redis_replicas': replicas,
@@ -103,11 +103,11 @@ def _PrepareCluster(bm_spec: _BenchmarkSpec):
           ),
       },
   ) as rendered_manifest:
-    bm_spec.container_cluster.ApplyManifest(rendered_manifest.name)
+    kubernetes_commands.ApplyManifest(rendered_manifest.name)
 
-  bm_spec.container_cluster.WaitForRollout('statefulset/redis')
+  kubernetes_commands.WaitForRollout('statefulset/redis')
 
-  pod_ips = bm_spec.container_cluster.GetPodIps('statefulset/redis')
+  pod_ips = kubernetes_commands.GetPodIps('statefulset/redis')
   ip_and_port_list = list(map(lambda ip: '%s:%s' % (ip, redis_port), pod_ips))
   cmd = [
       'redis-cli',
@@ -117,7 +117,7 @@ def _PrepareCluster(bm_spec: _BenchmarkSpec):
       '1',
       '--cluster-yes',
   ] + ip_and_port_list
-  bm_spec.container_cluster.RunKubectlExec('redis-0', cmd)
+  kubernetes_commands.RunKubectlExec('redis-0', cmd)
 
   bm_spec.redis_endpoint_ip = pod_ips[0]
 

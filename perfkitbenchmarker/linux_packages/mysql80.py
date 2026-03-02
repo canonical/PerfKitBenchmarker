@@ -19,61 +19,55 @@ import logging
 import re
 
 from perfkitbenchmarker import data
+from perfkitbenchmarker import linux_virtual_machine
 from perfkitbenchmarker import os_types
 from perfkitbenchmarker import virtual_machine
+from perfkitbenchmarker import vm_util
 
 
 MYSQL_PSWD = 'perfkitbenchmarker'
 PACKAGE_NAME = 'mysql'
-
-DISABLE_HUGE_PAGES = """
-[Unit]
-Description=Disable Transparent Huge Pages (THP)
-DefaultDependencies=no
-After=sysinit.target local-fs.target
-Before=mysqld.service
-
-[Service]
-Type=oneshot
-ExecStart=/bin/sh -c 'echo never | tee /sys/kernel/mm/transparent_hugepage/enabled > /dev/null'
-
-[Install]
-WantedBy=basic.target
-"""
 
 # OS dependent service defaults.
 MYSQL_SERVICE_NAME = 'MYSQL_SERVICE_NAME'
 MYSQL_CONFIG_PATH = 'MYSQL_CONFIG_PATH'
 MYSQL_LOG_PATH = 'MYSQL_LOG_PATH'
 OS_DEPENDENT_DEFAULTS = {
-    'debian': {
+    os_types.DEBIAN: {
         MYSQL_SERVICE_NAME: 'mysql',
         MYSQL_CONFIG_PATH: '/etc/mysql/mysql.conf.d/mysqld.cnf',
         MYSQL_LOG_PATH: '/var/log/mysql/error.log',
     },
-    'centos': {
+    os_types.RED_HAT: {
         MYSQL_SERVICE_NAME: 'mysqld',
         MYSQL_CONFIG_PATH: '/etc/my.cnf',
         MYSQL_LOG_PATH: '/var/log/mysqld.log',
     },
 }
+MYSQL_DEFAULT_PATH = '/var/lib/mysql'
+
+
+class MysqldFailedToStartError(Exception):
+  """Raised when mysqld fails to start."""
+
+  pass
+
+
+class MysqldFailedToStopError(Exception):
+  """Raised when mysqld fails to stop."""
+
+  pass
 
 
 def YumInstall(vm):
   """Installs the mysql package on the VM."""
-  if vm.OS_TYPE not in os_types.AMAZONLINUX_TYPES:
-    vm.RemoteCommand('sudo dnf config-manager --set-enabled crb')
-    vm.RemoteCommand('sudo dnf install -y epel-release epel-next-release')
-  vm.RemoteCommand(
-      'sudo yum -y install '
-      'https://dev.mysql.com/get/mysql80-community-release-el9-5.noarch.rpm'
-  )
   vm.RemoteCommand('sudo dnf config-manager --enable mysql80-community')
   vm.RemoteCommand('sudo dnf config-manager --enable mysql-tools-community')
-  vm.RemoteCommand(
-      'sudo yum install -y mysql-community-server mysql-community-client luajit'
-      ' libaio screen mysql-community-libs'
+  vm.InstallPackages(
+      'mysql-community-server mysql-community-client luajit  libaio screen '
+      'mysql-community-libs'
   )
+  _StopServiceIfRunning(vm)
 
 
 def AptInstall(vm):
@@ -94,9 +88,13 @@ def AptInstall(vm):
       ' mysql-apt-config_0.8.17-1_all.deb'
   )
 
-  _, stderr = vm.RemoteCommand('sudo apt-get update', ignore_failure=True)
+  _, stderr, code = vm.RemoteCommandWithReturnCode(
+      'sudo apt-get update', ignore_failure=True
+  )
 
-  if stderr:
+  # Sometimes apt prints a warning to stderr but still succeeds. If we try to
+  # fix it, we can break future apt and dpkg commands.
+  if code and stderr:
     if 'public key is not available:' in stderr:
       # This error is due to mysql updated the repository and the public
       # key is not updated.
@@ -122,6 +120,26 @@ def AptInstall(vm):
       f'password {MYSQL_PSWD}" | sudo debconf-set-selections'
   )
   vm.InstallPackages('mysql-server')
+  _StopServiceIfRunning(vm)
+
+
+def _StopServiceIfRunning(vm):
+  """Stop the MySQL systemd service, if one is running."""
+
+  service_name = GetOSDependentDefaults(vm.OS_TYPE)[MYSQL_SERVICE_NAME]
+
+  # If mysql is already running as a systemd service then stop it. But it's okay
+  # if this fails, because mysql might not be running.
+  vm.RemoteCommand(f'sudo systemctl stop {service_name}', ignore_failure=True)
+  vm.RemoteCommand(
+      f'sudo systemctl disable {service_name}', ignore_failure=True
+  )
+  # Make sure mysql is stopped, which is what we really wanted.
+  _, _, code = vm.RemoteCommandWithReturnCode(
+      'pgrep mysqld', ignore_failure=True
+  )
+  if not code:
+    raise MysqldFailedToStopError()
 
 
 def YumGetPathToConfig(vm):
@@ -157,8 +175,10 @@ def ConfigureSystemSettings(vm: virtual_machine.VirtualMachine):
     vm: The VM to configure.
   """
   if vm.OS_TYPE not in os_types.LINUX_OS_TYPES:
+    assert isinstance(vm, linux_virtual_machine.BaseLinuxMixin)
     logging.error(
-        'System settings not configured for unsupported OS: %s', vm.os_info)  # pytype: disable=attribute-error
+        'System settings not configured for unsupported OS: %s', vm.os_info
+    )
     return
   sysctl_append = 'sudo tee -a /etc/sysctl.conf'
   vm.RemoteCommand(f'echo "vm.swappiness=1" | {sysctl_append}')
@@ -166,11 +186,14 @@ def ConfigureSystemSettings(vm: virtual_machine.VirtualMachine):
   vm.RemoteCommand(f'echo "vm.dirty_background_ratio=5" | {sysctl_append}')
   vm.RemoteCommand(f'echo "net.core.somaxconn=65535" | {sysctl_append}')
   vm.RemoteCommand(
-      f'echo "net.core.netdev_max_backlog=65535" | {sysctl_append}')
+      f'echo "net.core.netdev_max_backlog=65535" | {sysctl_append}'
+  )
   vm.RemoteCommand(
-      f'echo "net.ipv4.tcp_max_syn_backlog=65535" | {sysctl_append}')
+      f'echo "net.ipv4.tcp_max_syn_backlog=65535" | {sysctl_append}'
+  )
   vm.RemoteCommand(
-      f'echo "net.ipv4.ip_local_port_range=4000 65000" | {sysctl_append}')
+      f'echo "net.ipv4.ip_local_port_range=4000 65000" | {sysctl_append}'
+  )
   vm.RemoteCommand(f'echo "net.ipv4.tcp_tw_reuse=1" | {sysctl_append}')
   vm.RemoteCommand(f'echo "net.ipv4.tcp_fin_timeout=5" | {sysctl_append}')
   vm.RemoteCommand('sudo sysctl -p')
@@ -178,67 +201,103 @@ def ConfigureSystemSettings(vm: virtual_machine.VirtualMachine):
   limits_append = 'sudo tee -a /etc/security/limits.conf'
   vm.RemoteCommand(f'echo "*     soft    nofile  64000" | {limits_append}')
   vm.RemoteCommand(f'echo "*     hard    nofile  64000" | {limits_append}')
+  vm.RemoteCommand(f'echo "*     soft    memlock unlimited" | {limits_append}')
+  vm.RemoteCommand(f'echo "*     hard    memlock unlimited" | {limits_append}')
 
   auth_append = 'sudo tee -a /etc/pam.d/login'
   vm.RemoteCommand(f'echo "session required pam_limits.so" | {auth_append}')
-
-  thp_append = 'sudo tee -a /usr/lib/systemd/system/disable-thp.service'
-  vm.RemoteCommand('sudo touch /usr/lib/systemd/system/disable-thp.service')
-  vm.RemoteCommand(f'echo "{DISABLE_HUGE_PAGES}" | {thp_append}')
-  vm.RemoteCommand(
-      'sudo chown root:root /usr/lib/systemd/system/disable-thp.service')
-  vm.RemoteCommand(
-      'sudo chmod 0600 /usr/lib/systemd/system/disable-thp.service')
-  vm.RemoteCommand('sudo systemctl daemon-reload')
-  vm.RemoteCommand('sudo systemctl enable disable-thp.service')
-  vm.RemoteCommand('sudo systemctl start disable-thp.service')
 
   vm.Reboot()
 
 
 def GetOSDependentDefaults(os_type: str) -> dict[str, str]:
   """Returns the OS family."""
-  if os_type in os_types.CENTOS_TYPES or os_type in os_types.AMAZONLINUX_TYPES:
-    return OS_DEPENDENT_DEFAULTS['centos']
+  if os_type in os_types.RED_HAT_OS_TYPES:
+    return OS_DEPENDENT_DEFAULTS[os_types.RED_HAT]
+  elif os_type in os_types.DEBIAN_OS_TYPES:
+    return OS_DEPENDENT_DEFAULTS[os_types.DEBIAN]
   else:
-    return OS_DEPENDENT_DEFAULTS['debian']
+    raise ValueError(f'Unsupported OS type: {os_type}')
 
 
-def ConfigureAndRestart(
-    vm: virtual_machine.VirtualMachine, buffer_pool_size: str, server_id: int
+def WriteMysqlConfiguration(
+    vm: virtual_machine.VirtualMachine,
+    buffer_pool_size: str,
+    server_id: int,
+    config_template: str,
 ):
-  """Configure and restart mysql."""
-  config_template = 'mysql/ha.cnf.j2'
+  """Write mysql configuration files."""
   remote_temp_config = '/tmp/my.cnf'
   remote_final_config = GetOSDependentDefaults(vm.OS_TYPE)[MYSQL_CONFIG_PATH]
-  config_d_service = 'mysql/mysqld.service'
-  remote_temp_d_service = '/tmp/mysqld'
-  remote_final_d_service = '/lib/systemd/system/mysqld.service'
   logrotation = 'mysql/logrotation'
   remote_temp_logrotation = '/tmp/logrotation'
   remote_final_logrotation = '/etc/logrotate.d/mysqld'
   remote_final_log_dir = GetOSDependentDefaults(vm.OS_TYPE)[MYSQL_LOG_PATH]
-  service_name = GetOSDependentDefaults(vm.OS_TYPE)[MYSQL_SERVICE_NAME]
   context = {
       'scratch_dir': vm.GetScratchDir(),
       'server_id': str(server_id),
       'buffer_pool_size': buffer_pool_size,
       'log_dir': remote_final_log_dir,
   }
+
   vm.RenderTemplate(
       data.ResourcePath(config_template), remote_temp_config, context
   )
   vm.RemoteCommand(f'sudo cp {remote_temp_config} {remote_final_config}')
-  vm.PushDataFile(config_d_service, remote_temp_d_service)
-  vm.RemoteCommand(f'sudo cp {remote_temp_d_service} {remote_final_d_service}')
   vm.PushDataFile(logrotation, remote_temp_logrotation)
   vm.RemoteCommand(
       f'sudo cp {remote_temp_logrotation} {remote_final_logrotation}'
   )
   vm.RemoteCommand(f'sudo chmod 0644 {remote_final_logrotation}')
-  vm.RemoteCommand('sudo systemctl daemon-reload')
-  vm.RemoteCommand(f'sudo systemctl stop {service_name}')
-  vm.RemoteCommand(f'sudo systemctl start {service_name}')
+
+  # mysqld silently exits if /var/run/mysqld doesn't exist.
+  vm.RemoteCommand('sudo mkdir -p /var/run/mysqld')
+  vm.RemoteCommand('sudo chown mysql:mysql /var/run/mysqld')
+
+
+def ConfigureAndStartServer(
+    vm: virtual_machine.VirtualMachine,
+):
+  """Configure and start mysql."""
+  # The default MySQL systemd unit file sets the open file limit to 100000.
+  # Do the same here.
+  vm.RemoteCommand(
+      'echo "mysql soft nofile 100000" | sudo tee -a /etc/security/limits.conf'
+  )
+  vm.RemoteCommand(
+      'echo "mysql hard nofile 100000" | sudo tee -a /etc/security/limits.conf'
+  )
+
+  # MySQL uses the mysql/ha.cnf.j2 template to set up the MySQL server.
+  # The template uses the scratch directory to store the MySQL data and binary
+  # log files.
+  scratch_dir = vm.GetScratchDir()
+
+  # We do not need to initialize the database if the scratch directory is the
+  # default MySQL installation directory.
+  if scratch_dir != MYSQL_DEFAULT_PATH:
+    vm.RemoteCommand(f'sudo chown mysql:mysql {scratch_dir}')
+    vm.RemoteCommand(
+        f'sudo -u mysql -g mysql mysqld --initialize --datadir={scratch_dir}'
+    )
+
+  # Start the server.
+  vm.RemoteCommand('sudo -g mysql -u mysql nohup mysqld &> /dev/null &')
+
+  log_file_path = GetOSDependentDefaults(vm.OS_TYPE)[MYSQL_LOG_PATH]
+
+  socket_file = f'{scratch_dir}/mysql.sock'
+
+  # mysqld isn't ready until it's written a socket file.
+  @vm_util.Retry(retryable_exceptions=(MysqldFailedToStartError,))
+  def EnsureMysqldStarted():
+    stdout, _ = vm.RemoteCommand(f'sudo file {socket_file}')
+    # Get the log file to see for last server messages.
+    vm.RemoteCommand(f'tail -n 5 {log_file_path}')
+    if 'cannot open' in stdout:
+      raise MysqldFailedToStartError()
+
+  EnsureMysqldStarted()
 
 
 def UpdatePassword(vm: virtual_machine.VirtualMachine, new_password: str):
@@ -283,7 +342,8 @@ def CreateDatabase(
 
 
 def SetupReplica(
-    vm: virtual_machine.VirtualMachine, password: str, master_ip: str):
+    vm: virtual_machine.VirtualMachine, password: str, master_ip: str
+):
   """Setup replica mysql server."""
   tmp_path = '/tmp/setup_repl.sql'
   vm.RenderTemplate(

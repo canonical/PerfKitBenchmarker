@@ -18,8 +18,9 @@ import datetime
 import json
 import logging
 import os
+import random
 import re
-from typing import Any
+from typing import Any, override
 
 from absl import flags
 from perfkitbenchmarker import data
@@ -27,24 +28,33 @@ from perfkitbenchmarker import edw_service
 from perfkitbenchmarker import provider_info
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.linux_packages import google_cloud_sdk
+from perfkitbenchmarker.providers.gcp import flags as gcp_flags
 from perfkitbenchmarker.providers.gcp import util as gcp_util
 
 
 FLAGS = flags.FLAGS
+
+INITIALIZE_SEARCH_TABLE_PARTITIONED = flags.DEFINE_bool(
+    'bq_initialize_search_table_partitioned',
+    True,
+    'Whether to partition the initial search table for text index'
+    ' benchmarking.',
+)
 
 BQ_CLIENT_FILE = 'bq-jdbc-simba-client-1.8-temp-labels.jar'
 BQ_PYTHON_CLIENT_FILE = 'bq_python_driver.py'
 BQ_PYTHON_CLIENT_DIR = 'edw/bigquery/clients/python'
 DEFAULT_TABLE_EXPIRATION = 3600 * 24 * 365  # seconds
 
-BQ_JDBC_INTERFACES = ['SIMBA_JDBC_1_6_2_1003', 'GOOGLE_JDBC']
-BQ_JDBC_CLIENT_FILE = {
-    'SIMBA_JDBC_1_6_2_1003': 'bq-jdbc-client-2.3.jar',
-    'GOOGLE_JDBC': 'bq-google-jdbc-client-1.0.jar',
+BQ_JDBC_INTERFACES = ['SIMBA_JDBC', 'GOOGLE_JDBC']
+BQ_JDBC_CLIENT_FILE = 'bq-jdbc-client.jar'
+BQ_JDBC_FILE = {
+    'SIMBA_JDBC': 'SimbaJDBCDriverforGoogleBigQuery42.zip',
+    'GOOGLE_JDBC': 'google-cloud-bigquery-jdbc-latest-full.jar',
 }
-BQ_JDBC_JAR_FILE = {
-    'SIMBA_JDBC_1_6_2_1003': 'GoogleBigQueryJDBC42_1_6_2.jar',
-    'GOOGLE_JDBC': 'jdbc-jar-with-dependencies-20250129.jar',
+BQ_JDBC_JAVA_FLAGS = {
+    'SIMBA_JDBC': '',
+    'GOOGLE_JDBC': '--add-opens=java.base/java.nio=ALL-UNNAMED',
 }
 
 
@@ -62,7 +72,7 @@ class GenericClientInterface(edw_service.EdwClientInterface):
 
   def GetMetadata(self) -> dict[str, str]:
     """Gets the Metadata attributes for the Client Interface."""
-    return {'client': FLAGS.bq_client_interface}
+    return {'client': gcp_flags.BQ_CLIENT_INTERFACE.value}
 
   def RunQueryWithResults(self, query_name: str) -> str:
     raise NotImplementedError
@@ -83,13 +93,13 @@ def GetBigQueryClientInterface(
   Raises:
     RuntimeError: if an unsupported bq_client_interface is requested
   """
-  if FLAGS.bq_client_interface == 'CLI':
+  if gcp_flags.BQ_CLIENT_INTERFACE.value == 'CLI':
     return CliClientInterface(project_id, dataset_id)
-  if FLAGS.bq_client_interface == 'JAVA':
+  if gcp_flags.BQ_CLIENT_INTERFACE.value == 'JAVA':
     return JavaClientInterface(project_id, dataset_id)
-  if FLAGS.bq_client_interface in BQ_JDBC_INTERFACES:
+  if gcp_flags.BQ_CLIENT_INTERFACE.value in BQ_JDBC_INTERFACES:
     return JdbcClientInterface(project_id, dataset_id)
-  if FLAGS.bq_client_interface == 'PYTHON':
+  if gcp_flags.BQ_CLIENT_INTERFACE.value == 'PYTHON':
     return PythonClientInterface(project_id, dataset_id)
   raise RuntimeError('Unknown BigQuery Client Interface requested.')
 
@@ -219,11 +229,17 @@ class JdbcClientInterface(GenericClientInterface):
     self.client_vm.InstallPreprovisionedPackageData(
         package_name,
         [
-            BQ_JDBC_CLIENT_FILE[FLAGS.bq_client_interface],
-            BQ_JDBC_JAR_FILE[FLAGS.bq_client_interface],
+            BQ_JDBC_CLIENT_FILE,
+            BQ_JDBC_FILE[gcp_flags.BQ_CLIENT_INTERFACE.value],
         ],
         '',
     )
+    if gcp_flags.BQ_CLIENT_INTERFACE.value == 'SIMBA_JDBC':
+      unzip_cmd = 'unzip {} -d ./'.format(
+          BQ_JDBC_FILE[gcp_flags.BQ_CLIENT_INTERFACE.value]
+      )
+      self.client_vm.Install('unzip')
+      self.client_vm.RemoteCommand(unzip_cmd)
 
   def ExecuteQuery(
       self, query_name: str, print_results: bool = False
@@ -242,11 +258,11 @@ class JdbcClientInterface(GenericClientInterface):
       performance_details: A dictionary of query execution attributes eg. job_id
     """
     query_command = (
-        'java -cp {}:{} '
+        'java {} -cp {}:./* '
         'com.google.cloud.performance.edw.App --project {} --service_account '
         '{} --credentials_file {} --dataset {} --query_file {}'.format(
-            BQ_JDBC_CLIENT_FILE[FLAGS.bq_client_interface],
-            BQ_JDBC_JAR_FILE[FLAGS.bq_client_interface],
+            BQ_JDBC_JAVA_FLAGS[gcp_flags.BQ_CLIENT_INTERFACE.value],
+            BQ_JDBC_CLIENT_FILE,
             self.project_id,
             FLAGS.gcp_service_account,
             FLAGS.gcp_service_account_key_file,
@@ -417,15 +433,25 @@ class PythonClientInterface(GenericClientInterface):
 
     # Install dependencies for driver
     self.client_vm.Install('pip')
-    self.client_vm.RemoteCommand('sudo pip install google-cloud-bigquery')
     self.client_vm.RemoteCommand(
-        'sudo pip install google-cloud-bigquery-storage'
+        'sudo apt-get -qq update && DEBIAN_FRONTEND=noninteractive sudo apt-get'
+        ' -qq install python3.12-venv'
     )
-    self.client_vm.RemoteCommand('sudo pip install pyarrow')
+    self.client_vm.RemoteCommand('python3 -m venv .venv')
+    self.client_vm.RemoteCommand(
+        'source .venv/bin/activate && pip install google-cloud-bigquery absl-py'
+        ' google-cloud-bigquery-storage pyarrow'
+    )
 
     # Push driver script to client vm
     self.client_vm.PushDataFile(
         os.path.join(BQ_PYTHON_CLIENT_DIR, BQ_PYTHON_CLIENT_FILE)
+    )
+    self.client_vm.PushDataFile(
+        os.path.join(
+            edw_service.EDW_PYTHON_DRIVER_LIB_DIR,
+            edw_service.EDW_PYTHON_DRIVER_LIB_FILE,
+        )
     )
 
   def ExecuteQuery(
@@ -433,7 +459,7 @@ class PythonClientInterface(GenericClientInterface):
   ) -> tuple[float, dict[str, Any]]:
     """Executes a query and returns performance details."""
     cmd = (
-        f'python3 {BQ_PYTHON_CLIENT_FILE} single --project'
+        f'.venv/bin/python {BQ_PYTHON_CLIENT_FILE} single --project'
         f' {self.project_id} --credentials_file {self.key_file_name} --dataset'
         f' {self.dataset_id} --query_file {query_name} --feature_config'
         f' {FLAGS.edw_bq_feature_config}'
@@ -442,7 +468,7 @@ class PythonClientInterface(GenericClientInterface):
       cmd += ' --print_results'
     if self.destination:
       cmd += f' --destination {self.destination}'
-    stdout, _ = self.client_vm.RemoteCommand(cmd)
+    stdout, _ = self.client_vm.RobustRemoteCommand(cmd)
     details = copy.copy(self.GetMetadata())
     details.update(json.loads(stdout)['details'])
     return json.loads(stdout)['query_wall_time_in_secs'], details
@@ -454,23 +480,23 @@ class PythonClientInterface(GenericClientInterface):
   ) -> str:
     """Executes queries simultaneously on client and return performance details."""
     cmd = (
-        f'python3 {BQ_PYTHON_CLIENT_FILE} throughput --project'
+        f'.venv/bin/python {BQ_PYTHON_CLIENT_FILE} throughput --project'
         f' {self.project_id} --credentials_file {self.key_file_name} --dataset'
         f" {self.dataset_id} --query_streams='{json.dumps(concurrency_streams)}'"
         f' --feature_config {FLAGS.edw_bq_feature_config} --labels'
         f" '{json.dumps(labels)}'"
     )
-    stdout, _ = self.client_vm.RemoteCommand(cmd)
+    stdout, _ = self.client_vm.RobustRemoteCommand(cmd)
     return stdout
 
   def RunQueryWithResults(self, query_name: str) -> str:
     """Executes a query and returns performance details and query output."""
     cmd = (
-        f'python3 {BQ_PYTHON_CLIENT_FILE} single --project'
+        f'.venv/bin/python {BQ_PYTHON_CLIENT_FILE} single --project'
         f' {self.project_id} --credentials_file {self.key_file_name} --dataset'
         f' {self.dataset_id} --query_file {query_name} --print_results'
     )
-    stdout, _ = self.client_vm.RemoteCommand(cmd)
+    stdout, _ = self.client_vm.RobustRemoteCommand(cmd)
     return stdout
 
 
@@ -483,6 +509,7 @@ class Bigquery(edw_service.EdwService):
 
   CLOUD = provider_info.GCP
   SERVICE_TYPE = 'bigquery'
+  QUERY_SET = 'bigquery'
   RUN_COST_QUERY_TEMPLATE = 'edw/bigquery/run_cost_query.sql.j2'
   client_interface: GenericClientInterface
 
@@ -742,6 +769,7 @@ class Bigquery(edw_service.EdwService):
     run_cost = output['details']['query_results']['billed_slot_seconds'][0]
     return run_cost
 
+  @override
   def GetIterationAuxiliaryMetrics(self, iter_run_key: str) -> dict[str, Any]:
     service_auxiliary_metrics = {}
     try:
@@ -753,6 +781,184 @@ class Bigquery(edw_service.EdwService):
       return service_auxiliary_metrics
     except NotImplementedError:  # No metrics support in client interface.
       return {}
+
+  SEARCH_QUERY_TEMPLATE_LOCATION = 'edw/bigquery/search_index'
+
+  CREATE_INDEX_QUERY_TEMPLATE = (
+      f'{SEARCH_QUERY_TEMPLATE_LOCATION}/create_index_query.sql.j2'
+  )
+  DELETE_INDEX_QUERY_TEMPLATE = (
+      f'{SEARCH_QUERY_TEMPLATE_LOCATION}/delete_index_query.sql.j2'
+  )
+  GET_INDEX_STATUS_QUERY_TEMPLATE = (
+      f'{SEARCH_QUERY_TEMPLATE_LOCATION}/index_status.sql.j2'
+  )
+  INITIALIZE_PART_SEARCH_TABLE_QUERY_TEMPLATE = (
+      f'{SEARCH_QUERY_TEMPLATE_LOCATION}/table_init_partitioned.sql.j2'
+  )
+  INITIALIZE_UNPART_SEARCH_TABLE_QUERY_TEMPLATE = (
+      f'{SEARCH_QUERY_TEMPLATE_LOCATION}/table_init.sql.j2'
+  )
+  LOAD_SEARCH_DATA_QUERY_TEMPLATE = (
+      f'{SEARCH_QUERY_TEMPLATE_LOCATION}/ingestion_query.sql.j2'
+  )
+  INDEX_SEARCH_QUERY_TEMPLATE = (
+      f'{SEARCH_QUERY_TEMPLATE_LOCATION}/search_query.sql.j2'
+  )
+  GET_ROW_COUNT_QUERY_TEMPLATE = 'edw/bigquery/get_row_count.sql.j2'
+  INJECT_TOKEN_INTO_TABLE = (
+      f'{SEARCH_QUERY_TEMPLATE_LOCATION}/inject_token_into_table.sql.j2'
+  )
+
+  def CreateSearchIndex(
+      self, table_path: str, index_name: str
+  ) -> tuple[float, dict[str, Any]]:
+    query_name = f'create_index_{index_name}'
+    context = {
+        'table_name': table_path,
+        'index_name': index_name,
+    }
+    self.client_interface.client_vm.RenderTemplate(
+        data.ResourcePath(self.CREATE_INDEX_QUERY_TEMPLATE),
+        query_name,
+        context,
+    )
+    self.client_interface.client_vm.RemoteCommand(f'cat {query_name}')
+    return self.client_interface.ExecuteQuery(query_name, print_results=True)
+
+  def DropSearchIndex(
+      self, table_path: str, index_name: str
+  ) -> tuple[float, dict[str, Any]]:
+    query_name = 'delete_index'
+    context = {
+        'table_name': table_path,
+        'index_name': index_name,
+    }
+    self.client_interface.client_vm.RenderTemplate(
+        data.ResourcePath(self.DELETE_INDEX_QUERY_TEMPLATE),
+        query_name,
+        context,
+    )
+    self.client_interface.client_vm.RemoteCommand(f'cat {query_name}')
+    return self.client_interface.ExecuteQuery(query_name, print_results=True)
+
+  def GetSearchIndexCompletionPercentage(
+      self, table_path: str, index_name: str
+  ) -> tuple[int, dict[str, Any]]:
+    query_name = 'get_index_status'
+    context = {
+        'table_name': table_path,
+        'index_name': index_name,
+    }
+    self.client_interface.client_vm.RenderTemplate(
+        data.ResourcePath(self.GET_INDEX_STATUS_QUERY_TEMPLATE),
+        query_name,
+        context,
+    )
+    self.client_interface.client_vm.RemoteCommand(f'cat {query_name}')
+    _, meta = self.client_interface.ExecuteQuery(query_name, print_results=True)
+    qres = meta['query_results']['coverage_percentage'][0]
+    return qres, meta
+
+  def InitializeSearchStarterTable(
+      self, table_path: str, storage_path: str
+  ) -> tuple[float, dict[str, Any]]:
+    query_name = 'initialize_search_table'
+    context = {
+        'table_name': table_path,
+    }
+    init_table_query = (
+        self.INITIALIZE_PART_SEARCH_TABLE_QUERY_TEMPLATE
+        if INITIALIZE_SEARCH_TABLE_PARTITIONED.value
+        else self.INITIALIZE_UNPART_SEARCH_TABLE_QUERY_TEMPLATE
+    )
+    self.client_interface.client_vm.RenderTemplate(
+        data.ResourcePath(init_table_query),
+        query_name,
+        context,
+    )
+    self.client_interface.client_vm.RemoteCommand(f'cat {query_name}')
+    return self.client_interface.ExecuteQuery(query_name, print_results=True)
+
+  def InsertSearchData(
+      self, table_path: str, storage_path: str
+  ) -> tuple[float, dict[str, Any]]:
+    query_name = 'load_search_data'
+    random_8_char_long_hex = f'{random.randrange(2**32):08x}'
+    context = {
+        'table_name': table_path,
+        'storage_path': storage_path,
+        'random_id': random_8_char_long_hex,
+    }
+    self.client_interface.client_vm.RenderTemplate(
+        data.ResourcePath(self.LOAD_SEARCH_DATA_QUERY_TEMPLATE),
+        query_name,
+        context,
+    )
+    self.client_interface.client_vm.RemoteCommand(f'cat {query_name}')
+    return self.client_interface.ExecuteQuery(query_name, print_results=True)
+
+  def GetTableRowCount(self, table_path: str) -> tuple[int, dict[str, Any]]:
+    query_name = 'get_row_count'
+    context = {
+        'table_name': table_path,
+    }
+    self.client_interface.client_vm.RenderTemplate(
+        data.ResourcePath(self.GET_ROW_COUNT_QUERY_TEMPLATE),
+        query_name,
+        context,
+    )
+    self.client_interface.client_vm.RemoteCommand(f'cat {query_name}')
+    _, meta = self.client_interface.ExecuteQuery(query_name, print_results=True)
+    qres = meta['query_results']['total_row_count'][0]
+    return qres, meta
+
+  def TextSearchQuery(
+      self,
+      table_path: str,
+      search_keyword: str,
+      order_by: str | None = None,
+      limit: int | None = None,
+      date_between: tuple[datetime.date, datetime.date] | None = None,
+  ) -> tuple[float, dict[str, Any]]:
+    query_name = 'text_search_query'
+    context = {
+        'table_name': table_path,
+        'search_text': search_keyword,
+        'order_by': order_by,
+        'limit': limit,
+        'date_between': date_between,
+    }
+    self.client_interface.client_vm.RenderTemplate(
+        data.ResourcePath(self.INDEX_SEARCH_QUERY_TEMPLATE),
+        query_name,
+        context,
+    )
+    self.client_interface.client_vm.RemoteCommand(f'cat {query_name}')
+    res, meta = self.client_interface.ExecuteQuery(
+        query_name, print_results=True
+    )
+    meta['edw_search_result_rows'] = len(
+        meta['query_results'].get('event_timestamp', [])
+    )
+    return res, meta
+
+  def InjectTokenIntoTable(
+      self, table_path: str, token: str, token_count: int
+    ) -> tuple[float, dict[str, Any]]:
+    query_name = 'inject_token_into_table'
+    context = {
+        'table_name': table_path,
+        'token': token,
+        'token_count': token_count,
+    }
+    self.client_interface.client_vm.RenderTemplate(
+        data.ResourcePath(self.INJECT_TOKEN_INTO_TABLE),
+        query_name,
+        context,
+    )
+    self.client_interface.client_vm.RemoteCommand(f'cat {query_name}')
+    return self.client_interface.ExecuteQuery(query_name, print_results=True)
 
 
 class Endor(Bigquery):
@@ -849,6 +1055,7 @@ class Bqfederated(Bigquery):
     Returns:
       A dictionary set to underlying data's details (format, etc.)
     """
+    # TODO(jguertin): Review & update for current datasets
     data_details = {}
     project_id, dataset_id = re.split(r'\.', self.cluster_identifier)
     data_details['metadata_caching'] = str('metadata-caching' in project_id)

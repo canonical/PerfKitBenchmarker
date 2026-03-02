@@ -188,7 +188,7 @@ flags.DEFINE_enum(
     'different name prefixes.\n'
     'sequential_with_hash_prefix: '
     'The same as sequential_by_stream, but prefixed by a 10 charachter partial '
-    'hexidecimal hash digest and a /.\n'
+    'hexadecimal hash digest and a /.\n'
     'approximately_sequential: object names from all '
     'streams will roughly increase together.\n'
     'prefix_by_vm_and_stream: '
@@ -292,7 +292,7 @@ object_storage_service:
       to select a set of sub-benchmarks to run. default is all.
   vm_groups:
     default:
-      vm_spec: *default_single_core
+      vm_spec: *default_dual_core
       vm_count: null
   flags:
     gcloud_scopes: https://www.googleapis.com/auth/devstorage.read_write
@@ -713,7 +713,7 @@ def ProcessMultiStreamResults(
   results.append(
       sample.Sample(
           'Multi-stream ' + operation + ' net throughput',
-          np.sum((
+          sum((
               size / active_time * 8
               for size, active_time in zip(
                   total_active_sizes, total_active_times
@@ -726,7 +726,7 @@ def ProcessMultiStreamResults(
   results.append(
       sample.Sample(
           'Multi-stream ' + operation + ' net throughput (with gap)',
-          np.sum((
+          sum((
               size / duration * 8
               for size, duration in zip(total_active_sizes, active_durations)
           )),

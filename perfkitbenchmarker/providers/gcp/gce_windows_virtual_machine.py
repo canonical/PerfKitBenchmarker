@@ -23,7 +23,6 @@ from perfkitbenchmarker import os_types
 from perfkitbenchmarker import virtual_machine
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker import windows_virtual_machine
-from perfkitbenchmarker.providers.gcp import flags as gcp_flags
 from perfkitbenchmarker.providers.gcp import gce_virtual_machine
 from perfkitbenchmarker.providers.gcp import gcs
 from perfkitbenchmarker.providers.gcp import util
@@ -87,7 +86,7 @@ class WindowsGceVirtualMachine(
     """Initialize a Windows GCE virtual machine.
 
     Args:
-      vm_spec: virtual_machine.BaseVmSpec object of the vm.
+      vm_spec: virtual_machine_spec.BaseVmSpec object of the vm.
     """
     super().__init__(vm_spec)
     self.boot_metadata['windows-startup-script-ps1'] = (
@@ -225,34 +224,6 @@ class WindowsGceVirtualMachine(
       return 'windows-sql-cloud'
     return 'windows-cloud'
 
-  def SetupLMNotification(self):
-    """Prepare environment for /scripts/gce_maintenance_notify.py script."""
-    self.Install('python')
-    self.RemoteCommand('pip install requests')
-    self.PushDataFile(
-        self._LM_NOTICE_SCRIPT, f'{self.temp_dir}\\{self._LM_NOTICE_SCRIPT}'
-    )
-
-  def _GetLMNotificationCommand(self):
-    """Return Remote python execution command for LM notify script."""
-    vm_path = ntpath.join(self.temp_dir, self._LM_NOTICE_SCRIPT)
-    return (
-        f'python {vm_path} {gcp_flags.LM_NOTIFICATION_METADATA_NAME.value}'
-        f' {gcp_flags.LM_NOTIFICATION_TIMEOUT.value} >'
-        f' {self.temp_dir}\\{self._LM_NOTICE_LOG} 2>&1'
-    )
-
-  def _PullLMNoticeLog(self):
-    """Pull the LM Notice Log onto the local VM."""
-    self.PullFile(
-        f'{vm_util.GetTempDir()}/{self._LM_NOTICE_LOG}',
-        f'{self.temp_dir}\\{self._LM_NOTICE_LOG}',
-    )
-
-  def _ReadLMNoticeContents(self):
-    """Read the contents of the LM Notice Log into a string."""
-    return self.RemoteCommand(f'type {self.temp_dir}\\{self._LM_NOTICE_LOG}')[0]
-
   @property
   def _MetadataPreemptCmd(self) -> str:
     return _METADATA_PREEMPT_CMD_WIN
@@ -275,14 +246,20 @@ class WindowsGceSqlServerVirtualMachine(WindowsGceVirtualMachine):
       os_types.WINDOWS2019_SQLSERVER_2017_ENTERPRISE: 'sql-ent-2017-win-2019',
       os_types.WINDOWS2019_SQLSERVER_2019_STANDARD: 'sql-std-2019-win-2019',
       os_types.WINDOWS2019_SQLSERVER_2019_ENTERPRISE: 'sql-ent-2019-win-2019',
+      os_types.WINDOWS2019_SQLSERVER_2025_STANDARD: 'sql-std-2025-win-2019',
+      os_types.WINDOWS2019_SQLSERVER_2025_ENTERPRISE: 'sql-ent-2025-win-2019',
       os_types.WINDOWS2022_SQLSERVER_2019_STANDARD: 'sql-std-2019-win-2022',
       os_types.WINDOWS2022_SQLSERVER_2019_ENTERPRISE: 'sql-ent-2019-win-2022',
       os_types.WINDOWS2022_SQLSERVER_2022_STANDARD: 'sql-std-2022-win-2022',
       os_types.WINDOWS2022_SQLSERVER_2022_ENTERPRISE: 'sql-ent-2022-win-2022',
+      os_types.WINDOWS2022_SQLSERVER_2025_STANDARD: 'sql-std-2025-win-2022',
+      os_types.WINDOWS2022_SQLSERVER_2025_ENTERPRISE: 'sql-ent-2025-win-2022',
       os_types.WINDOWS2025_SQLSERVER_2019_STANDARD: 'sql-std-2019-win-2025',
       os_types.WINDOWS2025_SQLSERVER_2019_ENTERPRISE: 'sql-ent-2019-win-2025',
       os_types.WINDOWS2025_SQLSERVER_2022_STANDARD: 'sql-std-2022-win-2025',
       os_types.WINDOWS2025_SQLSERVER_2022_ENTERPRISE: 'sql-ent-2022-win-2025',
+      os_types.WINDOWS2025_SQLSERVER_2025_STANDARD: 'sql-std-2025-win-2025',
+      os_types.WINDOWS2025_SQLSERVER_2025_ENTERPRISE: 'sql-ent-2025-win-2025',
   }
 
   OS_TYPE = os_types.WINDOWS_SQLSERVER_OS_TYPES

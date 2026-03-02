@@ -18,7 +18,6 @@ All VM specifics are self-contained and the class provides methods to
 operate on the VM: boot, shutdown, etc.
 """
 
-
 import base64
 import collections
 import json
@@ -31,7 +30,6 @@ import time
 import uuid
 from absl import flags
 from perfkitbenchmarker import disk
-from perfkitbenchmarker import disk_strategies
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import flags as pkb_flags
 from perfkitbenchmarker import linux_virtual_machine
@@ -39,6 +37,7 @@ from perfkitbenchmarker import placement_group
 from perfkitbenchmarker import provider_info
 from perfkitbenchmarker import resource
 from perfkitbenchmarker import virtual_machine
+from perfkitbenchmarker import virtual_machine_spec
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker import windows_virtual_machine
 from perfkitbenchmarker.configs import option_decoders
@@ -227,7 +226,7 @@ def GetRootBlockDeviceSpecForImage(image_id, region):
   return root_block_device_dict
 
 
-def GetBlockDeviceMap(vm):
+def GetBlockDeviceMap(vm: 'AwsVirtualMachine'):
   """Returns the block device map to expose all devices for a given machine.
 
   Args:
@@ -270,7 +269,7 @@ def GetBlockDeviceMap(vm):
 def GetArmArchitecture(machine_type: str):
   """Returns the specific ARM processor architecture of the VM."""
   # c6g.medium -> c6g, m6gd.large -> m6g, c5n.18xlarge -> c5
-  prefix = re.split(r'[dn]?\.', machine_type)[0]
+  prefix = re.split(r'[bdn]?\.', machine_type)[0]
   return _MACHINE_TYPE_PREFIX_TO_ARM_ARCH.get(prefix)
 
 
@@ -358,7 +357,7 @@ class AwsDedicatedHost(resource.BaseResource):
     return state in HOST_EXISTS_STATES
 
 
-class AwsVmSpec(virtual_machine.BaseVmSpec):
+class AwsVmSpec(virtual_machine_spec.BaseVmSpec):
   """Object containing the information needed to create an AwsVirtualMachine.
 
   Attributes:
@@ -366,6 +365,10 @@ class AwsVmSpec(virtual_machine.BaseVmSpec):
   """
 
   CLOUD = provider_info.AWS
+
+  def GetRegion(self) -> str:
+    assert isinstance(self.zone, str)
+    return util.GetRegionFromZone(self.zone)
 
   @classmethod
   def _ApplyFlags(cls, config_values, flag_values):
@@ -380,8 +383,6 @@ class AwsVmSpec(virtual_machine.BaseVmSpec):
         provided config values.
     """
     super()._ApplyFlags(config_values, flag_values)
-    if flag_values['aws_boot_disk_size'].present:
-      config_values['boot_disk_size'] = flag_values.aws_boot_disk_size
     if flag_values['aws_spot_instances'].present:
       config_values['use_spot_instance'] = flag_values.aws_spot_instances
     if flag_values['aws_spot_price'].present:
@@ -411,7 +412,6 @@ class AwsVmSpec(virtual_machine.BaseVmSpec):
             option_decoders.IntDecoder,
             {'default': None},
         ),
-        'boot_disk_size': (option_decoders.IntDecoder, {'default': None}),
     })
 
     return result
@@ -542,8 +542,8 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
   deleted_hosts = set()
   host_map = collections.defaultdict(list)
   client_token: str
-  create_cmd: list[str] | None
-  create_disk_strategy: disk_strategies.CreateDiskStrategy
+  create_cmd: list[str]
+  create_disk_strategy: aws_disk_strategies.AWSCreateDiskStrategy
   device_by_disk_spec_id: dict[int, str]
   disk_identifiers_by_device: dict[str, aws_disk.AWSDiskIdentifiers]
   host: AwsDedicatedHost | None
@@ -572,8 +572,7 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
       ValueError: If an incompatible vm_spec is passed.
     """
     super().__init__(vm_spec)
-    assert isinstance(self.zone, str)
-    self.region = util.GetRegionFromZone(self.zone)
+    self.region = vm_spec.GetRegion()
     self.user_name = FLAGS.aws_user_name or self.DEFAULT_USER_NAME
     if self.machine_type in aws_disk.NUM_LOCAL_VOLUMES:
       self.max_local_disks = aws_disk.NUM_LOCAL_VOLUMES[self.machine_type]
@@ -581,21 +580,9 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
       self.user_data = f'file://{self.boot_startup_script}'
     else:
       self.user_data = None
-    self.network = aws_network.AwsNetwork.GetNetwork(self)
+    self.network = aws_network.AwsNetwork.GetNetwork(self.vm_spec)
     self.network_eni_count = aws_network.AWS_ENI_COUNT.value
     self.network_card_count = aws_network.AWS_NETWORK_CARD_COUNT.value
-    if (
-        (self.network_eni_count > 1)
-        and (self.network_card_count > 1)
-        and (self.machine_type not in aws_network.DUAL_NETWORK_CARD_MACHINES)
-    ):
-      logging.warning(
-          '%s does not support %s network cards. Using 1 instead.',
-          self.machine_type,
-          self.network_card_count,
-      )
-      self.network_eni_count = 1
-      self.network_card_count = 1
     self.placement_group = self.network.placement_group
     self.firewall = aws_network.AwsFirewall.GetFirewall()
     self.use_dedicated_host = vm_spec.use_dedicated_host
@@ -631,12 +618,12 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
     # See:
     # https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/enhanced-networking-os.html
     self._smp_affinity_script = 'smp_affinity.sh'
-    self.create_cmd = None
+    self.create_cmd = []
 
     arm_arch = GetArmArchitecture(self.machine_type)
+    self.is_aarch64 = bool(arm_arch)
     if arm_arch:
       self.host_arch = arm_arch
-      self.is_aarch64 = True
 
     if self.use_dedicated_host and util.IsRegion(self.zone):
       raise ValueError(
@@ -647,8 +634,8 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
 
     if self.use_dedicated_host and self.use_spot_instance:
       raise ValueError('Tenancy=host is not supported for Spot Instances')
-    self.allocation_id = None
-    self.association_id = None
+    self.allocation_ids = {}
+    self.association_ids = {}
     self.aws_tags = {}
     # this maps the deterministic order
     # of this device in the VM's disk_spec to the device name
@@ -830,9 +817,22 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
             network_interface['PrivateIpAddress']
         ] + self.internal_ips
       else:
+        if aws_flags.AWS_DISABLE_NON_PRIMARY_NIC_SOURCE_DEST_CHECK.value:
+          cmd = util.AWS_PREFIX + [
+              'ec2',
+              'modify-network-interface-attribute',
+              '--network-interface-id',
+              network_interface['NetworkInterfaceId'],
+              '--region',
+              self.region,
+              '--no-source-dest-check',
+          ]
+          vm_util.IssueCommand(cmd, raise_on_failure=False)
         # EFAv3 only has internal IPs for every 4th NIC?
-        if (self.machine_type not in _EFA_V3_MACHINE_TYPES
-            or network_interface['Attachment']['NetworkCardIndex'] % 4 == 0):
+        if (
+            self.machine_type not in _EFA_V3_MACHINE_TYPES
+            or network_interface['Attachment']['NetworkCardIndex'] % 4 == 0
+        ):
           self.internal_ips.append(network_interface['PrivateIpAddress'])
     if util.IsRegion(self.zone):
       self.zone = str(instance['Placement']['AvailabilityZone'])
@@ -887,36 +887,43 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
     Args:
       instance: dict which contains instance info.
     """
-    network_interface_id = None
     for network_interface in instance['NetworkInterfaces']:
-      # The primary network interface (eth0) for the instance.
-      if network_interface['Attachment']['DeviceIndex'] == 0:
-        network_interface_id = network_interface['NetworkInterfaceId']
-        break
-    assert network_interface_id is not None
+      network_interface_id = network_interface['NetworkInterfaceId']
+      device_index = network_interface['Attachment']['DeviceIndex']
+      if (
+          self.assign_external_ip and device_index == 0
+      ) or self.assign_external_ip_all_nics:
+        stdout, _, _ = vm_util.IssueCommand(
+            util.AWS_PREFIX
+            + [
+                'ec2',
+                'allocate-address',
+                f'--region={self.region}',
+                '--domain=vpc',
+            ]
+        )
+        response = json.loads(stdout)
+        public_ip = response['PublicIp']
+        allocation_id = response['AllocationId']
 
-    stdout, _, _ = vm_util.IssueCommand(
-        util.AWS_PREFIX
-        + ['ec2', 'allocate-address', f'--region={self.region}', '--domain=vpc']
-    )
-    response = json.loads(stdout)
-    self.ip_address = response['PublicIp']
-    self.allocation_id = response['AllocationId']
+        self.allocation_ids[public_ip] = allocation_id
+        util.AddDefaultTags(allocation_id, self.region)
+        if device_index == 0:
+          self.ip_address = public_ip
+        self.ip_addresses.append(public_ip)
 
-    util.AddDefaultTags(self.allocation_id, self.region)
-
-    stdout, _, _ = vm_util.IssueCommand(
-        util.AWS_PREFIX
-        + [
-            'ec2',
-            'associate-address',
-            f'--region={self.region}',
-            f'--allocation-id={self.allocation_id}',
-            f'--network-interface-id={network_interface_id}',
-        ]
-    )
-    response = json.loads(stdout)
-    self.association_id = response['AssociationId']
+        stdout, _, _ = vm_util.IssueCommand(
+            util.AWS_PREFIX
+            + [
+                'ec2',
+                'associate-address',
+                f'--region={self.region}',
+                f'--allocation-id={allocation_id}',
+                f'--network-interface-id={network_interface_id}',
+            ]
+        )
+        response = json.loads(stdout)
+        self.association_ids[public_ip] = response['AssociationId']
 
   def _InstallEfa(self):
     """Installs AWS EFA packages.
@@ -942,6 +949,7 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
     if not util.IsRegion(self.zone):
       placement.append('AvailabilityZone=%s' % self.zone)
     if self.use_dedicated_host:
+      assert self.host
       placement.append('Tenancy=host,HostId=%s' % self.host.id)
       self.num_hosts = len(self.host_list)
     elif self.placement_group:
@@ -962,20 +970,33 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
           '--count=1',
           '--instance-market-options=MarketType="capacity-block"',
           '--capacity-reservation-specification=CapacityReservationTarget='
-          '{CapacityReservationId=%s}' % reservation_id]
+          '{CapacityReservationId=%s}' % reservation_id,
+      ]
     else:
       reservation_args = []
-    create_cmd = util.AWS_PREFIX + [
-        'ec2',
-        'run-instances',
-        '--region=%s' % self.region,
-        '--client-token=%s' % self.client_token,
-        '--image-id=%s' % self.image,
-        '--instance-type=%s' % self.machine_type,
-        '--key-name=%s' % AwsKeyFileManager.GetKeyNameForRun(),
-        '--tag-specifications=%s'
-        % util.FormatTagSpecifications('instance', self.aws_tags),
-    ] + reservation_args
+
+    bandwidth_weighting_args = []
+    if aws_flags.AWS_INSTANCE_BANDWIDTH_WEIGHTING.value:
+      bandwidth_weighting_args = [
+          '--network-performance-options',
+          f'BandwidthWeighting={aws_flags.AWS_INSTANCE_BANDWIDTH_WEIGHTING.value}',
+      ]
+    create_cmd = (
+        util.AWS_PREFIX
+        + [
+            'ec2',
+            'run-instances',
+            '--region=%s' % self.region,
+            '--client-token=%s' % self.client_token,
+            '--image-id=%s' % self.image,
+            '--instance-type=%s' % self.machine_type,
+            '--key-name=%s' % AwsKeyFileManager.GetKeyNameForRun(),
+            '--tag-specifications=%s'
+            % util.FormatTagSpecifications('instance', self.aws_tags),
+        ]
+        + reservation_args
+        + bandwidth_weighting_args
+    )
 
     if FLAGS.aws_vm_hibernate:
       create_cmd.extend([
@@ -987,6 +1008,7 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
         'hpc6a.48xlarge',
         'hpc6id.32xlarge',
         'hpc7a.96xlarge',
+        'hpc7g.16xlarge',
     ):
       query_cmd = util.AWS_PREFIX + [
           'ec2',
@@ -1026,27 +1048,32 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
             )
         )
       create_cmd.extend(efas)
-    elif self.network_eni_count > 1:
+    else:
       enis = ['--network-interfaces']
-      enis_per_network_card = self.network_eni_count // self.network_card_count
       for device_index in range(self.network_eni_count):
         eni_params = _ENI_PARAMS.copy()
         eni_params.update({
-            'NetworkCardIndex': device_index // enis_per_network_card,
+            'NetworkCardIndex': device_index % self.network_card_count,
             'DeviceIndex': device_index,
             'Groups': self.group_id,
             'SubnetId': self.network.subnet.id,
         })
+        # Only allowed for single NIC instances.
+        if (
+            self.assign_external_ip
+            and self.network_eni_count == 1
+        ):
+          eni_params['AssociatePublicIpAddress'] = True
+        if aws_flags.AWS_NIC_QUEUE_COUNTS.value:
+          eni_params['EnaQueueCount'] = aws_flags.AWS_NIC_QUEUE_COUNTS.value[
+              device_index
+          ]
         enis.append(
             ','.join(
                 f'{key}={value}' for key, value in sorted(eni_params.items())
             )
         )
       create_cmd.extend(enis)
-    else:
-      if self.assign_external_ip:
-        create_cmd.append('--associate-public-ip-address')
-      create_cmd.append(f'--subnet-id={self.network.subnet.id}')
     if block_device_map:
       create_cmd.append('--block-device-mappings=%s' % block_device_map)
     if placement:
@@ -1261,6 +1288,7 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
     instance = response['Reservations'][0]['Instances'][0]
     if 'PublicIpAddress' in instance:
       self.ip_address = instance['PublicIpAddress']
+      self.ip_addresses.append(instance['PublicIpAddress'])
     else:
       logging.info('VM is pending.')
       raise AwsTransitionalVmRetryableError()
@@ -1299,25 +1327,25 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
       vm_util.IssueCommand(cancel_cmd, raise_on_failure=False)
 
     if FLAGS.aws_efa or self.network_eni_count > 1:
-      if self.association_id:
+      for association_id in self.association_ids.values():
         vm_util.IssueCommand(
             util.AWS_PREFIX
             + [
                 'ec2',
                 'disassociate-address',
                 f'--region={self.region}',
-                f'--association-id={self.association_id}',
+                f'--association-id={association_id}',
             ]
         )
 
-      if self.allocation_id:
+      for allocation_id in self.allocation_ids.values():
         vm_util.IssueCommand(
             util.AWS_PREFIX
             + [
                 'ec2',
                 'release-address',
                 f'--region={self.region}',
-                f'--allocation-id={self.allocation_id}',
+                f'--allocation-id={allocation_id}',
             ]
         )
 
@@ -1609,6 +1637,9 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
       result['efa_count'] = FLAGS.aws_efa_count
       result['nic_count'] = FLAGS.aws_efa_count
     result['preemptible'] = self.use_spot_instance
+    result['instance_bandwidth_weighting'] = (
+        aws_flags.AWS_INSTANCE_BANDWIDTH_WEIGHTING.value or 'default'
+    )
     return result
 
   def DiskTypeCreatedOnVMCreation(self, disk_type):
@@ -1619,42 +1650,44 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
     """Returns whether the disk type has been created during VM creation."""
     return self.DiskTypeCreatedOnVMCreation(data_disk.disk_type)
 
-
-class BaseLinuxAwsVirtualMachine(
-    AwsVirtualMachine, linux_virtual_machine.BaseLinuxMixin
-):
-  """Class supporting Linux AWS virtual machines."""
-
-  def _PostCreate(self):
-    super()._PostCreate()
-    nic_queue_counts = aws_flags.AWS_NIC_QUEUE_COUNTS.value
-    if nic_queue_counts:
-      for network_device in nic_queue_counts:
-        device_name, queue_count = network_device.split('=')
-        self.RemoteCommand(
-            f'sudo ethtool -L {device_name} combined {queue_count}'
-        )
+  def DowngradeToCheapInstance(self):
+    """Downgrades the VM to a cheap instance type (e.g., t3.micro)."""
+    logging.info('Downgrading instance %s to t3.micro', self.id)
+    self.Stop()
+    cmd = util.AWS_PREFIX + [
+        'ec2',
+        'modify-instance-attribute',
+        '--region',
+        self.region,
+        '--instance-id',
+        self.id,
+        '--instance-type',
+        'Value=t3.micro',
+    ]
+    vm_util.IssueCommand(cmd)
+    self.Start()
 
 
 class ClearBasedAwsVirtualMachine(
-    BaseLinuxAwsVirtualMachine, linux_virtual_machine.ClearMixin
+    AwsVirtualMachine, linux_virtual_machine.ClearMixin
 ):
   IMAGE_NAME_FILTER_PATTERN = 'clear/images/*/clear-*'
   DEFAULT_USER_NAME = 'clear'
 
 
 class CoreOsBasedAwsVirtualMachine(
-    BaseLinuxAwsVirtualMachine, linux_virtual_machine.CoreOsMixin
+    AwsVirtualMachine, linux_virtual_machine.CoreOsMixin
 ):
   IMAGE_NAME_FILTER_PATTERN = 'fedora-coreos-*'
   # CoreOS only distinguishes between stable and testing in the description
   IMAGE_DESCRIPTION_FILTER = 'Fedora CoreOS stable *'
+  DEFAULT_ROOT_DISK_TYPE = 'gp3'
   IMAGE_OWNER = CENTOS_IMAGE_PROJECT
   DEFAULT_USER_NAME = 'core'
 
 
 class Debian11BasedAwsVirtualMachine(
-    BaseLinuxAwsVirtualMachine, linux_virtual_machine.Debian11Mixin
+    AwsVirtualMachine, linux_virtual_machine.Debian11Mixin
 ):
   # From https://wiki.debian.org/Cloud/AmazonEC2Image/Bullseye
   IMAGE_NAME_FILTER_PATTERN = 'debian-11-{alternate_architecture}-*'
@@ -1669,15 +1702,26 @@ class Debian11BackportsBasedAwsVirtualMachine(
 
 
 class Debian12BasedAwsVirtualMachine(
-    BaseLinuxAwsVirtualMachine, linux_virtual_machine.Debian12Mixin
+    AwsVirtualMachine, linux_virtual_machine.Debian12Mixin
 ):
   # From https://wiki.debian.org/Cloud/AmazonEC2Image/Bookworm
   IMAGE_NAME_FILTER_PATTERN = 'debian-12-{alternate_architecture}-*'
   IMAGE_OWNER = DEBIAN_IMAGE_PROJECT
+  DEFAULT_ROOT_DISK_TYPE = 'gp3'
   DEFAULT_USER_NAME = 'admin'
 
 
-class UbuntuBasedAwsVirtualMachine(BaseLinuxAwsVirtualMachine):
+class Debian13BasedAwsVirtualMachine(
+    AwsVirtualMachine, linux_virtual_machine.Debian13Mixin
+):
+  # From https://wiki.debian.org/Cloud/AmazonEC2Image/Trixie
+  IMAGE_NAME_FILTER_PATTERN = 'debian-13-{alternate_architecture}-*'
+  IMAGE_OWNER = DEBIAN_IMAGE_PROJECT
+  DEFAULT_ROOT_DISK_TYPE = 'gp3'
+  DEFAULT_USER_NAME = 'admin'
+
+
+class UbuntuBasedAwsVirtualMachine(AwsVirtualMachine):
   IMAGE_OWNER = UBUNTU_IMAGE_PROJECT
   DEFAULT_USER_NAME = 'ubuntu'
 
@@ -1763,7 +1807,7 @@ ENV LD_LIBRARY_PATH=/opt/aws-ofi-nccl/lib:/opt/amazon/efa:\$LD_LIBRARY_PATH
 
 
 class AmazonLinux2EfaBasedAwsVirtualMachine(
-    BaseLinuxAwsVirtualMachine, linux_virtual_machine.AmazonLinux2DLMixin
+    AwsVirtualMachine, linux_virtual_machine.AmazonLinux2DLMixin
 ):
   """AmazonLinux2 Base DLAMI virtual machine."""
 
@@ -1805,7 +1849,7 @@ class Ubuntu2404BasedAwsVirtualMachine(
 
 
 class AmazonLinux2BasedAwsVirtualMachine(
-    BaseLinuxAwsVirtualMachine, linux_virtual_machine.AmazonLinux2Mixin
+    AwsVirtualMachine, linux_virtual_machine.AmazonLinux2Mixin
 ):
   """Class with configuration for AWS Amazon Linux 2 virtual machines."""
 
@@ -1821,7 +1865,7 @@ class AmazonNeuronBasedAwsVirtualMachine(
 
 
 class AmazonLinux2023BasedAwsVirtualMachine(
-    BaseLinuxAwsVirtualMachine, linux_virtual_machine.AmazonLinux2023Mixin
+    AwsVirtualMachine, linux_virtual_machine.AmazonLinux2023Mixin
 ):
   """Class with configuration for AWS Amazon Linux 2023 virtual machines."""
 
@@ -1829,7 +1873,7 @@ class AmazonLinux2023BasedAwsVirtualMachine(
 
 
 class Rhel8BasedAwsVirtualMachine(
-    BaseLinuxAwsVirtualMachine, linux_virtual_machine.Rhel8Mixin
+    AwsVirtualMachine, linux_virtual_machine.Rhel8Mixin
 ):
   """Class with configuration for AWS RHEL 8 virtual machines."""
 
@@ -1837,11 +1881,12 @@ class Rhel8BasedAwsVirtualMachine(
   # https://access.redhat.com/articles/3692431
   # All RHEL AMIs are HVM. HVM- blocks HVM_BETA.
   IMAGE_NAME_FILTER_PATTERN = 'RHEL-8*_HVM-*'
+  DEFAULT_ROOT_DISK_TYPE = 'gp3'
   IMAGE_OWNER = RHEL_IMAGE_PROJECT
 
 
 class Rhel9BasedAwsVirtualMachine(
-    BaseLinuxAwsVirtualMachine, linux_virtual_machine.Rhel9Mixin
+    AwsVirtualMachine, linux_virtual_machine.Rhel9Mixin
 ):
   """Class with configuration for AWS RHEL 9 virtual machines."""
 
@@ -1852,8 +1897,21 @@ class Rhel9BasedAwsVirtualMachine(
   IMAGE_OWNER = RHEL_IMAGE_PROJECT
 
 
+class Rhel10BasedAwsVirtualMachine(
+    AwsVirtualMachine, linux_virtual_machine.Rhel10Mixin
+):
+  """Class with configuration for AWS RHEL 10 virtual machines."""
+
+  # Documentation on finding RHEL images:
+  # https://access.redhat.com/articles/3692431
+  # All RHEL AMIs are HVM. HVM- blocks HVM_BETA.
+  IMAGE_NAME_FILTER_PATTERN = 'RHEL-10*_HVM-*'
+  IMAGE_OWNER = RHEL_IMAGE_PROJECT
+  DEFAULT_ROOT_DISK_TYPE = 'gp3'
+
+
 class RockyLinux8BasedAwsVirtualMachine(
-    BaseLinuxAwsVirtualMachine, linux_virtual_machine.RockyLinux8Mixin
+    AwsVirtualMachine, linux_virtual_machine.RockyLinux8Mixin
 ):
   """Class with configuration for AWS Rocky Linux 8 virtual machines."""
 
@@ -1863,7 +1921,7 @@ class RockyLinux8BasedAwsVirtualMachine(
 
 
 class RockyLinux9BasedAwsVirtualMachine(
-    BaseLinuxAwsVirtualMachine, linux_virtual_machine.RockyLinux9Mixin
+    AwsVirtualMachine, linux_virtual_machine.RockyLinux9Mixin
 ):
   """Class with configuration for AWS Rocky Linux 9 virtual machines."""
 
@@ -1872,8 +1930,18 @@ class RockyLinux9BasedAwsVirtualMachine(
   DEFAULT_USER_NAME = 'rocky'
 
 
+class RockyLinux10BasedAwsVirtualMachine(
+    AwsVirtualMachine, linux_virtual_machine.RockyLinux10Mixin
+):
+  """Class with configuration for AWS Rocky Linux 10 virtual machines."""
+
+  IMAGE_OWNER = ROCKY_LINUX_IMAGE_PROJECT
+  IMAGE_NAME_FILTER_PATTERN = 'Rocky-10-*'
+  DEFAULT_USER_NAME = 'rocky'
+
+
 class CentOsStream9BasedAwsVirtualMachine(
-    BaseLinuxAwsVirtualMachine, linux_virtual_machine.CentOsStream9Mixin
+    AwsVirtualMachine, linux_virtual_machine.CentOsStream9Mixin
 ):
   """Class with configuration for AWS CentOS Stream 9 virtual machines."""
 

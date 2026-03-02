@@ -35,6 +35,7 @@ from perfkitbenchmarker import relational_db
 from perfkitbenchmarker import sample
 from perfkitbenchmarker import sql_engine_utils
 from perfkitbenchmarker import virtual_machine
+from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.linux_packages import sysbench
 
 FLAGS = flags.FLAGS
@@ -117,8 +118,7 @@ _TXN_ISOLATION_LEVEL = flags.DEFINE_enum(
     'sysbench_txn_isolation_level',
     'SER',
     ['SER', 'RR', 'RC'],
-    'If true, uses postgres-compatible benchmark script. Only used if'
-    ' --sysbench_testname=spanner_tpcc.',
+    'Set transaction isolation level. For Spanner, RC is not supported.',
 )
 _SKIP_LOAD_STAGE = flags.DEFINE_boolean(
     'sysbench_skip_load_stage',
@@ -316,6 +316,8 @@ def CreateMetadataFromFlags():
       'sysbench_run_seconds': FLAGS.sysbench_run_seconds,
       'sysbench_latency_percentile': FLAGS.sysbench_latency_percentile,
       'sysbench_report_interval': FLAGS.sysbench_report_interval,
+      'sysbench_txn_isolation_level': _TXN_ISOLATION_LEVEL.value,
+      'sysbench_rand_type': UNIFORM,
   }
   if FLAGS.sysbench_testname == SPANNER_TPCC:
     metadata['sysbench_use_fk'] = FLAGS.sysbench_use_fk
@@ -388,6 +390,7 @@ def _GetSysbenchPrepareCommand(
       ),
       ('--scale=%d' % FLAGS.sysbench_scale if _IsValidFlag('scale') else ''),
       '--threads=%d' % _LOAD_THREADS.value,
+      '--rand-type=%s' % UNIFORM,
   ]
 
   if _IsValidFlag('auto-inc'):
@@ -487,10 +490,10 @@ def _LoadDatabaseInParallel(
     # This command update the secondary index
     # Run all index update in parallel.
     client_vms[0].RobustRemoteCommand(
-        'cd ~/sysbench/ && nice -15 sysbench oltp_read_only'
+        f'cd ~/sysbench/ && nice -15 sysbench {FLAGS.sysbench_testname}'
         f' --tables={FLAGS.sysbench_tables} --table_size=0 '
-        f' --threads={FLAGS.sysbench_tables} --auto-inc=off '
-        '--create_secondary=true --db-driver=pgsql'
+        f' --threads={FLAGS.sysbench_tables//2} --auto-inc=off'
+        ' --create_tables=false --create_secondary=true --db-driver=pgsql'
         ' --pgsql-host=/tmp prepare'
     )
 
@@ -595,6 +598,7 @@ def Prepare(benchmark_spec) -> List[sample.Sample]:
         'Sleeping for %d seconds now that loading has finished.',
         _SLEEP_SEC.value,
     )
+    time.sleep(_SLEEP_SEC.value)
   return load_samples
 
 
@@ -668,13 +672,33 @@ def _GetSysbenchRunCommand(
       '--max-requests=0',
       '--time=%d' % duration,
   ]
-  if _GetSysbenchTestParameter() == 'tpcc':
+  spanner_read_committed = (
+      db.engine_type == sql_engine_utils.SPANNER_POSTGRES
+      and _TXN_ISOLATION_LEVEL.value == 'RC'
+  )
+  if spanner_read_committed:
+    logging.warning(
+        'Spanner does not support RC isolation level, will ignore'
+        ' sysbench_txn_isolation_level flag and defaulting to SER .'
+    )
+  if (
+      _GetSysbenchTestParameter() == 'tpcc'
+      or db.engine_type == sql_engine_utils.SPANNER_POSTGRES
+  ) and not spanner_read_committed:
     run_cmd_tokens.append('--trx_level=%s' % _TXN_ISOLATION_LEVEL.value)
   run_cmd = ' '.join(run_cmd_tokens + _GetCommonSysbenchOptions(db) + ['run'])
   run_cmd = 'cd ~/sysbench/ && ' + run_cmd
   return run_cmd
 
 
+class PostgresConnectionError(Exception):
+  pass
+
+
+@vm_util.Retry(
+    max_retries=5,
+    retryable_exceptions=(PostgresConnectionError,),
+)
 def _IssueSysbenchCommand(vm, duration, benchmark_spec, sysbench_thread_count):
   """Issues a sysbench run command given a vm and a duration.
 
@@ -690,6 +714,11 @@ def _IssueSysbenchCommand(vm, duration, benchmark_spec, sysbench_thread_count):
 
   Returns:
     stdout, stderr: the result of the command.
+
+  Raises:
+    PostgresConnectionError: If a temporary failure in name resolution occurs
+      during the command execution.
+    errors.Benchmarks.RunError: If sysbench fails for any other reason.
   """
   stdout = ''
   stderr = ''
@@ -697,7 +726,20 @@ def _IssueSysbenchCommand(vm, duration, benchmark_spec, sysbench_thread_count):
     run_cmd = _GetSysbenchRunCommand(
         duration, benchmark_spec.relational_db, sysbench_thread_count
     )
-    stdout, stderr = vm.RobustRemoteCommand(run_cmd, timeout=duration + 60)
+    stdout, stderr = vm.RobustRemoteCommand(
+        run_cmd,
+        timeout=duration + 60,
+        ignore_failure=True,
+    )
+    for output in [stdout, stderr]:
+      if output and 'Temporary failure in name resolution' in output:
+        raise PostgresConnectionError(
+            'Temporary failure in name resolution, retrying'
+        )
+    if stderr:
+      raise errors.Benchmarks.RunError(
+          f'Failure when running sysbench:\n{stderr}'
+      )
     logging.info(
         'Sysbench results: \n stdout is:\n%s\nstderr is\n%s', stdout, stderr
     )
@@ -836,7 +878,13 @@ def Run(benchmark_spec):
     metadata['sysbench_thread_count'] = thread_count
     # The run phase is common across providers. The VMs[0] object contains all
     # information and states necessary to carry out the run.
-    results += _RunSysbench(client_vms, metadata, benchmark_spec, thread_count)
+    start_time = datetime.datetime.now()
+    current_results = _RunSysbench(
+        client_vms, metadata, benchmark_spec, thread_count
+    )
+    end_time = datetime.datetime.now()
+    current_results.extend(db.CollectMetrics(start_time, end_time))
+    results.extend(current_results)
   return results
 
 

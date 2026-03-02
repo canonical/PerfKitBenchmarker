@@ -33,7 +33,9 @@ from perfkitbenchmarker import background_tasks
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import relational_db
 from perfkitbenchmarker import relational_db_spec
+from perfkitbenchmarker import sample
 from perfkitbenchmarker import sql_engine_utils
+from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.configs import option_decoders
 from perfkitbenchmarker.configs import spec
 from perfkitbenchmarker.providers.gcp import util
@@ -75,6 +77,12 @@ flags.DEFINE_string(
     'The name of the static Cloud Spanner database. New '
     'database created if unset. cloud_spanner_instance flag is '
     'mandatory to use this flag.',
+)
+_MAX_COMMIT_DELAY = flags.DEFINE_integer(
+    'cloud_spanner_max_commit_delay',
+    None,
+    'A delay to batch writes to increase throughput but also increase latency.'
+    ' See https://cloud.google.com/spanner/docs/throughput-optimized-writes',
 )
 
 # Flags related to managed autoscaler
@@ -275,6 +283,7 @@ class GcpSpannerInstance(relational_db.BaseRelationalDb):
   CLOUD = 'GCP'
   IS_MANAGED = True
   REQUIRED_ATTRS = ['CLOUD', 'IS_MANAGED', 'ENGINE']
+  METRICS_COLLECTION_DELAY_SECONDS = CPU_API_DELAY_SECONDS
 
   def __init__(self, db_spec: SpannerSpec, **kwargs):
     super().__init__(db_spec, **kwargs)
@@ -413,6 +422,22 @@ class GcpSpannerInstance(relational_db.BaseRelationalDb):
     )
     cmd.flags['instance'] = self.instance_id
     stdout, stderr, _ = cmd.Issue(raise_on_failure=False)
+    return stdout, stderr
+
+  def RunDDLQuery(
+      self, sql_query: str, timeout: int = vm_util.DEFAULT_TIMEOUT
+  ) -> tuple[str, str]:
+    """Runs a DDL query on the database."""
+    cmd = util.GcloudCommand(
+        self, 'spanner', 'databases', 'ddl', 'update', self.database
+    )
+    cmd.flags['instance'] = self.instance_id
+    cmd.flags['ddl'] = sql_query
+    stdout, stderr, retcode = cmd.Issue(
+        raise_on_failure=False, timeout=timeout
+    )
+    if retcode != 0:
+      logging.error('Failed to run DDL query: %s', sql_query)
     return stdout, stderr
 
   def _Exists(self, instance_only: bool = False) -> bool:
@@ -576,7 +601,43 @@ class GcpSpannerInstance(relational_db.BaseRelationalDb):
       })
     else:
       metadata['gcp_spanner_node_count'] = self.nodes
+    if _MAX_COMMIT_DELAY.value:
+      metadata['gcp_spanner_max_commit_delay'] = _MAX_COMMIT_DELAY.value
     return metadata
+
+  def _GetMetricsToCollect(self) -> list[relational_db.MetricSpec]:
+    return [
+        util.GcpMetricSpec(
+            provider_name='spanner.googleapis.com/instance/storage/used_bytes',
+            sample_name='disk_bytes_used',
+            unit='GB',
+            conversion_func=lambda x: x / (1024 * 1024 * 1024),
+            project=self.project,
+            resource_filter=(
+                'resource.type="spanner_instance" AND'
+                f' resource.labels.instance_id="{self.instance_id}" AND'
+                f' resource.labels.project_id="{self.project}" AND'
+                ' metric.labels.storage_class="ssd"'
+            ),
+        )
+    ]
+
+  def _CollectProviderMetric(
+      self,
+      metric: relational_db.MetricSpec,
+      start_time: datetime.datetime,
+      end_time: datetime.datetime,
+      collect_percentiles: bool = False,
+  ) -> list[sample.Sample]:
+    assert isinstance(metric, util.GcpMetricSpec)
+    points = util.GetTimeSeries(
+        metric,
+        start_time,
+        end_time,
+    )
+    return self._CreateSamples(
+        points, metric.sample_name, metric.unit, collect_percentiles
+    )
 
   def GetAverageCpuUsage(
       self, duration_minutes: int, end_time: datetime.datetime

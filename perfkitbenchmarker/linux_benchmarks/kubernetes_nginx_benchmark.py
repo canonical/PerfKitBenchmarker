@@ -23,6 +23,7 @@ from perfkitbenchmarker import background_tasks
 from perfkitbenchmarker import configs
 from perfkitbenchmarker import data
 from perfkitbenchmarker.linux_benchmarks import nginx_benchmark
+from perfkitbenchmarker.resources.container_service import kubernetes_commands
 
 FLAGS = flags.FLAGS
 
@@ -66,7 +67,7 @@ kubernetes_nginx:
             machine_type: Standard_D4s_v5
   vm_groups:
     clients:
-      vm_spec: *default_single_core
+      vm_spec: *default_dual_core
       vm_count: 1
 """
 
@@ -123,7 +124,7 @@ def _PrepareCluster(benchmark_spec):
   if FLAGS.nginx_use_ssl:
     nginx_port = 443
 
-  benchmark_spec.container_cluster.ApplyManifest(
+  kubernetes_commands.ApplyManifest(
       'container/kubernetes_nginx/kubernetes_nginx.yaml.j2',
       nginx_image=container_image,
       nginx_replicas=replicas,

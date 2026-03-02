@@ -16,14 +16,14 @@
 # pylint: disable=not-context-manager
 
 import builtins
+import contextlib
 import os
+import tempfile
 import unittest
 from unittest import mock
 
 from absl import flags as flgs
 from absl.testing import flagsaver
-import contextlib2
-from perfkitbenchmarker import container_service
 from perfkitbenchmarker import data
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import vm_util
@@ -31,16 +31,15 @@ from perfkitbenchmarker.configs import container_spec
 from perfkitbenchmarker.providers.gcp import gce_network
 from perfkitbenchmarker.providers.gcp import google_kubernetes_engine
 from perfkitbenchmarker.providers.gcp import util
+from perfkitbenchmarker.resources.container_service import container
+from perfkitbenchmarker.resources.container_service import kubectl
+from perfkitbenchmarker.resources.container_service import kubernetes_commands
 from tests import pkb_common_test_case
 
 FLAGS = flgs.FLAGS
 
 _COMPONENT = 'test_component'
 _RUN_URI = 'abc9876'
-_NVIDIA_DRIVER_SETUP_DAEMON_SET_SCRIPT = 'https://raw.githubusercontent.com/GoogleCloudPlatform/container-engine-accelerators/master/nvidia-driver-installer/cos/daemonset-preloaded.yaml'
-_NVIDIA_UNRESTRICTED_PERMISSIONS_DAEMON_SET = (
-    'nvidia_unrestricted_permissions_daemonset.yml'
-)
 
 _INSTANCE_GROUPS_LIST_OUTPUT = (
     '../../../tests/data/gcloud_compute_instance_groups_list_instances.json'
@@ -59,9 +58,9 @@ items:
 """
 
 
-@contextlib2.contextmanager
+@contextlib.contextmanager
 def patch_critical_objects(stdout='', stderr='', return_code=0, flags=FLAGS):
-  with contextlib2.ExitStack() as stack:
+  with contextlib.ExitStack() as stack:
     flags.gcloud_path = 'gcloud'
     flags.run_uri = _RUN_URI
     flags.data_search_paths = ''
@@ -102,7 +101,7 @@ def patch_critical_objects(stdout='', stderr='', return_code=0, flags=FLAGS):
 
 class GoogleContainerRegistryTestCase(pkb_common_test_case.PkbCommonTestCase):
 
-  class FakeContainerImage(container_service.ContainerImage):
+  class FakeContainerImage(container.ContainerImage):
 
     def __init__(self, name):
       self.name = name
@@ -112,7 +111,7 @@ class GoogleContainerRegistryTestCase(pkb_common_test_case.PkbCommonTestCase):
     super().setUp()
     self.enter_context(
         mock.patch.object(
-            google_kubernetes_engine.container_service,
+            container,
             'ContainerImage',
             self.FakeContainerImage,
         )
@@ -167,6 +166,7 @@ class GoogleKubernetesEngineCustomMachineTypeTestCase(
                     'zone': 'us-west1-a',
                 },
             },
+            'poll_for_events': False,
         },
     )
     return kubernetes_engine_spec
@@ -224,7 +224,7 @@ class GoogleKubernetesEngineTestCase(pkb_common_test_case.PkbCommonTestCase):
       self.assertIn('--min-cpu-platform skylake', command_string)
       self.assertIn('--disk-size 200', command_string)
       self.assertIn('--disk-type foo', command_string)
-      self.assertIn('--local-ssd-count 2', command_string)
+      self.assertIn('--ephemeral-storage-local-ssd count=2', command_string)
       self.assertIn('--no-enable-shielded-nodes', command_string)
       self.assertIn('--labels foo=bar,timeout=yesterday', command_string)
 
@@ -261,7 +261,7 @@ class GoogleKubernetesEngineTestCase(pkb_common_test_case.PkbCommonTestCase):
   def testPostCreate(self):
     spec = self.create_kubernetes_engine_spec()
     with patch_critical_objects() as issue_command, mock.patch.object(
-        container_service, 'RunKubectlCommand'
+        kubectl, 'RunKubectlCommand'
     ) as mock_kubectl_command:
       cluster = google_kubernetes_engine.GkeCluster(spec)
       cluster._PostCreate()
@@ -283,7 +283,7 @@ class GoogleKubernetesEngineTestCase(pkb_common_test_case.PkbCommonTestCase):
       cluster._Delete()
       command_string = ' '.join(issue_command.call_args[0][0])
 
-      self.assertEqual(issue_command.call_count, 4)
+      self.assertEqual(issue_command.call_count, 5)
       self.assertIn(
           'gcloud container clusters delete pkb-{}'.format(_RUN_URI),
           command_string,
@@ -313,7 +313,7 @@ class GoogleKubernetesEngineTestCase(pkb_common_test_case.PkbCommonTestCase):
       expected = {
           'project': 'fakeproject',
           'gce_local_ssd_count': 2,
-          'gce_local_ssd_interface': 'SCSI',
+          'gce_local_ssd_interface': 'NVME',
           'machine_type': 'fake-machine-type',
           'boot_disk_type': 'foo',
           'boot_disk_size': 200,
@@ -512,7 +512,7 @@ class GoogleKubernetesEngineWithGpusTestCase(
 ):
 
   @staticmethod
-  def create_kubernetes_engine_spec():
+  def create_kubernetes_engine_spec(gpu_type):
     kubernetes_engine_spec = container_spec.ContainerClusterSpec(
         'NAME',
         **{
@@ -520,18 +520,20 @@ class GoogleKubernetesEngineWithGpusTestCase(
             'vm_spec': {
                 'GCP': {
                     'machine_type': 'fake-machine-type',
-                    'gpu_type': 'k80',
+                    'gpu_type': gpu_type,
                     'gpu_count': 2,
                     'zone': 'us-west1-a',
                 },
             },
             'vm_count': 2,
+            'poll_for_events': False,
         },
     )
     return kubernetes_engine_spec
 
+  @flagsaver.flagsaver(gke_gpu_driver_version='latest')
   def testCreate(self):
-    spec = self.create_kubernetes_engine_spec()
+    spec = self.create_kubernetes_engine_spec('k80')
     with patch_critical_objects() as issue_command:
       cluster = google_kubernetes_engine.GkeCluster(spec)
       cluster._Create()
@@ -542,14 +544,30 @@ class GoogleKubernetesEngineWithGpusTestCase(
       self.assertIn('--num-nodes 2', command_string)
       self.assertIn('--machine-type fake-machine-type', command_string)
       self.assertIn(
-          '--accelerator type=nvidia-tesla-k80,count=2', command_string
+          '--accelerator '
+          + 'type=nvidia-tesla-k80,count=2,gpu-driver-version=latest',
+          command_string,
       )
 
-  @mock.patch('perfkitbenchmarker.kubernetes_helper.CreateFromFile')
+  def testCreateGpuH100(self):
+    spec = self.create_kubernetes_engine_spec('h100')
+    with patch_critical_objects() as issue_command:
+      cluster = google_kubernetes_engine.GkeCluster(spec)
+      cluster._Create()
+      command_string = ' '.join(issue_command.call_args[0][0])
+      self.assertIn(
+          '--accelerator '
+          'type=nvidia-h100-80gb,count=2,gpu-driver-version=default',
+          command_string,
+      )
+
+  @mock.patch(
+      'perfkitbenchmarker.resources.container_service.kubernetes_commands.CreateFromFile'
+  )
   def testPostCreate(self, create_from_file_patch):
-    spec = self.create_kubernetes_engine_spec()
+    spec = self.create_kubernetes_engine_spec('k80')
     with patch_critical_objects() as issue_command, mock.patch.object(
-        container_service, 'RunKubectlCommand'
+        kubectl, 'RunKubectlCommand'
     ) as mock_kubectl_command:
       cluster = google_kubernetes_engine.GkeCluster(spec)
       cluster._PostCreate()
@@ -563,20 +581,6 @@ class GoogleKubernetesEngineWithGpusTestCase(
       self.assertIn('KUBECONFIG', issue_command.call_args[1]['env'])
 
       self.assertEqual(mock_kubectl_command.call_count, 1)
-
-      expected_args_to_create_from_file = (
-          _NVIDIA_DRIVER_SETUP_DAEMON_SET_SCRIPT,
-          data.ResourcePath(_NVIDIA_UNRESTRICTED_PERMISSIONS_DAEMON_SET),
-      )
-      expected_calls = [
-          mock.call(arg) for arg in expected_args_to_create_from_file
-      ]
-
-      # Assert that create_from_file was called twice,
-      # and that the args were as expected (should be the NVIDIA
-      # driver setup daemon set, followed by the
-      # NVIDIA unrestricted permissions daemon set.
-      create_from_file_patch.assert_has_calls(expected_calls)
 
 
 class GoogleKubernetesEngineGetNodesTestCase(GoogleKubernetesEngineTestCase):
@@ -599,6 +603,29 @@ class GoogleKubernetesEngineGetNodesTestCase(GoogleKubernetesEngineTestCase):
           'gke-pkb-0c47e6fa-test-efea7796-grp',
       }
       self.assertEqual(expected, set(instance_groups))  # order doesn't matter
+
+  def testGetNodePoolNames(self):
+    output = ['default-pool', 'nap-e2-standard-2-iu4vquho', 'test-pool']
+    spec = self.create_kubernetes_engine_spec()
+    with patch_critical_objects(stdout='\n'.join(output)) as issue_command:
+      cluster = google_kubernetes_engine.GkeCluster(spec)
+      node_pools = cluster.GetNodePoolNames()
+
+      command_string = ' '.join(issue_command.call_args[0][0])
+      self.assertEqual(issue_command.call_count, 1)
+      self.assertIn(
+          'gcloud container clusters describe ' + cluster.name,
+          command_string,
+      )
+      self.assertIn('--flatten', command_string)
+      self.assertIn('--format', command_string)
+
+      expected = {
+          'default-pool',
+          'nap-e2-standard-2-iu4vquho',
+          'test-pool',
+      }
+      self.assertEqual(expected, set(node_pools))  # order doesn't matter
 
 
 class GoogleKubernetesEngineRegionalTestCase(
@@ -802,6 +829,69 @@ class GoogleKubernetesEngineAutopilotTestCase(
           },
           metadata,
       )
+
+  @flagsaver.flagsaver(gpu_type='h100', gpu_count=1, run_uri='123')
+  def testApplyYamlGpusH100(self):
+    self.enter_context(
+        mock.patch(
+            gce_network.__name__ + '.GceFirewall.GetFirewall',
+            return_value='fakefirewall',
+        )
+    )
+    self.enter_context(
+        mock.patch.object(
+            vm_util,
+            'GetTempDir',
+            return_value=tempfile.gettempdir(),
+        )
+    )
+    self.enter_context(
+        mock.patch(
+            gce_network.__name__ + '.GceNetwork.GetNetwork',
+            return_value=gce_network.GceNetwork(
+                gce_network.GceNetworkSpec('fakeproject', zone='us-central1-a')
+            ),
+        )
+    )
+    self.MockIssueCommand(
+        {'apply -f': [('deployment.apps/test-deployment hello', '', 0)]}
+    )
+    self.enter_context(
+        mock.patch.object(
+            data,
+            'ResourcePath',
+            return_value=os.path.join(
+                os.path.dirname(__file__),
+                '..',
+                '..',
+                'data',
+                'kube_apply.yaml.j2',
+            ),
+        )
+    )
+    spec = self.create_kubernetes_engine_spec()
+    with self.assertLogs(level='INFO') as logs:
+      cluster = google_kubernetes_engine.GkeAutopilotCluster(spec)
+      yamls = kubernetes_commands.ConvertManifestToYamlDicts(
+          'tests/data/kube_apply.yaml.j2',
+          name='hello-world',
+          command=[],
+      )
+      cluster.ModifyPodSpecPlacementYaml(
+          yamls,
+          'hello-world',
+      )
+      kubernetes_commands.ApplyYaml(
+          yamls,
+          should_log_file=True,
+      )
+    full_logs = ';'.join(logs.output)
+    self.assertIn("cloud.google.com/gke-accelerator-count: '1'", full_logs)
+    self.assertIn(
+        'cloud.google.com/gke-accelerator: nvidia-h100-80gb', full_logs
+    )
+    self.assertIn('cloud.google.com/gke-gpu-driver-version: default', full_logs)
+    self.assertIn('cloud.google.com/compute-class: Accelerator', full_logs)
 
 
 if __name__ == '__main__':

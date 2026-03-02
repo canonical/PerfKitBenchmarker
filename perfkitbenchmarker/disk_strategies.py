@@ -20,6 +20,7 @@ There are two types of diks strategies.
                           virtual machine should create the disk resource.
 2. SetUpDiskStrategy - This strategy controls how a disk are set up.
 """
+
 import copy
 import json
 import logging
@@ -30,6 +31,7 @@ from absl import flags
 from perfkitbenchmarker import background_tasks
 from perfkitbenchmarker import context as pkb_context
 from perfkitbenchmarker import disk
+from perfkitbenchmarker import lustre_service
 from perfkitbenchmarker import nfs_service
 from perfkitbenchmarker import os_types
 from perfkitbenchmarker import vm_util
@@ -104,7 +106,9 @@ class EmptyCreateDiskStrategy(CreateDiskStrategy):
   """Strategies to create nothing. Useful when there is no resource disk."""
 
   # pylint: disable=super-init-not-called
-  def __init__(self, vm: Any, disk_spec: disk.BaseDiskSpec, disk_count: int):
+  def __init__(
+      self, vm: Any, disk_spec: disk.BaseDiskSpec | None, disk_count: int
+  ):
     self.disk_spec = disk_spec
     self.disk_count = disk_count
     self.vm = vm
@@ -172,13 +176,13 @@ class SetUpDiskStrategy:
     )
 
   def GetTotalDiskCount(self) -> int:
-    total_disks = 0
+    remote_disks = 0
     for scratch_disk in self.scratch_disks:
       if isinstance(scratch_disk, disk.StripedDisk):
-        total_disks += len(scratch_disk.disks)
+        remote_disks += len(scratch_disk.disks)
       else:
-        total_disks += 1
-    return total_disks
+        remote_disks += 1
+    return remote_disks + self.vm.max_local_disks
 
   def CheckDisksVisibility(self):
     """Checks for all the disks to be visible from the VM.
@@ -198,7 +202,7 @@ class SetUpDiskStrategy:
       max_retries=200,
       retryable_exceptions=(DisksAreNotVisibleError,),
   )
-  def WaitForDisksToVisibleFromVm(self, start_time) -> float:
+  def WaitForRemoteDisksToVisibleFromVm(self, start_time) -> float:
     """Waits for the disks to be visible from the Guest.
 
     Args:
@@ -213,7 +217,6 @@ class SetUpDiskStrategy:
     # not implemented for Windows
     if self.vm.OS_TYPE not in os_types.LINUX_OS_TYPES:
       return -1
-    self.CheckDisksVisibility()
     if not self.CheckDisksVisibility():
       raise DisksAreNotVisibleError('Disks not visible')
     return time.time() - start_time
@@ -275,6 +278,37 @@ class SetUpNFSDiskStrategy(SetUpDiskStrategy):
     )
 
     self.vm.scratch_disks.append(nfs_disk)
+
+
+class SetUpLustreDiskStrategy(SetUpDiskStrategy):
+  """Strategies to set up Lustre disks."""
+
+  def __init__(
+      self,
+      vm,
+      disk_spec: disk.BaseDiskSpec,
+      lustre: lustre_service.BaseLustreService | None = None,
+  ):
+    super().__init__(vm, disk_spec)
+    if lustre:
+      self.lustre_service = lustre
+    else:
+      self.lustre_service = getattr(
+          pkb_context.GetThreadBenchmarkSpec(), 'lustre_service'
+      )
+
+  def SetUpDiskOnLinux(self):
+    """Performs Linux specific setup of Lustre disk."""
+    lustre_disk = self.lustre_service.CreateLustreDisk()
+    self.vm.MountDisk(
+        self.lustre_service.GetMountPoint(),
+        self.disk_spec.mount_point,
+        self.disk_spec.disk_type,
+        lustre_disk.mount_options,
+        lustre_disk.fstab_options,
+    )
+
+    self.vm.scratch_disks.append(lustre_disk)
 
 
 class SetUpSMBDiskStrategy(SetUpDiskStrategy):
@@ -475,7 +509,9 @@ class PrepareScratchDiskStrategy:
       logging.info('Temp DB is not supported on this cloud')
       return []
 
-    clause = ' -or '.join([f'($_.FriendlyName -eq "{name}")' for name in names])
+    clause = ' -or '.join(
+        [f'($_.FriendlyName -like "{name}")' for name in names]
+    )
     clause = '{' + clause + '}'
 
     # Select the DeviceID from the output
@@ -552,7 +588,7 @@ class DetachDiskStrategy:
       True : if all the disks are detached from the VM
     """
     non_boot_disks_attached = GetNonBootDiskCount(self.vm)
-    if non_boot_disks_attached == 0:
+    if non_boot_disks_attached - self.vm.max_local_disks == 0:
       return True
     else:
       return False
@@ -572,7 +608,6 @@ class DetachDiskStrategy:
     Raises:
       DisksAreNotDetachedError: if any disk is visible.
     """
-    self.CheckDisksDetach()
     if not self.CheckDisksDetach():
       raise DisksAreNotDetachedError('Disks not visible')
     return time.time()

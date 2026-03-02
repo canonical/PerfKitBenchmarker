@@ -16,15 +16,19 @@
 
 import builtins
 import contextlib
+import datetime
+import inspect
 import json
 import os
 import unittest
 from absl import flags
+from google.cloud import monitoring_v3
+from google.cloud.monitoring_v3 import types
 import mock
 from perfkitbenchmarker import disk
 from perfkitbenchmarker import relational_db
 from perfkitbenchmarker import relational_db_spec
-from perfkitbenchmarker import virtual_machine
+from perfkitbenchmarker import virtual_machine_spec
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.providers.gcp import gce_virtual_machine
 from perfkitbenchmarker.providers.gcp import gcp_relational_db
@@ -106,7 +110,7 @@ def VmGroupSpec():
 class GcpMysqlRelationalDbTestCase(pkb_common_test_case.PkbCommonTestCase):
 
   def createMySQLSpecDict(self):
-    db_spec = virtual_machine.BaseVmSpec(
+    db_spec = virtual_machine_spec.BaseVmSpec(
         'NAME',
         **{
             'machine_type': 'db-n1-standard-1',
@@ -172,6 +176,48 @@ class GcpMysqlRelationalDbTestCase(pkb_common_test_case.PkbCommonTestCase):
       self.assertIn('--storage-size=50', command_string)
       self.assertIn('--backup', command_string)
       self.assertIn('--zone=us-west1-b', command_string)
+
+  def testDiskMetadata(self):
+    FLAGS['db_disk_throughput'].parse(1200)
+    FLAGS['db_disk_iops'].parse(10000)
+    test_spec = inspect.cleandoc("""
+    cluster_boot:
+      relational_db:
+        cloud: GCP
+        engine: mysql
+        engine_version: '5.7'
+        db_spec:
+          GCP:
+            machine_type: db-n1-standard-1
+            zone: us-west1-b
+        db_disk_spec:
+          GCP:
+            disk_size: 50
+        vm_groups:
+          clients:
+            vm_spec:
+              GCP:
+                machine_type: n1-standard-16
+                zone: us-central1-c
+            disk_spec:
+              GCP:
+                disk_size: 500
+                disk_type: pd-ssd
+    """)
+    spec = pkb_common_test_case.CreateBenchmarkSpecFromYaml(test_spec)
+    spec.ConstructRelationalDb()
+    with self.subTest('disk_iops'):
+      self.assertEqual(
+          spec.relational_db.spec.db_disk_spec.provisioned_iops, 10000
+      )
+    with self.subTest('disk_throughput'):
+      self.assertEqual(
+          spec.relational_db.spec.db_disk_spec.provisioned_throughput, 1200
+      )
+    with self.subTest('metadata'):
+      metadata = spec.relational_db.GetResourceMetadata()
+      self.assertEqual(metadata['disk_iops'], 10000)
+      self.assertEqual(metadata['disk_throughput_mb'], 1200)
 
   def testCorrectVmGroupsPresent(self):
     with PatchCriticalObjects():
@@ -277,8 +323,68 @@ class GcpMysqlRelationalDbTestCase(pkb_common_test_case.PkbCommonTestCase):
       db._PostCreate()
       self.assertEqual(db.endpoint, db.server_vm.internal_ip)
 
+  def testCollectMetrics(self):
+    db = CreateDbFromSpec(self.createMySQLSpecDict())
+    db.instance_id = 'pkb-db-instance-123'
+    db.project = 'fakeproject'
+    mock_response = types.ListTimeSeriesResponse(
+        time_series=[{
+            'metric': {
+                'type': 'cloudsql.googleapis.com/database/cpu/utilization'
+            },
+            'points': [
+                {
+                    'interval': {
+                        'start_time': {'seconds': 1764103200, 'nanos': 0},
+                        'end_time': {'seconds': 1764103200, 'nanos': 0},
+                    },
+                    'value': {'double_value': 0.1},
+                },
+                {
+                    'interval': {
+                        'start_time': {'seconds': 1764103260, 'nanos': 0},
+                        'end_time': {'seconds': 1764103260, 'nanos': 0},
+                    },
+                    'value': {'double_value': 0.2},
+                },
+            ],
+        }]
+    )
+    mock_client = mock.MagicMock()
+    mock_client.list_time_series.return_value = mock_response.time_series
+    self.enter_context(
+        mock.patch.object(
+            monitoring_v3,
+            'MetricServiceClient',
+            return_value=mock_client,
+        )
+    )
 
-class GcpPostgresRelationlDbTestCase(pkb_common_test_case.PkbCommonTestCase):
+    start_time = datetime.datetime(2025, 11, 26, 10, 0, 0)
+    end_time = datetime.datetime(2025, 11, 26, 10, 1, 0)
+    samples = db.CollectMetrics(start_time, end_time)
+
+    cpu_avg = next(
+        s for s in samples if s.metric == 'database_cpu_utilization_average'
+    )
+    cpu_min = next(
+        s for s in samples if s.metric == 'database_cpu_utilization_min'
+    )
+    cpu_max = next(
+        s for s in samples if s.metric == 'database_cpu_utilization_max'
+    )
+    cpu_p50 = next(
+        s for s in samples if s.metric == 'database_cpu_utilization_p50'
+    )
+
+    self.assertEqual(cpu_avg.value, 15.0)
+    self.assertEqual(cpu_avg.unit, '%')
+    self.assertEqual(cpu_min.value, 10.0)
+    self.assertEqual(cpu_max.value, 20.0)
+    self.assertEqual(cpu_p50.value, 15.0)
+
+
+class GcpPostgresRelationalDbTestCase(pkb_common_test_case.PkbCommonTestCase):
 
   def setUp(self):
     super().setUp()

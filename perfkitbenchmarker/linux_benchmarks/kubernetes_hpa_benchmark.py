@@ -15,6 +15,7 @@
 
 from collections.abc import Callable
 import functools
+import logging
 import threading
 import typing
 from typing import Any, Dict, List
@@ -23,25 +24,23 @@ from absl import flags
 from perfkitbenchmarker import background_tasks
 from perfkitbenchmarker import benchmark_spec as bm_spec
 from perfkitbenchmarker import configs
-from perfkitbenchmarker import container_service
 from perfkitbenchmarker import errors
+from perfkitbenchmarker import virtual_machine
+from perfkitbenchmarker import vm_util
+from perfkitbenchmarker.linux_packages import http_poller
 from perfkitbenchmarker.linux_packages import locust
+from perfkitbenchmarker.resources.container_service import kubernetes_cluster
+from perfkitbenchmarker.resources.container_service import kubernetes_commands
 from perfkitbenchmarker.sample import Sample
 
 FLAGS = flags.FLAGS
-
-flags.DEFINE_string(
-    'kubernetes_hpa_runtime_class_name',
-    None,
-    'A custom runtimeClassName to apply to the pods.',
-)
 
 BENCHMARK_NAME = 'kubernetes_hpa'
 BENCHMARK_CONFIG = """
 kubernetes_hpa:
   description: Benchmarks how quickly hpa reacts to load
   vm_groups:
-    default:
+    clients:
       vm_spec: *default_dual_core
       vm_count: 1
   container_specs:
@@ -53,10 +52,18 @@ kubernetes_hpa:
     type: Kubernetes
     min_vm_count: 3
     max_vm_count: 50
-    vm_spec: *default_dual_core
+    vm_spec:
+      <<: *default_dual_core
+      GCP:
+        machine_type: n4-standard-2
+        zone: us-central1-a,us-central1-b,us-central1-c
+        image: null
   flags:
     locust_path: locust/rampup.py
 """
+
+_PORT = 5000
+_HEALTH_PATH = '/calculate'
 
 
 def GetConfig(user_config: Dict[str, Any]) -> Dict[str, Any]:
@@ -73,69 +80,67 @@ def GetConfig(user_config: Dict[str, Any]) -> Dict[str, Any]:
   return config
 
 
-def _PrepareCluster(benchmark_spec: bm_spec.BenchmarkSpec):
+def PrepareCluster(benchmark_spec: bm_spec.BenchmarkSpec, manifest_path: str):
   """Prepares a cluster to run the hpa benchmark."""
-  cluster: container_service.KubernetesCluster = (
+  cluster: kubernetes_cluster.KubernetesCluster = (
       benchmark_spec.container_cluster
   )
   fib_image = benchmark_spec.container_specs['kubernetes_fib'].image
 
-  cluster.ApplyManifest(
-      'container/kubernetes_hpa/fib.yaml.j2',
+  yaml_docs = kubernetes_commands.ConvertManifestToYamlDicts(
+      manifest_path,
       fib_image=fib_image,
-      runtime_class_name=FLAGS.kubernetes_hpa_runtime_class_name,
+      port=_PORT,
+  )
+  cluster.ModifyPodSpecPlacementYaml(
+      yaml_docs,
+      'fib',
+  )
+  kubernetes_commands.ApplyYaml(yaml_docs)
+
+  kubernetes_commands.WaitForResource(
+      'deploy/fib', 'available', namespace='fib'
   )
 
-  cluster.WaitForResource('deploy/fib', 'available', namespace='fib')
-  cluster.WaitForResource(
-      'service/fib',
-      '{.status.loadBalancer.ingress[0].ip}',
-      namespace='fib',
-      condition_type='jsonpath=',
-  )
 
-
-def _PrepareLocust(benchmark_spec: bm_spec.BenchmarkSpec):
+def PrepareLocust(benchmark_spec: bm_spec.BenchmarkSpec):
   """Prepares a vm to run locust."""
   vm = benchmark_spec.vms[0]
+  vm.Install('http_poller')
   locust.Install(vm)
   locust.Prep(vm)
 
 
-def Prepare(benchmark_spec: bm_spec.BenchmarkSpec):
+def Prepare(
+    benchmark_spec: bm_spec.BenchmarkSpec,
+    manifest_path: str = 'container/kubernetes_hpa/fib.yaml.j2',
+):
   """Install fib workload (and associated hpa) on the K8s Cluster.
 
   Args:
     benchmark_spec: The benchmark specification. Contains all data that is
       required to run the benchmark.
+    manifest_path: The manifest to apply.
   """
 
   prepare_fns = [
-      functools.partial(_PrepareCluster, benchmark_spec),
-      functools.partial(_PrepareLocust, benchmark_spec),
+      functools.partial(PrepareCluster, benchmark_spec, manifest_path),
+      functools.partial(PrepareLocust, benchmark_spec),
   ]
 
   background_tasks.RunThreaded(lambda f: f(), prepare_fns)
 
 
 def Run(benchmark_spec: bm_spec.BenchmarkSpec) -> List[Sample]:
-  """Run a benchmark against the Nginx server."""
-
-  # Get the SUT address
-  stdout, _, _ = container_service.RunKubectlCommand([
-      'get',
-      '-n',
-      'fib',
-      'svc/fib',
-      '-o',
-      "jsonpath='{.status.loadBalancer.ingress[0].ip}'",
-  ])
-  addr = 'http://' + stdout.strip() + ':5000'
-
+  """Run a benchmark against the fibonacci server."""
   vm = benchmark_spec.vms[0]
-  cluster: container_service.KubernetesCluster = typing.cast(
-      container_service.KubernetesCluster, benchmark_spec.container_cluster
+  cluster: kubernetes_cluster.KubernetesCluster = typing.cast(
+      kubernetes_cluster.KubernetesCluster, benchmark_spec.container_cluster
   )
+  addr = cluster.DeployIngress('fib', 'fib', _PORT, _HEALTH_PATH)
+
+  # Confirm the server can be pinged.
+  PollServer(vm, addr)
 
   samples = []
   stop = threading.Event()
@@ -150,14 +155,27 @@ def Run(benchmark_spec: bm_spec.BenchmarkSpec) -> List[Sample]:
   background_tasks.RunThreaded(
       lambda f: f(),
       [
-          lambda: kmc.ObserveNumReplicas(cluster, 'deploy/fib', 'fib'),
-          lambda: kmc.ObserveNumNodes(cluster),
+          lambda: kmc.ObserveNumReplicas('deploy/fib', 'fib'),
+          kmc.ObserveNumNodes,
           RunLocust,
       ],
       max_concurrent_threads=3,
   )
 
   return samples
+
+
+@vm_util.Retry(
+    retryable_exceptions=(errors.Resource.RetryableGetError,),
+)
+def PollServer(vm: virtual_machine.BaseVirtualMachine, addr: str) -> None:
+  """Polls the server to confirm it is responding."""
+  poller = http_poller.HttpPoller()
+  response = poller.Run(vm, addr + '/calculate')
+  if not response.success:
+    raise errors.Resource.RetryableGetError(
+        'Failed to contact server; got failing response: %s' % response
+    )
 
 
 class KubernetesMetricsCollector:
@@ -176,7 +194,6 @@ class KubernetesMetricsCollector:
 
   def ObserveNumReplicas(
       self,
-      cluster: container_service.KubernetesCluster,
       resource_name: str,
       namespace: str = '',
   ) -> None:
@@ -188,19 +205,19 @@ class KubernetesMetricsCollector:
     is signaled.
 
     Args:
-      cluster: The cluster in question.
       resource_name: The deployment/statefulset/etc's name, e.g.
         'deployment/my_deployment'.
       namespace: The namespace of the resource. If omitted, the 'default'
         namespace will be used.
     """
     self._Observe(
-        lambda: cluster.GetNumReplicasSamples(resource_name, namespace)
+        lambda: kubernetes_commands.GetNumReplicasSamples(
+            resource_name, namespace
+        )
     )
 
   def ObserveNumNodes(
       self,
-      cluster: container_service.KubernetesCluster,
   ) -> None:
     """Periodically samples the number of nodes.
 
@@ -208,11 +225,8 @@ class KubernetesMetricsCollector:
 
     Expected to be run in a background thread. Never completes until self._stop
     is signaled.
-
-    Args:
-      cluster: The cluster in question.
     """
-    self._Observe(cluster.GetNumNodesSamples)
+    self._Observe(kubernetes_commands.GetNumNodesSamples)
 
   def _Observe(
       self,
@@ -225,14 +239,29 @@ class KubernetesMetricsCollector:
     Args:
       observe_fn: The function to call.
     """
+    success_count = 0
+    failure_count = 0
     while True:
       try:
         self._samples.extend(observe_fn())
-      except errors.VmUtil.IssueCommandTimeoutError:
-        # Ignore timeouts - there'll be a gap in the data, but that's ok.
-        pass
+        success_count += 1
+      except (
+          errors.VmUtil.IssueCommandError,
+          errors.VmUtil.IssueCommandTimeoutError,
+      ) as e:
+        # Ignore errors, timeouts - there'll be a gap in the data, but that's
+        # ok.
+        logging.warning(
+            'Ignoring exception that occurred while observing cluster: %s', e
+        )
+        failure_count += 1
 
       if self._stop.wait(timeout=1.0):
+        if success_count + failure_count == 0:
+          raise AssertionError(
+              'Unexpected: no successful OR unsuccessful attempts occurred?'
+          )
+        assert success_count / (success_count + failure_count) >= 0.90
         return
 
 

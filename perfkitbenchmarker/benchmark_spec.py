@@ -21,6 +21,7 @@ import logging
 import os
 import pickle
 import threading
+import time
 from typing import Any
 import uuid
 
@@ -30,7 +31,6 @@ from perfkitbenchmarker import benchmark_status
 from perfkitbenchmarker import capacity_reservation
 from perfkitbenchmarker import cloud_tpu
 from perfkitbenchmarker import cluster
-from perfkitbenchmarker import container_service
 from perfkitbenchmarker import context
 from perfkitbenchmarker import data_discovery_service
 from perfkitbenchmarker import disk
@@ -42,6 +42,7 @@ from perfkitbenchmarker import errors
 from perfkitbenchmarker import flag_util
 from perfkitbenchmarker import flags as pkb_flags
 from perfkitbenchmarker import key as cloud_key
+from perfkitbenchmarker import lustre_service
 from perfkitbenchmarker import managed_memory_store
 from perfkitbenchmarker import messaging_service
 from perfkitbenchmarker import nfs_service
@@ -52,7 +53,6 @@ from perfkitbenchmarker import provider_info
 from perfkitbenchmarker import providers
 from perfkitbenchmarker import relational_db
 from perfkitbenchmarker import resource as resource_type
-from perfkitbenchmarker import resources  # pylint:disable=unused-import  # Load the __init__.py
 from perfkitbenchmarker import smb_service
 from perfkitbenchmarker import stages
 from perfkitbenchmarker import static_virtual_machine as static_vm
@@ -64,7 +64,11 @@ from perfkitbenchmarker.configs import freeze_restore_spec
 from perfkitbenchmarker.resources import base_job
 from perfkitbenchmarker.resources import example_resource
 from perfkitbenchmarker.resources import managed_ai_model
+from perfkitbenchmarker.resources.container_service import container_cluster
+from perfkitbenchmarker.resources.container_service import container_registry
+from perfkitbenchmarker.resources.container_service import kubernetes_cluster
 from perfkitbenchmarker.resources.pinecone import pinecone as pinecone_resource
+from perfkitbenchmarker.resources.vertex_vector_search import vvs as vvs_resource  # pylint: disable=line-too-long
 import six
 import six.moves._thread
 import six.moves.copyreg
@@ -180,7 +184,7 @@ class BenchmarkSpec:
     self.uuid = '%s-%s' % (FLAGS.run_uri, uuid.uuid4())
     self.always_call_cleanup = pkb_flags.ALWAYS_CALL_CLEANUP.value
     self.dpb_service: dpb_service.BaseDpbService = None
-    self.container_cluster: container_service.BaseContainerCluster = None
+    self.container_cluster: container_cluster.BaseContainerCluster = None
     self.cluster: cluster.BaseCluster = None
     self.key = None
     self.relational_db = None
@@ -191,11 +195,14 @@ class BenchmarkSpec:
     self.edw_service = None
     self.edw_compute_resource = None
     self.example_resource = None
+    self.multi_attach_disk = None
     self.nfs_service = None
+    self.lustre_service = None
     self.smb_service = None
     self.messaging_service = None
     self.ai_model = None
     self.pinecone = None
+    self.vvs = None
     self.memory_store = None
     self.data_discovery_service = None
     self.app_groups = {}
@@ -240,10 +247,18 @@ class BenchmarkSpec:
 
     # Modules can't be pickled, but functions can, so we store the functions
     # necessary to run the benchmark.
-    self.BenchmarkPrepare = benchmark_module.Prepare
+    self.BenchmarkPrepare = getattr(benchmark_module, 'Prepare', None)
+    self.BenchmarkPrepareSystem = getattr(
+        benchmark_module, 'PrepareSystem', None
+    )
+    self.BenchmarkInstallPackages = getattr(
+        benchmark_module, 'InstallPackages', None
+    )
+    self.BenchmarkStartServices = getattr(
+        benchmark_module, 'StartServices', None
+    )
     self.BenchmarkRun = benchmark_module.Run
     self.BenchmarkCleanup = benchmark_module.Cleanup
-
     # Set the current thread's BenchmarkSpec object to this one.
     context.SetThreadBenchmarkSpec(self)
 
@@ -292,8 +307,9 @@ class BenchmarkSpec:
 
   def ConstructResources(self):
     """Constructs the resources for the benchmark."""
-    self.ConstructContainerCluster()
+    # Put registry first, as it can be needed by cluster.
     self.ConstructContainerRegistry()
+    self.ConstructContainerCluster()
     # dpb service needs to go first, because it adds some vms.
     self.ConstructDpbService()
     self.ConstructCluster()
@@ -314,25 +330,33 @@ class BenchmarkSpec:
     self.ConstructBaseJob()
     self.ConstructVPNService()
     self.ConstructNfsService()
+    self.ConstructLustreService()
     self.ConstructSmbService()
     self.ConstructDataDiscoveryService()
     self.ConstructBaseJob()
     self.ConstructMemoryStore()
     self.ConstructPinecone()
+    self.ConstructVertexVectorSearch()
+    self.ConstructMultiAttachDisk()
 
   def ConstructContainerCluster(self):
     """Create the container cluster."""
     if self.config.container_cluster is None:
       return
+
     cloud = self.config.container_cluster.cloud
     cluster_type = self.config.container_cluster.type
     providers.LoadProvider(cloud)
-    container_cluster_class = container_service.GetContainerClusterClass(
+    container_cluster_class = container_cluster.GetContainerClusterClass(
         cloud, cluster_type
     )
     self.container_cluster = container_cluster_class(
         self.config.container_cluster
     )
+
+    if self.container_registry:
+      self.container_cluster.SetContainerRegistry(self.container_registry)
+
     self.resources.append(self.container_cluster)
 
   def ConstructCluster(self):
@@ -344,8 +368,7 @@ class BenchmarkSpec:
     cluster_class = cluster.GetClusterClass(cloud)
     self.cluster = cluster_class(self.config.cluster)
     self.resources.append(self.cluster)
-    self.vms_to_boot.update(
-        self.cluster.ExportVmGroupsForUnmanagedProvision())
+    self.vms_to_boot.update(self.cluster.ExportVmGroupsForUnmanagedProvision())
 
   def ConstructContainerRegistry(self):
     """Create the container registry."""
@@ -353,7 +376,7 @@ class BenchmarkSpec:
       return
     cloud = self.config.container_registry.cloud
     providers.LoadProvider(cloud)
-    container_registry_class = container_service.GetContainerRegistryClass(
+    container_registry_class = container_registry.GetContainerRegistryClass(
         cloud
     )
     self.container_registry = container_registry_class(
@@ -499,6 +522,11 @@ class BenchmarkSpec:
     self.edw_service = edw_service_class(
         self.config.edw_service
     )  # pytype: disable=not-instantiable
+    if self.container_cluster:
+      assert isinstance(
+          self.container_cluster, kubernetes_cluster.KubernetesCluster
+      )
+      self.edw_service.SetContainerCluster(self.container_cluster)
 
   def ConstructEdwComputeResource(self):
     """Create an edw_compute_resource object."""
@@ -518,7 +546,7 @@ class BenchmarkSpec:
     self.resources.append(self.edw_compute_resource)
 
   def ConstructExampleResource(self):
-    """Create an example_resource object. Also call this from pkb.py."""
+    """Create an example_resource object."""
     if self.config.example_resource is None:
       return
     example_resource_type = self.config.example_resource.example_type
@@ -545,12 +573,14 @@ class BenchmarkSpec:
     self.resources.append(self.base_job)
 
   def ConstructManagedAiModel(self):
-    """Create an example_resource object. Also call this from pkb.py."""
+    """Create an example_resource object."""
     if self.config.ai_model is None:
       return
     cloud = self.config.ai_model.cloud
     providers.LoadProvider(cloud)
-    model_class = managed_ai_model.GetManagedAiModelClass(cloud)
+    model_class = managed_ai_model.GetManagedAiModelClass(
+        cloud, self.config.ai_model.interface
+    )
     assert self.vm_groups
     vm = self.vm_groups[
         'clients' if 'clients' in self.vm_groups else 'default'
@@ -561,7 +591,7 @@ class BenchmarkSpec:
     self.resources.append(self.ai_model)
 
   def ConstructPinecone(self):
-    """Create an example_resource object. Also call this from pkb.py."""
+    """Create an example_resource object."""
     if self.config.pinecone is None:
       return
     cloud = self.config.pinecone.cloud
@@ -572,6 +602,17 @@ class BenchmarkSpec:
     )  # pytype: disable=not-instantiable
     self.pinecone.SetVms(self.vm_groups)
     self.resources.append(self.pinecone)
+
+  def ConstructVertexVectorSearch(self):
+    """Construct the Vertex Vector Search instance."""
+    if self.config.vvs is None:
+      return
+    cloud = self.config.vvs.cloud
+    providers.LoadProvider(cloud)
+    model_class = vvs_resource.GetVVSResourceClass(cloud)
+    self.vvs = model_class(self.config.vvs)  # pytype: disable=not-instantiable
+    self.vvs.SetVms(self.vm_groups)
+    self.resources.append(self.vvs)
 
   def ConstructMemoryStore(self):
     """Create the memory store instance."""
@@ -623,6 +664,29 @@ class BenchmarkSpec:
       logging.debug('NFS service %s', self.nfs_service)
       break
 
+  def ConstructLustreService(self):
+    """Construct the Lustre service object.
+
+    Creates an Lustre Service only if a Lustre disk is found in the disk_specs.
+    """
+    if self.lustre_service:
+      logging.info('Lustre service already created: %s', self.lustre_service)
+      return
+    for group_spec in self.vms_to_boot.values():
+      if not group_spec.disk_spec or not group_spec.vm_count:
+        continue
+      disk_spec = group_spec.disk_spec
+      if disk_spec.disk_type != disk.LUSTRE:
+        continue
+      # Choose which lustre_service to create.
+      cloud = group_spec.cloud
+      providers.LoadProvider(cloud)
+      lustre_class = lustre_service.GetLustreServiceClass(cloud)
+      self.lustre_service = lustre_class(
+          disk_spec, group_spec.vm_spec.zone
+      )  # pytype: disable=not-instantiable
+      break
+
   def ConstructSmbService(self):
     """Construct the SMB service object.
 
@@ -646,6 +710,33 @@ class BenchmarkSpec:
       )  # pytype: disable=not-instantiable
       logging.debug('SMB service %s', self.smb_service)
       break
+
+  def ConstructMultiAttachDisk(self):
+    """Construct the multi attach disk object."""
+    # Hdml is constructed after VM creation. The class is included here
+    # to enable multiple VMs in the same VM group to share the same HdML.
+    # It is deleted during DeleteScratchDisks.
+    if self.multi_attach_disk:
+      return
+    for group_spec in self.vms_to_boot.values():
+      if not group_spec.disk_spec:
+        continue
+      disk_spec = group_spec.disk_spec
+      if disk_spec.disk_type not in disk.MULTI_ATTACH_DISK_TYPES:
+        continue
+      if disk_spec.num_striped_disks > 1:
+        raise errors.Benchmarks.UnsupportedConfigError(
+            'Disk type %s allows only 1 striped disk.' % disk_spec.disk_type
+        )
+      cloud = group_spec.cloud
+      providers.LoadProvider(cloud)
+      disk_class = disk.GetMultiAttachDiskClass(cloud)
+      self.multi_attach_disk = disk_class(
+          disk_spec,
+          name=f'pkb-{FLAGS.run_uri}-data-0-0',
+          zone=group_spec.vm_spec.zone,
+          project=None,
+      )
 
   def ConstructVirtualMachineGroup(
       self, group_name, group_spec
@@ -898,21 +989,54 @@ class BenchmarkSpec:
     # do after network setup but before VM created
     if self.nfs_service and self.nfs_service.CLOUD != nfs_service.UNMANAGED:
       self.nfs_service.Create()
+    if self.lustre_service:
+      self.lustre_service.Create()
     if self.smb_service:
       self.smb_service.Create()
+    if self.multi_attach_disk:
+      self.multi_attach_disk.Create()
 
     for placement_group_object in self.placement_groups.values():
       placement_group_object.Create()
 
     if self.vms:
-      # We separate out creating, booting, and preparing the VMs into two phases
-      # so that we don't slow down the creation of all the VMs by running
-      # commands on the VMs that booted.
-      background_tasks.RunThreaded(
-          lambda vm: vm.CreateAndBoot(),
-          self.vms,
-          post_task_delay=FLAGS.create_and_boot_post_task_delay,
-      )
+      # Iterate through VM groups to apply potential provision_delay_seconds
+      # and then call CreateAndBoot for each group.
+      # Sorting by provision_order ensures a deterministic order if delays
+      # are intended to create a sequence.
+      for group_name in sorted(
+          self.vm_groups.keys(),
+          key=lambda x: self.vms_to_boot[x].provision_order,
+      ):
+        group_vms = self.vm_groups[group_name]
+        if not group_vms:
+          continue
+
+        group_spec = self.vms_to_boot[group_name]
+        provision_delay_seconds = getattr(
+            group_spec, 'provision_delay_seconds', 0
+        )
+        if provision_delay_seconds:
+          logging.info(
+              'Delaying provisioning of VM group %s by %s seconds.',
+              group_name,
+              provision_delay_seconds,
+          )
+          time.sleep(provision_delay_seconds)
+
+        post_task_delay = FLAGS.create_and_boot_post_task_delay
+        logging.info(
+            "Starting CreateAndBoot for VM group '%s' with"
+            ' post_task_delay: %s.',
+            group_name,
+            post_task_delay,
+        )
+        background_tasks.RunThreaded(
+            lambda vm: vm.CreateAndBoot(),
+            group_vms,
+            post_task_delay=post_task_delay,
+        )
+
       if self.nfs_service and self.nfs_service.CLOUD == nfs_service.UNMANAGED:
         self.nfs_service.Create()
       if not FLAGS.skip_vm_preparation:
@@ -934,8 +1058,8 @@ class BenchmarkSpec:
     if self.cluster:
       if self.cluster.unmanaged:
         self.cluster.ImportVmGroups(
-            self.vm_groups['headnode'][0],
-            self.vm_groups['workers'])
+            self.vm_groups['headnode'][0], self.vm_groups['workers']
+        )
       self.cluster.Create()
     if self.dpb_service:
       self.dpb_service.Create()
@@ -943,6 +1067,7 @@ class BenchmarkSpec:
       self.relational_db.SetVms(self.vm_groups)
       self.relational_db.Create(restore=should_restore)
     if self.non_relational_db:
+      self.non_relational_db.SetVms(self.vm_groups)
       self.non_relational_db.Create(restore=should_restore)
     if hasattr(self, 'key') and self.key:
       self.key.Create()
@@ -952,6 +1077,8 @@ class BenchmarkSpec:
       self.ai_model.Create()
     if self.pinecone:
       self.pinecone.Create()
+    if self.vvs:
+      self.vvs.Create()
     if self.edw_service:
       if (
           not self.edw_service.user_managed
@@ -1011,8 +1138,12 @@ class BenchmarkSpec:
       self.base_job.Delete()
     if self.nfs_service:
       self.nfs_service.Delete()
+    if self.lustre_service:
+      self.lustre_service.Delete()
     if self.smb_service:
       self.smb_service.Delete()
+    if self.multi_attach_disk:
+      self.multi_attach_disk.Delete()
     if hasattr(self, 'messaging_service') and self.messaging_service:
       self.messaging_service.Delete()
     if hasattr(self, 'memory_store') and self.memory_store:
@@ -1023,6 +1154,8 @@ class BenchmarkSpec:
       self.data_discovery_service.Delete()
     if hasattr(self, 'pinecone') and self.pinecone:
       self.pinecone.Delete()
+    if hasattr(self, 'vvs') and self.vvs:
+      self.vvs.Delete()
 
     # Note: It is ok to delete capacity reservations before deleting the VMs,
     # and will actually save money (mere seconds of usage).
@@ -1172,7 +1305,7 @@ class BenchmarkSpec:
     """Create a vm in zone.
 
     Args:
-      vm_spec: A virtual_machine.BaseVmSpec object.
+      vm_spec: A virtual_machine_spec.BaseVmSpec object.
       os_type: The type of operating system for the VM. See the flag of the same
         name for more information.
       cloud: The cloud for the VM. See the flag of the same name for more

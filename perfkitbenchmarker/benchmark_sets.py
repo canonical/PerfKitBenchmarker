@@ -87,7 +87,6 @@ BENCHMARK_SETS = {
             'benchmarks in parallel to measure Cloud performance.'
         ),
         BENCHMARK_LIST: [
-            'fio_netperf',
             'netperf_hammerdbcli',
         ],
     },
@@ -146,9 +145,7 @@ BENCHMARK_SETS = {
             'cassandra_ycsb',
             'cluster_boot',
             'copy_throughput',
-            'dpdk',
             'fio',
-            'fio_netperf',
             'gpu_pcie_bandwidth',
             'horovod',
             'hpcc',

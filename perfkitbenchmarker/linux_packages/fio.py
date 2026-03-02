@@ -32,7 +32,7 @@ FLAGS = flags.FLAGS
 
 FIO_DIR = '%s/fio' % linux_packages.INSTALL_DIR
 GIT_REPO = 'https://github.com/axboe/fio.git'
-GIT_TAG = 'fio-3.27'
+GIT_TAG = 'fio-3.39'
 FIO_PATH = FIO_DIR + '/fio'
 FIO_CMD_PREFIX = '%s --output-format=json' % FIO_PATH
 SECTION_REGEX = r'\[(\w+)\]\n([\w\d\n=*$/]+)'
@@ -52,7 +52,6 @@ HIST_BUCKET_START_IDX = 3
 FIO_HIST_LOG_PARSER_PATCH = 'fiologparser_hist.patch'
 FIO_HIST_LOG_PARSER_PATH = '%s/tools/hist' % FIO_DIR
 FIO_HIST_LOG_PARSER = 'fiologparser_hist.py'
-FIO_PATCH = FIO_DIR + '/fio.patch'
 
 
 def GetFioExec():
@@ -70,9 +69,6 @@ def _Install(vm):
     vm.RemoteCommand(f'sudo pip3 install {package}')
   vm.RemoteCommand('git clone {} {}'.format(GIT_REPO, FIO_DIR))
   vm.RemoteCommand('cd {} && git checkout {}'.format(FIO_DIR, GIT_TAG))
-
-  vm.PushDataFile('fio.patch', FIO_PATCH)
-  vm.RemoteCommand(f'cd {FIO_DIR} && patch -l -p1 < fio.patch')
 
   vm.RemoteCommand('cd {} && ./configure && make'.format(FIO_DIR))
   if flags.FLAGS.fio_hist_log:
@@ -270,11 +266,13 @@ def ParseResults(
               ('p5', _ConvertClat(percentiles['5.000000'])),
               ('p10', _ConvertClat(percentiles['10.000000'])),
               ('p20', _ConvertClat(percentiles['20.000000'])),
+              ('p25', _ConvertClat(percentiles['25.000000'])),
               ('p30', _ConvertClat(percentiles['30.000000'])),
               ('p40', _ConvertClat(percentiles['40.000000'])),
               ('p50', _ConvertClat(percentiles['50.000000'])),
               ('p60', _ConvertClat(percentiles['60.000000'])),
               ('p70', _ConvertClat(percentiles['70.000000'])),
+              ('p75', _ConvertClat(percentiles['75.000000'])),
               ('p80', _ConvertClat(percentiles['80.000000'])),
               ('p90', _ConvertClat(percentiles['90.000000'])),
               ('p95', _ConvertClat(percentiles['95.000000'])),

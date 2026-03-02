@@ -39,7 +39,7 @@ class AwsClusterTest(pkb_common_test_case.PkbCommonTestCase):
     vm_config = {
         'cloud': 'AWS',
         'os_type': 'ubuntu2004',
-        'vm_spec': {'AWS': {}}
+        'vm_spec': {'AWS': {'zone': 'us-fake-1a'}}
     }
     FLAGS.run_uri = 'run12345'
     self.cluster_spec = TestAwsClusterSpec(
@@ -95,7 +95,65 @@ Scheduling:
     Networking:
       SubnetIds:
       - subnet-456
-         ''', None, None)
+         ''', None, None),
+        ('''{
+    "InternetGateways": [
+        {
+            "InternetGatewayId": "igw-123"
+        }
+    ]
+}
+''', None, None),  # Internet Gateway
+        ('''{
+    "RouteTables": [
+        {
+            "Associations": [
+                {
+                    "Main": false
+                }
+            ],
+            "RouteTableId": "rtb-123"
+        },
+        {
+            "Associations": [
+                {
+                    "Main": true
+                }
+            ],
+            "RouteTableId": "rtb-456"
+        },
+        {
+            "Associations": [
+                {
+                    "Main": false
+                }
+            ],
+            "RouteTableId": "rtb-789"
+        }
+    ]
+}''', None, None),  # Route Table
+        ('''{
+    "NatGateways": [
+        {
+            "NatGatewayAddresses": [
+                {
+                    "NetworkInterfaceId": "eni-123"
+                }
+            ],
+            "NatGatewayId": "nat-123"
+        }
+    ]
+}
+''', None, None),  # Nat Gateway,
+        # Mock tagging
+        ('', None, None),
+        ('', None, None),
+        ('', None, None),
+        ('', None, None),
+        ('', None, None),
+        ('', None, None),
+        ('', None, None),
+        ('', None, None),
     ]
     self.cluster._CreateDependencies()
     self.assertEqual(
@@ -122,6 +180,10 @@ HeadNode:
   Ssh:
     KeyName: perfkit-key-run12345
   SharedStorageType: Ebs
+  Iam:
+    S3Access:
+      - BucketName: *
+        EnableWriteAccess: false
 Scheduling:
   Scheduler: slurm
   SlurmQueues:

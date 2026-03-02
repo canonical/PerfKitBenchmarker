@@ -27,6 +27,7 @@ from perfkitbenchmarker import background_tasks
 from perfkitbenchmarker import configs
 from perfkitbenchmarker.linux_benchmarks import mongodb_ycsb_benchmark
 from perfkitbenchmarker.linux_packages import ycsb
+from perfkitbenchmarker.resources.container_service import kubernetes_commands
 
 FLAGS = flags.FLAGS
 
@@ -77,7 +78,7 @@ kubernetes_mongodb:
             machine_type: Standard_D4s_v5
   vm_groups:
     clients:
-      vm_spec: *default_single_core
+      vm_spec: *default_dual_core
       os_type: ubuntu2204  # Python 2
       vm_count: null
 """
@@ -115,7 +116,7 @@ def _PrepareDeployment(benchmark_spec):
   """Deploys MongoDB Operator and instance on the cluster."""
   cluster = benchmark_spec.container_cluster
   storage_class = STORAGE_CLASS.value or cluster.GetDefaultStorageClass()
-  cluster.ApplyManifest(
+  kubernetes_commands.ApplyManifest(
       'container/kubernetes_mongodb/kubernetes_mongodb.yaml.j2',
       cpu_request=FLAGS.kubernetes_mongodb_cpu_request,
       memory_request=FLAGS.kubernetes_mongodb_memory_request,

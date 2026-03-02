@@ -19,17 +19,19 @@ import ntpath
 import os
 import time
 from typing import Tuple, cast
-
 from absl import flags
 from perfkitbenchmarker import background_tasks
 from perfkitbenchmarker import errors
+from perfkitbenchmarker import log_util
 from perfkitbenchmarker import os_mixin
 from perfkitbenchmarker import os_types
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker import windows_packages
+import requests
 import six
 import timeout_decorator
 import winrm
+
 
 FLAGS = flags.FLAGS
 
@@ -45,6 +47,20 @@ flags.DEFINE_bool(
     False,
     'Allows executables to be set to High (up from Normal) CPU priority '
     'through the SetProcessPriorityToHigh function.',
+)
+
+flags.DEFINE_integer(
+    'winrm_retries',
+    3,
+    'Default number of times to retry transient failures on WinRM commands.',
+    lower_bound=1,
+)
+
+flags.DEFINE_integer(
+    'winrm_retry_interval',
+    10,
+    'Default time to wait between retries on WinRM commands.',
+    lower_bound=1,
 )
 
 # Windows disk letter starts from C, use a larger disk letter for attached disk
@@ -84,6 +100,46 @@ STARTUP_SCRIPT = 'powershell -EncodedCommand {encoded_command}'.format(
 
 class WaitTimeoutError(Exception):
   """Exception thrown if a wait operation takes too long."""
+
+
+def winrm_retry(func):
+  """A decorator that applies vm_util.Retry with WinRM-specific flag settings.
+
+  This decorator is a "decorator factory" that, when applied to a method,
+  returns a vm_util.Retry decorator configured with the *runtime* values
+  of absl flags.
+
+  Args:
+    func: The function to decorate vm_util.Retry.
+
+  Returns:
+    A function that wraps functions in retry logic. It can be used as a
+    decorator.
+  """
+
+  def wrapper(self, *args, **kwargs):
+
+    retried_func = vm_util.Retry(
+        log_errors=False,
+        max_retries=FLAGS.winrm_retries,
+        poll_interval=FLAGS.winrm_retry_interval,
+        retryable_exceptions=(
+            WaitTimeoutError,
+            requests.exceptions.ConnectionError,
+        ),
+    )(func)
+
+    try:
+      return retried_func(self, *args, **kwargs)
+    except requests.exceptions.ConnectionError:
+      logging.warning(
+          'ConnectionError detected. The WinRM service on the VM'
+          ' may be down or restarting. Please check Windows Event Logs'
+          ' on the VM for details.'
+      )
+      raise
+
+  return wrapper
 
 
 class BaseWindowsMixin(os_mixin.BaseOsMixin):
@@ -149,12 +205,51 @@ class BaseWindowsMixin(os_mixin.BaseOsMixin):
       RemoteCommandError: If there was a problem issuing the command or the
           command timed out.
     """
-    logging.info('Running command on %s: %s', self, command, stacklevel=2)
-    s = winrm.Session(
-        'https://%s:%s' % (self.GetConnectionIp(), self.winrm_port),
-        auth=(self.user_name, self.password),
-        server_cert_validation='ignore',
+    return self.RemoteCommandWithReturnCode(
+        command, ignore_failure, timeout
+    )[:2]
+
+  @winrm_retry
+  def RemoteCommandWithReturnCode(
+      self,
+      command: str,
+      ignore_failure: bool = False,
+      timeout: float | None = None,
+  ) -> Tuple[str, str, int]:
+    """Runs a powershell command on the VM.
+
+    Args:
+      command: A valid powershell command.
+      ignore_failure: Ignore any failure if set to true.
+      timeout: Float. A timeout in seconds for the command. If None is passed,
+        no timeout is applied. Timeout kills the winrm session which then kills
+        the process being executed.
+
+    Returns:
+      A tuple of stdout, stderr, and return code from running the command.
+
+    Raises:
+      RemoteCommandError: If there was a problem issuing the command or the
+          command timed out.
+    """
+    log_util.LogToShortLogAndRoot(
+        f'Running command on {self}: {command}', stacklevel=2
     )
+    if timeout is None:
+      s = winrm.Session(
+          'https://%s:%s' % (self.GetConnectionIp(), self.winrm_port),
+          auth=(self.user_name, self.password),
+          server_cert_validation='ignore',
+      )
+    else:
+      s = winrm.Session(
+          'https://%s:%s' % (self.GetConnectionIp(), self.winrm_port),
+          auth=(self.user_name, self.password),
+          server_cert_validation='ignore',
+          read_timeout_sec=timeout + 10,
+          operation_timeout_sec=timeout,
+      )
+
     encoded_command = six.ensure_str(
         base64.b64encode(command.encode('utf_16_le'))
     )
@@ -190,7 +285,7 @@ class BaseWindowsMixin(os_mixin.BaseOsMixin):
       )
       raise errors.VirtualMachine.RemoteCommandError(error_text)
 
-    return stdout, stderr
+    return stdout, stderr, retcode
 
   def PartitionDisk(self, dev_name, dev_path, num_partitions, partition_size):
     raise NotImplementedError()
@@ -580,7 +675,8 @@ class BaseWindowsMixin(os_mixin.BaseOsMixin):
       script_path = ntpath.join(self.temp_dir, os.path.basename(tf.name))
       self.RemoteCopy(tf.name, script_path)
       self.RemoteCommand(
-          'diskpart /s {script_path}'.format(script_path=script_path)
+          'diskpart /s {script_path}'.format(script_path=script_path),
+          timeout=60,
       )
 
   def DiskDriveIsLocal(self, device, model):
@@ -696,6 +792,18 @@ class Windows2019SQLServer2019Enterprise(BaseWindowsMixin):
   OS_TYPE = os_types.WINDOWS2019_SQLSERVER_2019_ENTERPRISE
 
 
+class Windows2019SQLServer2025Standard(BaseWindowsMixin):
+  """Class holding Windows Server 2019 with Desktop Experience VM specifics."""
+
+  OS_TYPE = os_types.WINDOWS2019_SQLSERVER_2025_STANDARD
+
+
+class Windows2019SQLServer2025Enterprise(BaseWindowsMixin):
+  """Class holding Windows Server 2019 with Desktop Experience VM specifics."""
+
+  OS_TYPE = os_types.WINDOWS2019_SQLSERVER_2025_ENTERPRISE
+
+
 class Windows2022SQLServer2019Standard(BaseWindowsMixin):
   """Class holding Windows Server 2022 with Desktop Experience VM specifics."""
 
@@ -720,13 +828,37 @@ class Windows2022SQLServer2022Enterprise(BaseWindowsMixin):
   OS_TYPE = os_types.WINDOWS2022_SQLSERVER_2022_ENTERPRISE
 
 
-class Windows2025SQLServer2022Standard(BaseWindowsMixin):
+class Windows2022SQLServer2025Standard(BaseWindowsMixin):
   """Class holding Windows Server 2022 with Desktop Experience VM specifics."""
+
+  OS_TYPE = os_types.WINDOWS2022_SQLSERVER_2025_STANDARD
+
+
+class Windows2022SQLServer2025Enterprise(BaseWindowsMixin):
+  """Class holding Windows Server 2022 with Desktop Experience VM specifics."""
+
+  OS_TYPE = os_types.WINDOWS2022_SQLSERVER_2025_ENTERPRISE
+
+
+class Windows2025SQLServer2022Standard(BaseWindowsMixin):
+  """Class holding Windows Server 2025 with Desktop Experience VM specifics."""
 
   OS_TYPE = os_types.WINDOWS2025_SQLSERVER_2022_STANDARD
 
 
 class Windows2025SQLServer2022Enterprise(BaseWindowsMixin):
-  """Class holding Windows Server 2022 with Desktop Experience VM specifics."""
+  """Class holding Windows Server 2025 with Desktop Experience VM specifics."""
 
   OS_TYPE = os_types.WINDOWS2025_SQLSERVER_2022_ENTERPRISE
+
+
+class Windows2025SQLServer2025Standard(BaseWindowsMixin):
+  """Class holding Windows Server 2025 with Desktop Experience VM specifics."""
+
+  OS_TYPE = os_types.WINDOWS2025_SQLSERVER_2025_STANDARD
+
+
+class Windows2025SQLServer2025Enterprise(BaseWindowsMixin):
+  """Class holding Windows Server 2025 with Desktop Experience VM specifics."""
+
+  OS_TYPE = os_types.WINDOWS2025_SQLSERVER_2025_ENTERPRISE

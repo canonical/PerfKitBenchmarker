@@ -24,8 +24,10 @@ import ipaddress
 import logging
 
 from absl import flags
-
-from perfkitbenchmarker import background_tasks, configs, sample
+from perfkitbenchmarker import background_tasks
+from perfkitbenchmarker import configs
+from perfkitbenchmarker import provider_info
+from perfkitbenchmarker import sample
 from perfkitbenchmarker.linux_packages import wrk2
 from perfkitbenchmarker.providers.openstack.utils import \
     wait_for_sync_manager_green_light
@@ -147,18 +149,19 @@ nginx:
   description: Benchmarks Nginx server performance.
   vm_groups:
     server:
-      vm_spec: *default_single_core
+      vm_spec: *default_dual_core
     upstream_servers:
       vm_spec: *default_dual_core
       vm_count: 6
     clients:
-      vm_spec: *default_single_core
+      vm_spec: *default_dual_core
       vm_count: null
 """
 
 _CONTENT_FILENAME = 'random_content'
 _API_GATEWAY_PATH = 'api_old'  # refer to data/nginx/rp_apigw.conf
 _WORKER_CONNECTIONS = 1024
+# Target rates are per NIC.
 _TARGET_RATE_LOWER_BOUND = 0
 _TARGET_RATE_UPPER_BOUND = 1000000
 _RPS_RANGE_THRESHOLD = 1000
@@ -198,12 +201,15 @@ def _ConfigureNginxServer(server, upstream_servers):
   server.RemoteCommand(
       'sudo cp %s /etc/nginx/conf.d/loadbalance.conf' % server_conf_file
   )
-  for idx, upstream_server in enumerate(upstream_servers):
-    server.RemoteCommand(
-        r"sudo sed -i 's|# server <fileserver_%s_ip_or_dns>|server %s|g'"
-        ' /etc/nginx/conf.d/loadbalance.conf'
-        % (idx + 1, upstream_server.internal_ip)
-    )
+  idx = 1
+  for upstream_server in upstream_servers:
+    for internal_ip in upstream_server.GetInternalIPs():
+      server.RemoteCommand(
+          r"sudo sed -i 's|# server <fileserver_%s_ip_or_dns>|server %s|g'"
+          ' /etc/nginx/conf.d/loadbalance.conf'
+          % (idx, internal_ip)
+      )
+      idx += 1
   if FLAGS.nginx_use_ssl:
     _ConfigureNginxForSsl(server)
   else:
@@ -324,6 +330,12 @@ def _TuneNetworkStack(vm):
   Args:
     vm: The VM to tune.
   """
+  if vm.PLATFORM == provider_info.KUBERNETES:
+    # TODO(pclay): Support safe sysctls in Kubernetes.
+    # https://cloud.google.com/kubernetes-engine/docs/how-to/node-system-config
+    # https://kubernetes.io/docs/tasks/administer-cluster/sysctl-cluster/#safe-and-unsafe-sysctls
+    return
+
   max_port_num = 65535
   small_4k = 4096
   large_8m = 8388607
@@ -365,15 +377,13 @@ def Prepare(benchmark_spec):
       _TuneNetworkStack, clients + [server] + upstream_servers
   )
 
-  benchmark_spec.nginx_endpoint_ip = server.internal_ip
 
-
-def _RunMultiClient(clients, target, rate, connections, duration, threads):
+def _RunMultiClient(clients, targets, rate, connections, duration, threads):
   """Run multiple instances of wrk2 against a single target."""
   results = []
   num_clients = len(clients)
 
-  def _RunSingleClient(client, client_number):
+  def _RunSingleClient(client, client_number, target):
     """Run wrk2 from a single client."""
     client_results = list(
         wrk2.Run(
@@ -389,7 +399,10 @@ def _RunMultiClient(clients, target, rate, connections, duration, threads):
       result.metadata.update({'client_number': client_number})
     results.extend(client_results)
 
-  args = [((client, i), {}) for i, client in enumerate(clients)]
+  args = []
+  for i, client in enumerate(clients):
+    for target in targets:
+      args.append(((client, i, target), {}))
   background_tasks.RunThreaded(_RunSingleClient, args)
 
   requests = 0
@@ -417,6 +430,7 @@ def _RunMultiClient(clients, target, rate, connections, duration, threads):
       'nginx_worker_connections': _WORKER_CONNECTIONS,
       'nginx_use_ssl': FLAGS.nginx_use_ssl,
       'p99_latency_threshold': _P99_LATENCY_THRESHOLD.value,
+      'num_server_targets': len(targets),
   }
   if not FLAGS.nginx_file_server_conf:
     metadata['caching'] = True
@@ -445,29 +459,32 @@ def Run(benchmark_spec):
     logging.info('Wait for sync ended, starting now')
     
   clients = benchmark_spec.vm_groups['clients']
+  server = benchmark_spec.vm_groups['server'][0]
   results = []
   scheme = 'https' if FLAGS.nginx_use_ssl else 'http'
-  hostip = benchmark_spec.nginx_endpoint_ip
-  hoststr = (
-      f'[{hostip}]'
-      if isinstance(ipaddress.ip_address(hostip), ipaddress.IPv6Address)
-      else f'{hostip}'
-  )
-  portstr = f':{FLAGS.nginx_server_port}' if FLAGS.nginx_server_port else ''
-  if FLAGS.nginx_scenario == 'reverse_proxy':
-    # e.g. "https://10.128.0.36/random_content"
-    target = f'{scheme}://{hoststr}{portstr}/{_CONTENT_FILENAME}'
-  # FLAGS.nginx_scenario = 'api_gateway'
-  else:
-    # e.g. "https://10.128.0.36/api_old/random_content"
-    target = (
-        f'{scheme}://{hoststr}{portstr}/{_API_GATEWAY_PATH}/{_CONTENT_FILENAME}'
+  targets = []
+  for hostip in server.GetInternalIPs():
+    hoststr = (
+        f'[{hostip}]'
+        if isinstance(ipaddress.ip_address(hostip), ipaddress.IPv6Address)
+        else f'{hostip}'
     )
+    portstr = f':{FLAGS.nginx_server_port}' if FLAGS.nginx_server_port else ''
+    if FLAGS.nginx_scenario == 'reverse_proxy':
+      # e.g. "https://10.128.0.36/random_content"
+      target = f'{scheme}://{hoststr}{portstr}/{_CONTENT_FILENAME}'
+    # FLAGS.nginx_scenario = 'api_gateway'
+    else:
+      # e.g. "https://10.128.0.36/api_old/random_content"
+      target = (
+          f'{scheme}://{hoststr}{portstr}/{_API_GATEWAY_PATH}/{_CONTENT_FILENAME}'
+      )
+    targets.append(target)
 
   if FLAGS.nginx_throttle:
     return _RunMultiClient(
         clients,
-        target,
+        targets,
         rate=100000000,  # 100M aggregate requests/sec should max out requests.
         connections=clients[0].NumCpusForBenchmark() * 10,
         duration=60,
@@ -485,7 +502,7 @@ def Run(benchmark_spec):
     while (upper_bound - lower_bound) > _RPS_RANGE_THRESHOLD:
       results = _RunMultiClient(
           clients,
-          target,
+          targets,
           rate=target_rate,
           connections=clients[0].NumCpusForBenchmark() * 10,
           duration=60,
@@ -508,7 +525,7 @@ def Run(benchmark_spec):
   for config in FLAGS.nginx_load_configs:
     rate, duration, threads, connections = list(map(int, config.split(':')))
     results += _RunMultiClient(
-        clients, target, rate, connections, duration, threads
+        clients, targets, rate, connections, duration, threads
     )
   return results
 

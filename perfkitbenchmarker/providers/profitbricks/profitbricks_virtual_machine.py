@@ -21,6 +21,7 @@ from perfkitbenchmarker import disk
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import provider_info
 from perfkitbenchmarker import virtual_machine
+from perfkitbenchmarker import virtual_machine_spec
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.configs import option_decoders
 from perfkitbenchmarker.configs import spec
@@ -95,7 +96,7 @@ class MachineTypeDecoder(option_decoders.TypeVerifier):
     )
 
 
-class ProfitBricksVmSpec(virtual_machine.BaseVmSpec):
+class ProfitBricksVmSpec(virtual_machine_spec.BaseVmSpec):
   """Object containing the information needed to create a
 
   ProfitBricksVirtualMachine.
@@ -279,7 +280,7 @@ class ProfitBricksVirtualMachine(virtual_machine.BaseVirtualMachine):
     # state for a while, and it cannot be deleted or modified in
     # this state. Wait for the action to finish and check the
     # reported result.
-    if not self._WaitUntilReady(self.server_status):
+    if not self._WaitForReadyAtUrl(self.server_status):
       raise errors.Error('VM creation failed, see log.')
 
   @vm_util.Retry()
@@ -315,7 +316,7 @@ class ProfitBricksVirtualMachine(virtual_machine.BaseVirtualMachine):
 
     # Check to make sure deletion has finished
     delete_status = r.headers['Location']
-    if not self._WaitUntilReady(delete_status):
+    if not self._WaitForReadyAtUrl(delete_status):
       raise errors.Error('VM deletion failed, see log.')
 
   def _CreateDependencies(self):
@@ -325,12 +326,12 @@ class ProfitBricksVirtualMachine(virtual_machine.BaseVirtualMachine):
     self.dc_id, self.dc_status = util.CreateDatacenter(
         self.header, self.location
     )
-    if not self._WaitUntilReady(self.dc_status):
+    if not self._WaitForReadyAtUrl(self.dc_status):
       raise errors.Error('Data center creation failed, see log.')
 
     # Create LAN
     self.lan_id, self.lan_status = util.CreateLan(self.header, self.dc_id)
-    if not self._WaitUntilReady(self.lan_status):
+    if not self._WaitForReadyAtUrl(self.lan_status):
       raise errors.Error('LAN creation failed, see log.')
 
   def _DeleteDependencies(self):
@@ -345,11 +346,11 @@ class ProfitBricksVirtualMachine(virtual_machine.BaseVirtualMachine):
 
     # Check to make sure deletion has finished
     delete_status = r.headers['Location']
-    if not self._WaitUntilReady(delete_status):
+    if not self._WaitForReadyAtUrl(delete_status):
       raise errors.Error('Data center deletion failed, see log.')
 
   @vm_util.Retry(timeout=TIMEOUT, log_errors=False)
-  def _WaitUntilReady(self, status_url):
+  def _WaitForReadyAtUrl(self, status_url):
     """Returns true if the ProfitBricks resource is ready."""
 
     # Poll resource for status update

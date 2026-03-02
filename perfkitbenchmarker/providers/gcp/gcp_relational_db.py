@@ -21,19 +21,20 @@ See https://cloud.google.com/sdk/gcloud/reference/beta/sql/instances/create
 for more information.
 """
 
-
 import datetime
 import json
 import logging
 import time
 
 from absl import flags
+from google.cloud import monitoring_v3
 from perfkitbenchmarker import data
 from perfkitbenchmarker import mysql_iaas_relational_db
 from perfkitbenchmarker import omni_postgres_iaas_relational_db
 from perfkitbenchmarker import postgres_iaas_relational_db
 from perfkitbenchmarker import provider_info
 from perfkitbenchmarker import relational_db
+from perfkitbenchmarker import sample
 from perfkitbenchmarker import sql_engine_utils
 from perfkitbenchmarker import sqlserver_iaas_relational_db
 from perfkitbenchmarker import timescaledb_iaas_relational_db
@@ -60,6 +61,8 @@ GCP_DATABASE_VERSION_MAPPING = {
         '13': 'POSTGRES_13',
         '14': 'POSTGRES_14',
         '15': 'POSTGRES_15',
+        '16': 'POSTGRES_16',
+        '17': 'POSTGRES_17',
     },
     sql_engine_utils.SQLSERVER: {
         '2017_Standard': 'SQLSERVER_2017_Standard',
@@ -74,8 +77,8 @@ GCP_DATABASE_VERSION_MAPPING = {
 }
 
 
-DEFAULT_MYSQL_VERSION = '5.7'
-DEFAULT_POSTGRES_VERSION = '9.6'
+DEFAULT_MYSQL_VERSION = '8.0'
+DEFAULT_POSTGRES_VERSION = '17'
 DEFAULT_SQL_SERVER_VERSION = '2017_Standard'
 
 DEFAULT_ENGINE_VERSIONS = {
@@ -99,7 +102,31 @@ MIN_CUSTOM_MACHINE_MEM_MB = 3840
 
 IS_READY_TIMEOUT = 600  # 10 minutes
 DELETE_INSTANCE_TIMEOUT = 600  # 10 minutes
-CREATION_TIMEOUT = 1200  # 20 minutes
+CREATION_TIMEOUT = 1800  # 30 minutes
+
+_METRIC_PREFIX = 'cloudsql.googleapis.com/database'
+
+# pyformat: disable
+_DEFAULT_METRICS = [
+    ('cpu/utilization', '%', lambda x: x * 100),
+    ('memory/total_usage', 'GB', lambda x: x / (1024 * 1024 * 1024)),
+    ('disk/read_ops_count', 'iops', None),
+    ('disk/write_ops_count', 'iops', None),
+    ('disk/write_bytes_count', 'MB/s', lambda x: x / (1024 * 1024)),
+    ('disk/read_bytes_count', 'MB/s', lambda x: x / (1024 * 1024)),
+    ('disk/utilization', '%', lambda x: x * 100),
+    ('disk/provisioning/iops', 'iops', None),
+    ('disk/provisioning/throughput', 'MB/s', None),
+    ('disk/bytes_used', 'GB', lambda x: x / (1024 * 1024 * 1024)),
+]
+_SQLSERVER_METRICS = [
+    ('sqlserver/memory/page_life_expectancy', 'seconds', None),
+    ('sqlserver/memory/lazy_write_count', 'count', None),
+    ('sqlserver/memory/buffer_cache_hit_ratio', '%', lambda x: x * 100),
+    ('sqlserver/memory/memory_grants_pending', 'count', None),
+    ('sqlserver/memory/free_list_stall_count', 'count', None),
+]
+# pyformat: enable
 
 
 class UnsupportedDatabaseEngineError(Exception):
@@ -182,12 +209,12 @@ class GCPRelationalDb(relational_db.BaseRelationalDb):
 
   This class contains logic required to provision and teardown the database.
   Currently, the database will be open to the world (0.0.0.0/0) which is not
-  ideal; however, a password is still required to connect. Currently only
-  MySQL 5.7 and Postgres 9.6 are supported.
+  ideal; however, a password is still required to connect.
   """
 
   CLOUD = provider_info.GCP
   IS_MANAGED = True
+  METRICS_COLLECTION_DELAY_SECONDS = 165
 
   def __init__(self, relational_db_spec):
     super().__init__(relational_db_spec)
@@ -230,6 +257,16 @@ class GCPRelationalDb(relational_db.BaseRelationalDb):
           '--root-password={}'.format(self.spec.database_password)
       )
 
+    if self.spec.db_disk_spec.provisioned_iops:
+      cmd_string.append(
+          '--storage-provisioned-iops=%s'
+          % self.spec.db_disk_spec.provisioned_iops
+      )
+    if self.spec.db_disk_spec.provisioned_throughput:
+      cmd_string.append(
+          '--storage-provisioned-throughput=%s'
+          % self.spec.db_disk_spec.provisioned_throughput
+      )
     if self.spec.db_spec.cpus and self.spec.db_spec.memory:
       self._ValidateSpec()
       memory = self.spec.db_spec.memory
@@ -258,18 +295,20 @@ class GCPRelationalDb(relational_db.BaseRelationalDb):
       cmd_string.append('--no-backup')
     cmd = util.GcloudCommand(*cmd_string)
     cmd.flags['project'] = self.project
+    # Needed for labels and allocated-ip-range-name
     cmd.use_beta_gcloud = True
 
     if self.spec.db_tier:
       cmd.flags['edition'] = self.spec.db_tier
-      cmd.use_alpha_gcloud = True
-      cmd.use_beta_gcloud = False
       if relational_db.ENABLE_DATA_CACHE.value:
         cmd.flags['enable-data-cache'] = True
       else:
         cmd.flags['no-enable-data-cache'] = True
 
-    _, stderr, retcode = cmd.Issue(timeout=CREATION_TIMEOUT)
+    _, stderr, retcode = cmd.Issue(
+        timeout=CREATION_TIMEOUT,
+        raise_on_failure=False,
+    )
 
     util.CheckGcloudResponseKnownFailures(stderr, retcode)
 
@@ -609,3 +648,59 @@ class GCPRelationalDb(relational_db.BaseRelationalDb):
     # this command doesnt support the specifier: 'format'
     del cmd.flags['format']
     cmd.IssueRetryable()
+
+  def _GetMetricsToCollect(self) -> list[relational_db.MetricSpec]:
+    """Returns a list of metrics to collect."""
+    metrics = _DEFAULT_METRICS
+    if self.engine_type == sql_engine_utils.SQLSERVER:
+      metrics += _SQLSERVER_METRICS
+    resource_filter = (
+        'resource.type="cloudsql_database" AND'
+        f' resource.labels.database_id="{self.project}:{self.instance_id}"'
+    )
+    final_metrics = []
+    for metric_name, unit, conversion_func in metrics:
+      is_delta = str(metric_name).endswith('_ops_count') or str(
+          metric_name
+      ).endswith('_bytes_count')
+      aligner = (
+          monitoring_v3.Aggregation.Aligner.ALIGN_RATE
+          if is_delta
+          else monitoring_v3.Aggregation.Aligner.ALIGN_MEAN
+      )
+      final_metrics.append(
+          util.GcpMetricSpec(
+              provider_name=f'{_METRIC_PREFIX}/{metric_name}',
+              sample_name=_GetMetricSampleName(
+                  f'{_METRIC_PREFIX}/{metric_name}'
+              ),
+              unit=unit,
+              conversion_func=conversion_func,
+              resource_filter=resource_filter,
+              project=self.project,
+              aligner=aligner,
+          )
+      )
+    return final_metrics
+
+  def _CollectProviderMetric(
+      self,
+      metric: relational_db.MetricSpec,
+      start_time: datetime.datetime,
+      end_time: datetime.datetime,
+      collect_percentiles: bool = False,
+  ) -> list[sample.Sample]:
+    """Collects time series metrics from Google Cloud Monitoring."""
+    assert isinstance(metric, util.GcpMetricSpec)
+    points = util.GetTimeSeries(
+        metric,
+        start_time,
+        end_time,
+    )
+    return self._CreateSamples(
+        points, metric.sample_name, metric.unit, collect_percentiles=True
+    )
+
+
+def _GetMetricSampleName(metric_type) -> str:
+  return '_'.join(metric_type.split('/')[1:])

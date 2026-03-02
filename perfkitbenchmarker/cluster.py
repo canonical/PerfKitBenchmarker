@@ -13,17 +13,23 @@
 # limitations under the License.
 
 """Class to represent a Cluster object."""
+
+import os
 import typing
 from typing import Callable, List, Tuple
+import uuid
 
 from absl import flags
 from absl import logging
+from perfkitbenchmarker import data
 from perfkitbenchmarker import disk
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import linux_virtual_machine
 from perfkitbenchmarker import resource
 from perfkitbenchmarker import static_virtual_machine
 from perfkitbenchmarker import virtual_machine
+from perfkitbenchmarker import virtual_machine_spec
+from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.configs import option_decoders
 from perfkitbenchmarker.configs import spec
 from perfkitbenchmarker.configs import vm_group_decoders
@@ -41,6 +47,12 @@ UNMANAGED = flags.DEFINE_boolean(
     False,
     'Instead of creating with cluster toolset, relying on cloud provider CLI.'
     ' e.g. gcloud for gcp, awscli for aws.'
+)
+TYPE = flags.DEFINE_string(
+    'cluster_type',
+    'default',
+    'Type of cluster to use. Chances are clusters vary quite differently and '
+    'may as well use its own template.'
 )
 
 
@@ -127,7 +139,9 @@ def GetClusterSpecClass(cloud: str):
 
 def GetClusterClass(cloud: str):
   """Returns the cluster spec class corresponding to the given service."""
-  return resource.GetResourceClass(BaseCluster, CLOUD=cloud)
+  if UNMANAGED.value and TYPE.value == 'default':
+    return BaseCluster
+  return resource.GetResourceClass(BaseCluster, CLOUD=cloud, TYPE=TYPE.value)
 
 
 class BaseCluster(resource.BaseResource):
@@ -144,7 +158,8 @@ class BaseCluster(resource.BaseResource):
   """
 
   RESOURCE_TYPE = 'BaseCluster'
-  REQUIRED_ATTRS = ['CLOUD']
+  TYPE = 'default'
+  REQUIRED_ATTRS = ['CLOUD', 'TYPE']
   DEFAULT_TEMPLATE = ''
 
   def __init__(self, cluster_spec: BaseClusterSpec):
@@ -161,11 +176,13 @@ class BaseCluster(resource.BaseResource):
     self.spec: BaseClusterSpec = cluster_spec
     self.worker_machine_type: str = self.machine_type
     self.headnode_machine_type: str = cluster_spec.headnode.vm_spec.machine_type
-    self.headnode_spec: virtual_machine.BaseVmSpec = (
+    self.headnode_spec: virtual_machine_spec.BaseVmSpec = (
         cluster_spec.headnode.vm_spec
     )
     self.image: str = cluster_spec.workers.vm_spec.image
-    self.workers_spec: virtual_machine.BaseVmSpec = cluster_spec.workers.vm_spec
+    self.workers_spec: virtual_machine_spec.BaseVmSpec = (
+        cluster_spec.workers.vm_spec
+    )
     self.workers_static_disk_spec: disk.BaseDiskSpec = (
         cluster_spec.workers.disk_spec
     )
@@ -210,6 +227,7 @@ class BaseCluster(resource.BaseResource):
       command: str,
       ignore_failure: bool = False,
       timeout: float | None = None,
+      env: str = '',
       **kwargs,
   ) -> Tuple[str, str]:
     """Runs a command on the VM.
@@ -222,6 +240,7 @@ class BaseCluster(resource.BaseResource):
       ignore_failure: Ignore any failure if set to true.
       timeout: The time to wait in seconds for the command before exiting. None
         means no timeout.
+      env: Environment variables to set before running the command.
       **kwargs: Additional command arguments.
 
     Returns:
@@ -231,7 +250,7 @@ class BaseCluster(resource.BaseResource):
       RemoteCommandError: If there was a problem issuing the command.
     """
     return self.headnode_vm.RemoteCommand(
-        f'srun -N {self.num_workers} {command}',
+        f'{env} srun -N {self.num_workers} {command}',
         ignore_failure=ignore_failure,
         timeout=timeout,
         **kwargs,
@@ -279,7 +298,7 @@ class BaseCluster(resource.BaseResource):
 
   def BackfillVm(
       self,
-      vm_spec: virtual_machine.BaseVmSpec,
+      vm_spec: virtual_machine_spec.BaseVmSpec,
       fn: Callable[[virtual_machine.BaseVirtualMachine], None],
   ):
     """Create and backfill a VM object created using cluster resource.
@@ -332,6 +351,12 @@ class BaseCluster(resource.BaseResource):
     self.worker_vms = workers
     self.vms = [self.headnode_vm] + self.worker_vms
 
+  def _Create(self):
+    pass
+
+  def _Delete(self):
+    pass
+
   def Create(self):
     if self.unmanaged:
       return
@@ -341,6 +366,54 @@ class BaseCluster(resource.BaseResource):
     if self.unmanaged:
       return
     super().Delete()
+
+  @vm_util.Retry(
+      fuzz=0,
+      timeout=1800,
+      max_retries=5,
+      retryable_exceptions=(errors.Resource.RetryableCreationError,),
+  )
+  def _WaitForClusterReady(self):
+    if self.unmanaged:
+      return
+    if not self.headnode_vm.TryRemoteCommand(
+        f'srun -N {self.num_workers} hostname'
+    ):
+      raise errors.Resource.RetryableCreationError('Cluster not ready.')
+
+  def InstallSquashImage(
+      self,
+      benchmark_name,
+      image,
+      install_path,
+      dockerfile
+  ):
+    """Download squash image from preprovisoned bucket or built from scratch.
+
+    Args:
+      benchmark_name: The name of the benchmark defining the preprovisioned
+        data. The benchmark's module must define the dict BENCHMARK_DATA mapping
+        filenames to sha256sum hashes.
+      image: String. Name of image stored in preprovisioned-bucket.
+      install_path: The path to download the data file.
+      dockerfile: String. Name of Dockerfile to built from scratch.
+    """
+    headnode = self.headnode_vm
+    try:
+      headnode.InstallPreprovisionedBenchmarkData(
+          benchmark_name, [image], install_path
+      )
+    except errors.Setup.BadPreprovisionedDataError:
+      logging.warning(
+          'Cannot find preprovisioned squash image %s in preprovisioned bucket.'
+          ' Attempting to build from dockerfile.')
+      headnode.PushFile(data.ResourcePath(dockerfile), 'Dockerfile')
+      tmp_image = str(uuid.uuid4()).split('-')[0]
+      image_path = os.path.join(install_path, image)
+      headnode.RemoteCommand(
+          f'docker build --network=host -t {tmp_image} .; '
+          f'enroot import -o {image_path} dockerd://{tmp_image}; '
+          f'docker rmi {tmp_image}')
 
 
 Cluster = typing.TypeVar('Cluster', bound=BaseCluster)
