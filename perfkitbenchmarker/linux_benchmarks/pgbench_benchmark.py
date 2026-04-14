@@ -35,11 +35,14 @@ This benchmark is written for pgbench 9.5, which is the default
 
 import datetime
 import re
+
 from absl import flags
-from perfkitbenchmarker import configs
-from perfkitbenchmarker import flag_util
-from perfkitbenchmarker import sql_engine_utils
+
+from perfkitbenchmarker import configs, flag_util, sql_engine_utils
 from perfkitbenchmarker.linux_packages import pgbench
+from perfkitbenchmarker.providers.openstack.utils import (
+  wait_for_sync_manager_green_light,
+)
 
 # Postgresql protocol options
 SIMPLE = 'simple'
@@ -110,6 +113,9 @@ pgbench:
         machine_type:
           compute_units: 800
         zone: eastus
+      OpenStack:
+        machine_type: m1.xlarge
+        zone: nova
     db_disk_spec:
       GCP:
         disk_size: 1000
@@ -120,6 +126,9 @@ pgbench:
       Azure:
         #Valid storage sizes range from minimum of 128000 MB and additional increments of 128000 MB up to maximum of 1024000 MB.
         disk_size: 128
+      OpenStack:
+        disk_size: 1000
+        disk_type: standard
     vm_groups:
       servers:
         vm_spec:
@@ -132,6 +141,9 @@ pgbench:
           Azure:
             machine_type: Standard_A4m_v2
             zone: eastus
+          OpenStack:
+            machine_type: m1.xlarge
+            zone: nova
         disk_spec: *default_500_gb
       clients:
         vm_spec:
@@ -144,6 +156,9 @@ pgbench:
           Azure:
             machine_type: Standard_A4m_v2
             zone: eastus
+          OpenStack:
+            machine_type: m1.xlarge
+            zone: nova
         disk_spec: *default_500_gb
 """
 
@@ -364,6 +379,8 @@ def Run(benchmark_spec):
   relational_db = benchmark_spec.relational_db
   db_size = GetDbSize(relational_db, TEST_DB_NAME)
   common_metadata = GetMetaData(db_size, benchmark_spec)
+  if FLAGS.pkbw_sync_manager_url:
+    wait_for_sync_manager_green_light(FLAGS.pkbw_sync_manager_url, 'ready')
 
   start_time = datetime.datetime.now()
   pgbench.RunPgBench(

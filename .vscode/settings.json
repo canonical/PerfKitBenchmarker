@@ -1,3 +1,11 @@
 {
-    "editor.formatOnSave": false
+  "editor.formatOnSave": false,
+  "editor.formatOnPaste": false,
+  "editor.formatOnType": false,
+  "editor.defaultFormatter": null,
+  "editor.formatOnSaveMode": "file",
+  "[python]": {
+    "editor.formatOnSave": false,
+    "editor.defaultFormatter": null
+  }
 }
