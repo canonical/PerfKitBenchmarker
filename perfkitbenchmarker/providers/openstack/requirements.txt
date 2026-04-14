@@ -13,5 +13,5 @@
 # limitations under the License.
 
 # Requirements for running PerfKitBenchmarker on OpenStack.
-openstacksdk>=0.9.10
-python-openstackclient>=3.6.0
+openstacksdk>=3.0.0
+python-openstackclient>=7.0.0

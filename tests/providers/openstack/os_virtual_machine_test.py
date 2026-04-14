@@ -1,12 +1,11 @@
 """Tests for perfkitbenchmarker.providers.openstack.os_virtual_machine_test."""
 
 import unittest
-from absl import flags
+
 import mock
-from perfkitbenchmarker import benchmark_spec
-from perfkitbenchmarker import configs
-from perfkitbenchmarker import errors
-from perfkitbenchmarker import linux_benchmarks
+from absl import flags
+
+from perfkitbenchmarker import benchmark_spec, configs, errors, linux_benchmarks
 from perfkitbenchmarker.configs import benchmark_config_spec
 from perfkitbenchmarker.providers.openstack import os_virtual_machine
 from tests import pkb_common_test_case
@@ -29,19 +28,19 @@ iperf:
 _network_true = {'router:external': True}
 _network_external = {'router:external': 'External'}
 _network_fail = {'router:external': 'Fail'}
+_network_is_router_external_true = {'is_router_external': True}
+_network_is_router_external_false = {'is_router_external': False}
 
 
 class TestOpenStackVirtualMachine(
-    pkb_common_test_case.TestOsMixin, os_virtual_machine.OpenStackVirtualMachine
+  pkb_common_test_case.TestOsMixin, os_virtual_machine.OpenStackVirtualMachine
 ):
   pass
 
 
 class BaseOpenStackNetworkTest(pkb_common_test_case.PkbCommonTestCase):
 
-  def _CreateBenchmarkSpecFromYaml(
-      self, yaml_string, benchmark_name=_BENCHMARK_NAME
-  ):
+  def _CreateBenchmarkSpecFromYaml(self, yaml_string, benchmark_name=_BENCHMARK_NAME):
     config = configs.LoadConfig(yaml_string, {}, benchmark_name)
     spec = self._CreateBenchmarkSpecFromConfigDict(config, benchmark_name)
     spec.disable_interrupt_moderation = False
@@ -65,12 +64,10 @@ class BaseOpenStackNetworkTest(pkb_common_test_case.PkbCommonTestCase):
 
   def _CreateBenchmarkSpecFromConfigDict(self, config_dict, benchmark_name):
     config_spec = benchmark_config_spec.BenchmarkConfigSpec(
-        benchmark_name, flag_values=FLAGS, **config_dict
+      benchmark_name, flag_values=FLAGS, **config_dict
     )
     benchmark_module = next(
-        b
-        for b in linux_benchmarks.BENCHMARKS
-        if b.BENCHMARK_NAME == benchmark_name
+      b for b in linux_benchmarks.BENCHMARKS if b.BENCHMARK_NAME == benchmark_name
     )
     return benchmark_spec.BenchmarkSpec(benchmark_module, config_spec, _URI)
 
@@ -84,9 +81,9 @@ class OpenStackVirtualMachineTest(BaseOpenStackNetworkTest):
   def setUp(self):
     super().setUp()
     self.mock_check_network_exists = self.enter_context(
-        mock.patch.object(
-            os_virtual_machine.OpenStackVirtualMachine, '_CheckNetworkExists'
-        )
+      mock.patch.object(
+        os_virtual_machine.OpenStackVirtualMachine, '_CheckNetworkExists'
+      )
     )
     FLAGS.ignore_package_requirements = True
     self.openstack_vm = self._CreateTestOpenStackVm()
@@ -103,6 +100,16 @@ class OpenStackVirtualMachineTest(BaseOpenStackNetworkTest):
 
   def test_CheckFloatingIPNetworkExistsWithFail(self):
     self.mock_check_network_exists.return_value = _network_fail
+    with self.assertRaises(errors.Config.InvalidValue):
+      self.openstack_vm._CheckFloatingIPNetworkExists('External')
+
+  def test_CheckFloatingIPNetworkExistsWithIsRouterExternalTrue(self):
+    self.mock_check_network_exists.return_value = _network_is_router_external_true
+    network = self.openstack_vm._CheckFloatingIPNetworkExists('External')
+    self.assertEqual(_network_is_router_external_true, network)
+
+  def test_CheckFloatingIPNetworkExistsWithIsRouterExternalFalse(self):
+    self.mock_check_network_exists.return_value = _network_is_router_external_false
     with self.assertRaises(errors.Config.InvalidValue):
       self.openstack_vm._CheckFloatingIPNetworkExists('External')
 
