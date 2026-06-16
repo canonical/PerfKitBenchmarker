@@ -15,7 +15,22 @@
 
 """Module containing wget installation and cleanup functions."""
 
+from absl import flags
+
+FLAGS = flags.FLAGS
+
 
 def Install(vm):
   """Installs the wget package on the VM."""
   vm.InstallPackages('wget')
+  # Write ~/.wgetrc so wget picks up the proxy even under SSH ControlMaster
+  # (ControlMaster multiplexed sessions don't re-read /etc/environment).
+  wgetrc_lines = []
+  if FLAGS.http_proxy:
+    wgetrc_lines.append('http_proxy = %s' % FLAGS.http_proxy)
+  if FLAGS.https_proxy:
+    wgetrc_lines.append('https_proxy = %s' % FLAGS.https_proxy)
+  if wgetrc_lines:
+    vm.RemoteCommand(
+        'printf "%s\n" >> ~/.wgetrc' % '\n'.join(wgetrc_lines)
+    )

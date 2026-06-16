@@ -3005,6 +3005,17 @@ class BaseDebianMixin(BaseLinuxMixin):
   @vm_util.Retry(max_retries=UPDATE_RETRIES)
   def AptUpdate(self):
     """Updates the package lists on VMs using apt."""
+    # Replace cloud-specific apt mirrors (e.g. nova.clouds.archive.ubuntu.com,
+    # azure.archive.ubuntu.com) with the canonical archive.ubuntu.com mirror.
+    # Cloud mirrors are often IPv6-only and unreachable in private-network
+    # OpenStack deployments.
+    self.RemoteCommand(
+        'sudo sed -i.bk '
+        '"s/azure\.archive\.ubuntu\.com/archive.ubuntu.com/g;'
+        's/[a-z]*\.clouds\.archive\.ubuntu\.com/archive.ubuntu.com/g" '
+        '/etc/apt/sources.list',
+        ignore_failure=True,
+    )
     try:
       # setting the timeout on the apt-get to 10 minutes because
       # it is known to get stuck.  In a normal update this
@@ -3066,9 +3077,14 @@ class BaseDebianMixin(BaseLinuxMixin):
     except errors.VirtualMachine.RemoteCommandError as e:
       # TODO(user): Remove code below after Azure fix their package repository,
       # or add code to recover the sources.list
+      # sources.list was already patched in AptUpdate(); run again in case
+      # a transient failure occurred before the sed had effect.
       self.RemoteCommand(
-          'sudo sed -i.bk "s/azure.archive.ubuntu.com/archive.ubuntu.com/g" '
-          '/etc/apt/sources.list'
+          'sudo sed -i.bk '
+          '"s/azure\.archive\.ubuntu\.com/archive.ubuntu.com/g;'
+          's/[a-z]*\.clouds\.archive\.ubuntu\.com/archive.ubuntu.com/g" '
+          '/etc/apt/sources.list',
+          ignore_failure=True,
       )
       logging.info(
           'Installing "%s" failed on %s. This may be transient. '

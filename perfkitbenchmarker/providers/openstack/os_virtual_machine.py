@@ -375,7 +375,10 @@ class OpenStackVirtualMachine(virtual_machine.BaseVirtualMachine):
         for net_name, addresses in server_dict["addresses"].items():
             if network_name == net_name:
                 try:
-                    ip = addresses[0]["addr"]
+                    addr = addresses[0]
+                    # openstackclient >= 8 returns dicts with an 'addr' key;
+                    # older versions (≤ 7) return plain IP strings.
+                    ip = addr["addr"] if isinstance(addr, dict) else addr
                 except Exception as e:
                     raise Exception(
                         f"Instance IP could not be found, here is what we have {addresses}, {e}"
