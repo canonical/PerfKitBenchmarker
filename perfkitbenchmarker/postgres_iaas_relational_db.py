@@ -33,14 +33,15 @@ MSSQL_PID = 'developer'  # Edition of SQL server on Linux
 
 POSTGRES_RESOURCE_PATH = 'database_configurations/postgres'
 POSTGRES_13_VERSION = '13'
+POSTGRES_16_VERSION = '16'
 
 POSTGRES_HBA_CONFIG = 'pg_hba.conf'
 POSTGRES_CONFIG = 'postgresql.conf'
 POSTGRES_CONFIG_PATH = '/etc/postgresql/{0}/main/'
 
-DEFAULT_POSTGRES_VERSION = POSTGRES_13_VERSION
+DEFAULT_POSTGRES_VERSION = POSTGRES_16_VERSION
 
-DEFAULT_ENGINE_VERSION = '13'
+DEFAULT_ENGINE_VERSION = '16'
 
 
 class PostgresIAASRelationalDb(iaas_relational_db.IAASRelationalDb):
@@ -111,11 +112,11 @@ class PostgresIAASRelationalDb(iaas_relational_db.IAASRelationalDb):
 
   def _SetupLinuxUnmanagedDatabase(self):
     super()._SetupLinuxUnmanagedDatabase()
-    if self.spec.engine_version == POSTGRES_13_VERSION:
+    if self.spec.engine_version in (POSTGRES_13_VERSION, POSTGRES_16_VERSION):
       self.server_vm.Install('postgres13')
     else:
       raise relational_db.UnsupportedError(
-          'Only postgres version 13 is currently supported'
+          'Only postgres versions 13 and 16 are currently supported'
       )
 
     vm = self.server_vm

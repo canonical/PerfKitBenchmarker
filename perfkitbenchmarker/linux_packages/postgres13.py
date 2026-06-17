@@ -18,16 +18,8 @@
 
 def AptInstall(vm):
   """Installs the postgres package on the VM."""
-  vm.RemoteCommand(
-      "sudo sh -c 'echo "
-      '"deb https://apt.postgresql.org/pub/repos/apt '
-      '$(lsb_release -cs)-pgdg main" '
-      "> /etc/apt/sources.list.d/pgdg.list'"
-  )
-  vm.InstallPackages('wget')
-  vm.RemoteCommand(
-      'wget --quiet -O - '
-      'https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -'
-  )
-  vm.RemoteCommand('sudo apt-get update')
-  vm.RemoteCommand('sudo apt-get -y install postgresql-13')
+  # Install from Ubuntu's default repos to avoid fetching the pgdg signing
+  # key (postgresql.org may be blocked by corporate proxies).
+  # Ubuntu 24.04 ships postgresql-16; the meta-package 'postgresql' selects
+  # the default distro version.
+  vm.InstallPackages('postgresql postgresql-contrib')

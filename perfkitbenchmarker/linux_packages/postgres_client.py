@@ -18,19 +18,9 @@
 
 def _Install(vm):
   """Installs the postgres client package on the VM."""
-  # Install Postgres client
-  vm.RemoteCommand(
-      'sudo sh -c '
-      '\'echo "deb https://apt.postgresql.org/pub/repos/apt'
-      ' $(lsb_release -cs)-pgdg main" >'
-      " /etc/apt/sources.list.d/pgdg.list'"
-  )
-  vm.InstallPackages('wget')
-  vm.RemoteCommand(
-      'wget --quiet -O - '
-      'https://www.postgresql.org/media/keys/ACCC4CF8.asc '
-      '| sudo apt-key add -'
-  )
+  # Install directly from Ubuntu's default repos to avoid fetching the
+  # pgdg signing key (postgresql.org may be blocked by corporate proxies).
+  # Ubuntu 24.04 ships postgresql-client-16 which includes pgbench.
   vm.InstallPackages('postgresql-client')
 
 
