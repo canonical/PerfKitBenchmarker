@@ -36,6 +36,9 @@ PROFITBRICKS = 'ProfitBricks'
 # Though Docker is not a cloud provider, it's inclusion is useful
 # for performing on premise to cloud benchmarks
 DOCKER = 'Docker'
+# LXD MicroCloud (LXD + MicroCeph + MicroOVN) is an on-premise / edge cloud
+# platform; included to enable on-prem benchmarks driven by the lxc CLI.
+LXDMICROCLOUD = 'LxdMicrocloud'
 # Likewise, UnitTest is not a cloud provider, but is useful for testing.
 UNIT_TEST = 'UnitTest'
 
@@ -52,6 +55,7 @@ PROVIDER_DIRECTORY_NAMES = (
     MESOS,
     PROFITBRICKS,
     DOCKER,
+    LXDMICROCLOUD,
 )
 # TODO(user): Remove Kubernetes from VALID_CLOUDS.
 VALID_CLOUDS = tuple(list(PROVIDER_DIRECTORY_NAMES) + [KUBERNETES, UNIT_TEST])
