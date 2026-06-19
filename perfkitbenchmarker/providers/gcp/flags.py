@@ -566,6 +566,20 @@ GKE_ADDONS = flags.DEFINE_string(
     '',
     'The addons to enable or disable.',
 )
+GKE_AUTOSCALING_PROFILE = flags.DEFINE_enum(
+    'gke_autoscaling_profile',
+    None,
+    ['optimize-utilization', 'balanced'],
+    'The cluster autoscaling profile: optimize-utilization (better bin-packing)'
+    ' or balanced. Default unset, which means the balanced profile is used.',
+)
+GKE_CLUSTER_IPV4_CIDR_SIZE = flags.DEFINE_integer(
+    'gke_cluster_ipv4_cidr_size',
+    None,
+    'Override cluster IPv4 CIDR size in bits (e.g. 19). If set, used instead of'
+    ' the size derived from max_vm_count. Use when the cluster will scale'
+    ' beyond the default node pool (e.g. kubernetes_node_scale with 5k nodes).',
+)
 GCE_PERFORMANCE_MONITORING_UNIT = flags.DEFINE_enum(
     'gce_performance_monitoring_unit',
     None,
@@ -651,4 +665,20 @@ flags.register_multi_flags_validator(
     ],
     _ValidateNetworkFlags,
     'gce_nic_types and gce_nic_queue_counts must be the same length.',
+)
+
+
+GCP_FIRESTORE_DATABASE_ID = flags.DEFINE_string(
+    'gcp_firestore_database_id',
+    None,
+    'Firestore instance name. If not specified, new instance '
+    'will be created and deleted on the fly. If specified, '
+    'the instance is considered user managed and will not '
+    'created/deleted by PKB.',
+)
+GCP_FIRESTORE_LOCATION = flags.DEFINE_string(
+    'gcp_firestore_location',
+    None,
+    'Location of the firestore database. See'
+    ' https://firebase.google.com/docs/firestore/locations.',
 )

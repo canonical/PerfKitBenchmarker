@@ -28,24 +28,19 @@ class KubernetesCluster(container_cluster.BaseContainerCluster):
 
   def __init__(self, cluster_spec: container_spec_lib.ContainerClusterSpec):
     super().__init__(cluster_spec)
-    self.event_poller: kubernetes_events.KubernetesEventPoller | None = None
     self.cluster_spec = cluster_spec
-    self._InitializeEventPoller()
+    self.event_poller: kubernetes_events.KubernetesEventPoller = (
+        self._InitializeEventPoller()
+    )
     self.inference_server = (
         kubernetes_inference_server.GetKubernetesInferenceServer(
             cluster_spec.inference_server, self
         )
     )
 
-  def _InitializeEventPoller(self):
-    if not self.cluster_spec.poll_for_events:
-      return
-
-    def _GetEventsNoLogging():
-      return kubernetes_commands.GetEvents(suppress_logging=True)
-
-    self.event_poller = kubernetes_events.KubernetesEventPoller(
-        _GetEventsNoLogging
+  def _InitializeEventPoller(self) -> kubernetes_events.KubernetesEventPoller:
+    return kubernetes_events.KubernetesEventPoller(
+        lambda: kubernetes_commands.GetEvents(suppress_logging=True)
     )
 
   def Create(self, restore: bool = False) -> None:
@@ -55,7 +50,7 @@ class KubernetesCluster(container_cluster.BaseContainerCluster):
 
   def _PostCreate(self):
     super()._PostCreate()
-    if self.event_poller:
+    if self.cluster_spec.poll_for_events:
       self.event_poller.StartPolling()
 
   def Delete(self, freeze: bool = False) -> None:
@@ -67,15 +62,13 @@ class KubernetesCluster(container_cluster.BaseContainerCluster):
     _DeleteAllFromDefaultNamespace()
 
   def _Delete(self):
-    if self.event_poller:
+    if self.cluster_spec.poll_for_events:
       self.event_poller.StopPolling()
     _DeleteAllFromDefaultNamespace()
 
   def GetEvents(self) -> set['kubernetes_events.KubernetesEvent']:
     """Gets the events for the cluster, including previously polled events."""
-    if self.event_poller:
-      return self.event_poller.GetEvents()
-    return kubernetes_commands.GetEvents()
+    return self.event_poller.GetEvents()
 
   def __getstate__(self):
     state = self.__dict__.copy()
@@ -85,7 +78,7 @@ class KubernetesCluster(container_cluster.BaseContainerCluster):
 
   def __setstate__(self, state):
     self.__dict__ = state
-    self._InitializeEventPoller()
+    self.event_poller = self._InitializeEventPoller()
 
   @functools.cached_property
   def k8s_version(self) -> str:
@@ -140,13 +133,17 @@ class KubernetesCluster(container_cluster.BaseContainerCluster):
     """Propagate cluster labels to disks if not done by cloud provider."""
     pass
 
+  def HasLocalSsd(self, nodepool_name: str = 'default') -> bool:
+    """Returns true if the given nodepool has local SSDs."""
+    raise NotImplementedError
+
   # TODO(pclay): integrate with kubernetes_disk.
   def GetDefaultStorageClass(self) -> str:
-    """Get the default storage class for the provider."""
+    """Gets the default storage class for the provider."""
     raise NotImplementedError
 
   def GetNodeSelectors(self, machine_type: str | None = None) -> dict[str, str]:
-    """Get the node selectors section of a yaml for the provider."""
+    """Gets the node selectors section of a yaml for the provider."""
     return {}
 
   def ModifyPodSpecPlacementYaml(
@@ -260,6 +257,33 @@ class KubernetesCluster(container_cluster.BaseContainerCluster):
     ])
     return f'{self._GetAddressFromIngress(stdout)}:{port}'
 
+  def ApplyManifest(self, manifest_file: str, **kwargs) -> Any:
+    """Applies a declarative Kubernetes manifest; possibly with jinja."""
+    return kubernetes_commands.ApplyManifest(manifest_file, **kwargs)
+
+  def WaitForResource(
+      self,
+      resource_name: str,
+      condition_name: str,
+      namespace: str | None = None,
+      timeout: int = vm_util.DEFAULT_TIMEOUT,
+      wait_for_all: bool = False,
+      condition_type: str = 'condition=',
+      extra_args: list[str] | None = None,
+      **kwargs,
+  ) -> None:
+    """Waits for a condition on a Kubernetes resource (eg: deployment, pod)."""
+    return kubernetes_commands.WaitForResource(
+        resource_name,
+        condition_name,
+        namespace,
+        timeout,
+        wait_for_all,
+        condition_type,
+        extra_args,
+        **kwargs,
+    )
+
   def _GetAddressFromIngress(self, ingress_out: str):
     """Gets the endpoint address from the Ingress resource."""
     ingress = json.loads(ingress_out.strip("'"))
@@ -294,7 +318,7 @@ def _DeleteAllFromDefaultNamespace():
     run_cmd = ['delete', 'job', '--all', '-n', 'default']
     kubectl.RunRetryableKubectlCommand(run_cmd)
 
-    timeout = 60 * 20
+    timeout = 60 * 60  # 1 hour for kubectl delete all -n default (teardown)
     run_cmd = [
         'delete',
         'all',
@@ -306,7 +330,7 @@ def _DeleteAllFromDefaultNamespace():
     kubectl.RunRetryableKubectlCommand(run_cmd, timeout=timeout)
 
     run_cmd = ['delete', 'pvc', '--all', '-n', 'default']
-    kubectl.RunKubectlCommand(run_cmd)
+    kubectl.RunRetryableKubectlCommand(run_cmd, timeout=timeout)
     # There maybe a slight race if resources are cleaned up in the background
     # where deleting the cluster immediately prevents the PVCs from being
     # deleted.
@@ -323,3 +347,8 @@ def _DeleteAllFromDefaultNamespace():
         'Timed out while deleting all resources from default namespace. We'
         ' should still continue trying to delete everything.'
     ) from e
+  except errors.VmUtil.IssueCommandError as e:
+    if 'kubeconfig1: no such file or directory' in str(e):
+      logging.info('Kubeconfig not found, assuming cluster is already deleted.')
+      return
+    raise e

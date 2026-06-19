@@ -1179,7 +1179,11 @@ class BaseLinuxMixin(os_mixin.BaseOsMixin):
     self._WaitForSSH(self.internal_ip)
     self.ssh_internal_time = time.time()
 
-  @vm_util.Retry(log_errors=False, poll_interval=1)
+  @vm_util.Retry(
+      log_errors=False,
+      poll_interval=1,
+      retryable_exceptions=(errors.VirtualMachine.RemoteCommandError,),
+  )
   def _WaitForSSH(self, ip_address: Union[str, None] = None):
     """Waits until the VM is ready."""
     # Always wait for remote host command to succeed, because it is necessary to
@@ -2926,6 +2930,14 @@ class CentOsStream9Mixin(BaseRedHatMixin):
 
   OS_TYPE = os_types.CENTOS_STREAM9
 
+  def PrepareVMEnvironment(self):
+    super().PrepareVMEnvironment()
+    self.Install('python')
+    self.InstallPackages('python3.12')
+    self.RemoteCommand(
+        'sudo rm /usr/bin/python3; '
+        'sudo ln -s /usr/bin/python3.12 /usr/bin/python3')
+
   def SetupPackageManager(self):
     """Install EPEL."""
     # https://docs.fedoraproject.org/en-US/epel/#_centos_stream_9
@@ -2979,6 +2991,22 @@ class RockyLinux10Mixin(BaseRockyLinuxMixin):
   """Class holding Rocky Linux 10 specific VM methods and attributes."""
 
   OS_TYPE = os_types.ROCKY_LINUX10
+
+
+# Extend Rocky Linux mixins for Alma Linux to dedupe logic.
+class AlmaLinux8Mixin(RockyLinux8Mixin):
+  """Class holding Alma Linux 8 specific VM methods and attributes."""
+  OS_TYPE = os_types.ALMA_LINUX8
+
+
+class AlmaLinux9Mixin(RockyLinux9Mixin):
+  """Class holding Alma Linux 9 specific VM methods and attributes."""
+  OS_TYPE = os_types.ALMA_LINUX9
+
+
+class AlmaLinux10Mixin(RockyLinux10Mixin):
+  """Class holding Alma Linux 10 specific VM methods and attributes."""
+  OS_TYPE = os_types.ALMA_LINUX10
 
 
 class CoreOsMixin(BaseContainerLinuxMixin):
@@ -3337,6 +3365,12 @@ class Ubuntu2404Mixin(BaseUbuntuMixin):
   """Class holding Ubuntu 24.04 specific VM methods and attributes."""
 
   OS_TYPE = os_types.UBUNTU2404
+
+
+class Ubuntu2604Mixin(BaseUbuntuMixin):
+  """Class holding Ubuntu 26.04 specific VM methods and attributes."""
+
+  OS_TYPE = os_types.UBUNTU2604
 
 
 class ContainerizedDebianMixin(BaseDebianMixin):

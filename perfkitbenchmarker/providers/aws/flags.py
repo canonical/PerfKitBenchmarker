@@ -81,6 +81,33 @@ USE_AWS_SPOT_INSTANCES = flags.DEFINE_boolean(
     False,
     'Whether to use AWS spot instances for any AWS VMs.',
 )
+EKS_INSTALL_S3_CSI_ADDON = flags.DEFINE_boolean(
+    'eks_install_s3_csi_addon',
+    False,
+    'Install AWS Mountpoint for Amazon S3 CSI Driver as an EKS managed addon '
+    'during cluster post-create. Requires IAM permissions to be set up '
+    'out-of-band (Pod Identity Association on the addon service account).',
+)
+K8S_INFERENCE_SERVER_S3_BUCKET = flags.DEFINE_string(
+    'k8s_inference_server_s3_bucket',
+    None,
+    'The S3 bucket that has model data for inference server to use '
+    '(mounted via the AWS Mountpoint S3 CSI Driver).',
+)
+K8S_INFERENCE_SERVER_S3_REGION = flags.DEFINE_string(
+    'k8s_inference_server_s3_region',
+    None,
+    'AWS region of the S3 bucket referenced by '
+    '--k8s_inference_server_s3_bucket. Required for the Mountpoint S3 CSI '
+    'driver mount options.',
+)
+EKS_INSTALL_NEURON_DEVICE_PLUGIN = flags.DEFINE_boolean(
+    'eks_install_neuron_device_plugin',
+    False,
+    'Install the AWS Neuron Device Plugin DaemonSet on the EKS cluster during '
+    'post-create. Required so that pods can request the '
+    'aws.amazon.com/neuron resource on Inferentia/Trainium nodes.',
+)
 flags.DEFINE_float(
     'aws_spot_price',
     None,
@@ -233,6 +260,21 @@ flags.DEFINE_boolean(
     'Whether to install AWS Load Balancer Controller in EKS Karpenter clusters'
     'Default value - do not install unless explicitly requested',
 )
+flags.DEFINE_integer(
+    'eks_karpenter_limits_vcpu_per_node',
+    2,
+    'Assumed vCPUs per provisioned node when computing Karpenter NodePool '
+    'limits.cpu on EKS (uses kubernetes_scale_num_nodes, this value, and 5% '
+    'headroom; minimum limit 1000). Raise for larger EC2 instance shapes.',
+)
+flags.DEFINE_boolean(
+    'eks_tune_vpc_cni_for_scale',
+    False,
+    'Tune aws-node DaemonSet warm-pool settings (WARM_ENI_TARGET=0, '
+    'WARM_IP_TARGET=1, MINIMUM_IP_TARGET=1) after cluster creation. '
+    'Required when scaling to thousands of nodes to prevent subnet IP '
+    'exhaustion. Enable when running kubernetes_node_scale at large scale.',
+)
 AWS_CAPACITY_BLOCK_RESERVATION_ID = flags.DEFINE_string(
     'aws_capacity_block_reservation_id',
     None,
@@ -256,6 +298,11 @@ AURORA_METRICS_COLLECTION_SLEEP_SECONDS = flags.DEFINE_integer(
     2 * 60 * 60,
     'The time to sleep before collecting Aurora metrics. By default this is a'
     ' long time in order to collect accurate VolumeBytesUsed metrics.',
+)
+AWS_AURORA_EXPRESS_CONFIGURATION = flags.DEFINE_boolean(
+    'aws_aurora_express_configuration',
+    False,
+    'Whether to use express configuration for Aurora cluster creation.',
 )
 AWS_EC2_INSTANCE_PROFILE = flags.DEFINE_string(
     'aws_ec2_instance_profile',
@@ -284,6 +331,12 @@ AWS_S3_MOUNT_ENABLE_METADATA_CACHE = flags.DEFINE_boolean(
     'aws_s3_mount_enable_metadata_cache',
     False,
     'Whether to enable metadata cache for s3 mountpoint.',
+)
+
+AWS_RDS_DEDICATED_LOG_VOLUME = flags.DEFINE_boolean(
+    'aws_rds_dedicated_log_volume',
+    False,
+    'Whether to use dedicated log volume for AWS RDS MySQL and MariaDB.',
 )
 
 
@@ -349,4 +402,10 @@ AWS_DOCUMENTDB_SNAPSHOT = flags.DEFINE_string(
     'aws_documentdb_snapshot',
     None,
     'If supplied, creates the DocumentDB instance from the snapshot.',
+)
+AWS_METADATA_HTTP_TOKENS = flags.DEFINE_enum(
+    'aws_metadata_http_tokens',
+    None,
+    ['required', 'optional'],
+    'The metadata http tokens state for the ec2 instance (IMDSv2).',
 )

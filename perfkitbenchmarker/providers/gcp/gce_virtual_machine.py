@@ -95,7 +95,9 @@ _FAILED_TO_START_DUE_TO_PREEMPTION = (
 _GCE_VM_CREATE_TIMEOUT = 1200
 _GCE_NVIDIA_GPU_PREFIX = 'nvidia-'
 _GCE_NVIDIA_TESLA_GPU_PREFIX = 'nvidia-tesla-'
-_SHUTDOWN_SCRIPT = 'su "{user}" -c "echo | gsutil cp - {preempt_marker}"'
+_SHUTDOWN_SCRIPT = (
+    'su "{user}" -c "echo | gcloud storage cp - {preempt_marker}"'
+)
 METADATA_PREEMPT_URI = (
     'http://metadata.google.internal/computeMetadata/v1/instance/preempted'
 )
@@ -107,6 +109,7 @@ _MACHINE_TYPE_PREFIX_TO_ARM_ARCH = {
     't2a': 'neoverse-n1',
     'c3a': 'ampere1',
     'c4a': 'neoverse-v2',
+    'n4a': 'neoverse-n3',
 }
 # When requesting a specific GPU type independently of the machine type, choose
 # the most common version. When using a machine type from the
@@ -150,6 +153,15 @@ _FIXED_GPU_MACHINE_TYPES = {
     'g2-standard-32': (virtual_machine_spec.GPU_L4, 1),
     'g2-standard-48': (virtual_machine_spec.GPU_L4, 4),
     'g2-standard-96': (virtual_machine_spec.GPU_L4, 8),
+    # RTX Pro 6000 GPUs. 6 -> 24 actually use fractional GPUs.
+    # https://docs.cloud.google.com/compute/docs/accelerator-optimized-machines#g4-machine-types
+    'g4-standard-6': (virtual_machine_spec.GPU_RTX_PRO_6000, 1),
+    'g4-standard-12': (virtual_machine_spec.GPU_RTX_PRO_6000, 1),
+    'g4-standard-24': (virtual_machine_spec.GPU_RTX_PRO_6000, 1),
+    'g4-standard-48': (virtual_machine_spec.GPU_RTX_PRO_6000, 1),
+    'g4-standard-96': (virtual_machine_spec.GPU_RTX_PRO_6000, 2),
+    'g4-standard-192': (virtual_machine_spec.GPU_RTX_PRO_6000, 4),
+    'g4-standard-384': (virtual_machine_spec.GPU_RTX_PRO_6000, 8),
 }
 
 PKB_SKIPPED_TEARDOWN_METADATA_KEY = 'pkb_skipped_teardown'
@@ -678,6 +690,7 @@ class GceVirtualMachine(virtual_machine.BaseVirtualMachine):
     self.create_disk_strategy = gce_disk_strategies.GetCreateDiskStrategy(
         self, None, 0
     )
+    self.skip_existence_check = False
 
   def _GetNetwork(self):
     """Returns the GceNetwork to use."""
@@ -963,6 +976,7 @@ class GceVirtualMachine(virtual_machine.BaseVirtualMachine):
     if 'name' in stdout:
       response = json.loads(stdout)
       self.create_operation_name = response[0]['name']
+      self.skip_existence_check = True
 
     self._ParseCreateErrors(self.create_cmd.rate_limited, stderr, retcode)
     if not self.create_return_time:
@@ -1162,6 +1176,7 @@ class GceVirtualMachine(virtual_machine.BaseVirtualMachine):
 
   def _Delete(self):
     """Delete a GCE VM instance."""
+    self.skip_existence_check = False
     delete_cmd = util.GcloudCommand(
         self, 'compute', 'instances', 'delete', self.name
     )
@@ -1192,6 +1207,13 @@ class GceVirtualMachine(virtual_machine.BaseVirtualMachine):
   )
   def _Exists(self):
     """Returns true if the VM exists."""
+    if self.skip_existence_check:
+      # We use async creation for VMs.
+      # If the VM creation process is not yet complete,
+      # but the create operation exists, then we
+      # should skip the VM existence check and move on to checking the
+      # create operation status.
+      return True
     getinstance_cmd = util.GcloudCommand(
         self, 'compute', 'instances', 'describe', self.name
     )
@@ -1814,6 +1836,12 @@ class CosDevBasedGceVirtualMachine(BaseCosBasedGceVirtualMachine):
   DEFAULT_ARM_IMAGE_FAMILY = 'cos-arm64-dev'
 
 
+class Cos129BasedGceVirtualMachine(BaseCosBasedGceVirtualMachine):
+  OS_TYPE = os_types.COS129
+  DEFAULT_X86_IMAGE_FAMILY = 'cos-129-lts'
+  DEFAULT_ARM_IMAGE_FAMILY = 'cos-arm64-129-lts'
+
+
 class Cos125BasedGceVirtualMachine(BaseCosBasedGceVirtualMachine):
   OS_TYPE = os_types.COS125
   DEFAULT_X86_IMAGE_FAMILY = 'cos-125-lts'
@@ -1830,12 +1858,6 @@ class Cos117BasedGceVirtualMachine(BaseCosBasedGceVirtualMachine):
   OS_TYPE = os_types.COS117
   DEFAULT_X86_IMAGE_FAMILY = 'cos-117-lts'
   DEFAULT_ARM_IMAGE_FAMILY = 'cos-arm64-117-lts'
-
-
-class Cos113BasedGceVirtualMachine(BaseCosBasedGceVirtualMachine):
-  OS_TYPE = os_types.COS113
-  DEFAULT_X86_IMAGE_FAMILY = 'cos-113-lts'
-  DEFAULT_ARM_IMAGE_FAMILY = 'cos-arm64-113-lts'
 
 
 class CoreOsBasedGceVirtualMachine(
@@ -1869,6 +1891,13 @@ class Ubuntu2404BasedGceVirtualMachine(
     BaseLinuxGceVirtualMachine, linux_vm.Ubuntu2404Mixin
 ):
   DEFAULT_X86_IMAGE_FAMILY = 'ubuntu-2404-lts-amd64'
+  DEFAULT_IMAGE_PROJECT = 'ubuntu-os-cloud'
+
+
+class Ubuntu2604BasedGceVirtualMachine(
+    BaseLinuxGceVirtualMachine, linux_vm.Ubuntu2604Mixin
+):
+  DEFAULT_X86_IMAGE_FAMILY = 'ubuntu-2604-lts-amd64'
   DEFAULT_IMAGE_PROJECT = 'ubuntu-os-cloud'
 
 

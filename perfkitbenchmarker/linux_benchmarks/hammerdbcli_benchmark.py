@@ -2,7 +2,7 @@
 
 import datetime
 import posixpath
-from typing import Any
+from typing import Any, cast
 
 from absl import flags
 from perfkitbenchmarker import benchmark_spec as bm_spec
@@ -147,7 +147,7 @@ def _PrepareServer(db: iaas_relational_db.IAASRelationalDb):
       SetPostgresOptimizedServerConfiguration(
           optimized_server_config,
           db.server_vm,
-          db,
+          cast(postgres_iaas_relational_db.PostgresIAASRelationalDb, db),
           custom_server_config,
       )
 
@@ -201,6 +201,7 @@ def Prepare(benchmark_spec: bm_spec.BenchmarkSpec) -> None:
       password=db.spec.database_password,
       user=db.spec.database_username,
       is_managed_azure=(FLAGS.cloud == 'Azure' and FLAGS.use_managed_db),
+      db_engine_version=db.spec.engine_version,
   )
 
   if db.engine == sql_engine_utils.ALLOYDB:
@@ -221,10 +222,16 @@ def SetOptimizedServerConfiguration(
     db: Relational database class.
   """
   if db.engine == sql_engine_utils.MYSQL:
-    SetMysqlOptimizedServerConfiguration(optimized_server_config, server_vm, db)
+    SetMysqlOptimizedServerConfiguration(
+        optimized_server_config,
+        server_vm,
+        cast(mysql_iaas_relational_db.MysqlIAASRelationalDb, db),
+    )
   elif db.engine == sql_engine_utils.POSTGRES:
     SetPostgresOptimizedServerConfiguration(
-        optimized_server_config, server_vm, db
+        optimized_server_config,
+        server_vm,
+        cast(postgres_iaas_relational_db.PostgresIAASRelationalDb, db),
     )
 
 
@@ -351,7 +358,12 @@ def _CheckAlloyDbColumnarEngine(
 ) -> list[sample.Sample]:
   """Checks AlloyDB columnar engine recommendation and reruns if needed."""
   columnar_size, relation = db.GetColumnarEngineRecommendation('tpch')
-  db.UpdateAlloyDBFlags(columnar_size, True, 'off', relation=relation)
+  db.UpdateAlloyDBFlags(
+      columnar_engine_size=columnar_size,
+      enable_columnar_recommendation=True,
+      enable_auto_columnarization='off',
+      relation=relation,
+  )
   db.WaitColumnarEnginePopulates(database_name)
   # Another prewarm
   stdout = hammerdb.Run(client_vm, db.engine, script, timeout=timeout)
@@ -361,13 +373,12 @@ def _CheckAlloyDbColumnarEngine(
 def _PreRun(db: relational_db.BaseRelationalDb) -> None:
   """Prepares the database for the benchmark run."""
   db.ClearWaitStats()
-  db.QueryIOStats()
+  db.LogDatabaseDebugInfo()
 
 
 def _PostRun(db: relational_db.BaseRelationalDb) -> None:
   """Records the database metrics after the benchmark run."""
-  db.QueryWaitStats()
-  db.QueryIOStats()
+  db.LogDatabaseDebugInfo()
 
 
 def Run(benchmark_spec: bm_spec.BenchmarkSpec) -> list[sample.Sample]:

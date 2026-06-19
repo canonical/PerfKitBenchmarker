@@ -21,8 +21,10 @@ instructions.
 """
 
 from collections import abc
+import copy
 import json
 import logging
+import math
 import re
 from typing import Any
 from urllib import parse
@@ -42,7 +44,6 @@ from perfkitbenchmarker.resources.container_service import container_cluster
 from perfkitbenchmarker.resources.container_service import kubectl
 from perfkitbenchmarker.resources.container_service import kubernetes_cluster
 from perfkitbenchmarker.resources.container_service import kubernetes_commands
-
 
 FLAGS = flags.FLAGS
 # GPU types which practically require spot to get.
@@ -75,6 +76,29 @@ def RecursivelyUpdateDictionary(
     else:
       original[k] = v
   return original
+
+
+def ApplyInferenceS3PvAndPvc() -> None:
+  """Apply the PV and PVC backed by Mountpoint for Amazon S3 CSI driver.
+
+  Prerequisites:
+    - Model weights uploaded to the S3 bucket
+    (--k8s_inference_server_s3_bucket).
+    - S3 CSI driver installed on the cluster (--eks_install_s3_csi_addon).
+  """
+  bucket = aws_flags.K8S_INFERENCE_SERVER_S3_BUCKET.value
+  region = aws_flags.K8S_INFERENCE_SERVER_S3_REGION.value
+  if not bucket or not region:
+    raise errors.Resource.CreationError(
+        'Both --k8s_inference_server_s3_bucket and '
+        '--k8s_inference_server_s3_region are required to apply the S3 PVC.'
+    )
+  kubernetes_commands.ApplyManifest(
+      'container/kubernetes_ai_inference/s3_pv_pvc.yaml.j2',
+      s3_bucket=bucket,
+      s3_region=region,
+  )
+  logging.info('Successfully applied S3 PVC.')
 
 
 class BaseEksCluster(kubernetes_cluster.KubernetesCluster):
@@ -159,7 +183,7 @@ class BaseEksCluster(kubernetes_cluster.KubernetesCluster):
         f'--kubeconfig={FLAGS.kubeconfig}',
     ]
     stdout, _, retcode = vm_util.IssueCommand(
-        cmd, timeout=1800, raise_on_failure=False
+        cmd, timeout=2700, raise_on_failure=False
     )
     if retcode:
       if 'The maximum number of VPCs has been reached' in stdout:
@@ -181,16 +205,9 @@ class BaseEksCluster(kubernetes_cluster.KubernetesCluster):
             'pkb_nodepool': nodepool.name,
         },
     }
-    if (
-        nodepool.name == self.default_nodepool.name
-        and self.min_nodes != self.max_nodes
-    ):
-      # Min / max config only apply to the default nodepool.
-      group_json['minSize'] = self.min_nodes
-      group_json['maxSize'] = self.max_nodes
-      group_json['desiredCapacity'] = min(
-          max(self.min_nodes, nodepool.num_nodes), self.max_nodes
-      )
+    if nodepool.min_nodes != nodepool.max_nodes:
+      group_json['minSize'] = nodepool.min_nodes
+      group_json['maxSize'] = nodepool.max_nodes
     return group_json
 
   def _WriteJsonToFile(self, json_dict: dict[str, Any]) -> str:
@@ -380,6 +397,7 @@ class EksCluster(BaseEksCluster):
       vm_config: virtual_machine_spec.BaseVmSpec,
       nodepool_config: container.BaseNodePoolConfig,
   ):
+    super().InitializeNodePoolForCloud(vm_config, nodepool_config)
     nodepool_config.disk_type = (
         aws_virtual_machine.AwsVirtualMachine.DEFAULT_ROOT_DISK_TYPE
     )
@@ -542,24 +560,22 @@ class EksAutoCluster(BaseEksCluster):
   """
 
   CLOUD = provider_info.AWS
-  CLUSTER_TYPE = 'Autopilot'
+  CLUSTER_TYPE = 'Auto'
 
   def __init__(self, spec):
     super().__init__(spec)
     self._ChooseSecondZone()
-    is_rare_gpu = virtual_machine.GPU_TYPE.value in _RARE_GPU_TYPES
+    is_rare_gpu = self.gpu_type in _RARE_GPU_TYPES
     self.use_spot: bool = aws_flags.USE_AWS_SPOT_INSTANCES.value or is_rare_gpu
-
-  def InitializeNodePoolForCloud(
-      self,
-      vm_config: virtual_machine_spec.BaseVmSpec,
-      nodepool_config: container.BaseNodePoolConfig,
-  ):
-    pass
 
   def _Create(self):
     """Creates the control plane and worker nodes."""
-    self._EksCtlCreate({'autoModeConfig': {'enabled': True}})
+    self._EksCtlCreate({
+        'autoModeConfig': {
+            'enabled': True,
+            'nodePools': ['general-purpose', 'system'],
+        }
+    })
 
     # Enable public and private access to the cluster.
     vpc_cmd = [
@@ -583,6 +599,170 @@ class EksAutoCluster(BaseEksCluster):
           'container/auto/nodepool.yaml.j2',
           CLUSTER_NAME=self.name,
       )
+    if aws_flags.EKS_INSTALL_S3_CSI_ADDON.value:
+      self._InstallS3CsiAddon()
+    if aws_flags.EKS_INSTALL_NEURON_DEVICE_PLUGIN.value:
+      self._InstallNeuronDevicePlugin()
+
+  # AWS-stable identifiers for the Mountpoint for S3 CSI driver:
+  # https://docs.aws.amazon.com/eks/latest/userguide/s3-csi.html
+  _S3_CSI_ADDON_NAME = 'aws-mountpoint-s3-csi-driver'
+  _S3_CSI_SERVICE_ACCOUNT_NAME = 's3-csi-driver-sa'
+  _S3_CSI_SERVICE_ACCOUNT_NAMESPACE = 'kube-system'
+  # PKB-managed IAM resources reused across runs.
+  _S3_CSI_ROLE_NAME = 'PkbS3CsiDriverRole'
+  _S3_CSI_POLICY_NAME_PREFIX = 'PkbS3CsiDriverReadOnly'
+
+  def _InstallS3CsiAddon(self):
+    """Installs the S3 CSI Driver and the IAM glue (Role/Policy + PIA)."""
+    bucket = aws_flags.K8S_INFERENCE_SERVER_S3_BUCKET.value
+    if not bucket:
+      raise errors.Config.InvalidValue(
+          '--k8s_inference_server_s3_bucket is required when '
+          '--eks_install_s3_csi_addon is enabled.'
+      )
+    policy_arn = self._EnsureS3CsiPolicy(bucket)
+    role_arn = self._EnsureS3CsiRole(policy_arn)
+
+    vm_util.IssueRetryableCommand(
+        util.AWS_PREFIX
+        + [
+            'eks',
+            'create-addon',
+            '--region',
+            self.region,
+            '--cluster-name',
+            self.name,
+            '--addon-name',
+            self._S3_CSI_ADDON_NAME,
+            '--resolve-conflicts',
+            'OVERWRITE',
+        ]
+    )
+    vm_util.IssueRetryableCommand(
+        util.AWS_PREFIX
+        + [
+            'eks',
+            'wait',
+            'addon-active',
+            '--region',
+            self.region,
+            '--cluster-name',
+            self.name,
+            '--addon-name',
+            self._S3_CSI_ADDON_NAME,
+        ],
+        timeout=900,
+    )
+    self._EnsureS3CsiPodIdentityAssociation(role_arn)
+    logging.info('Successfully installed Mountpoint for S3 CSI Driver.')
+
+  def _EnsureS3CsiPolicy(self, bucket: str) -> str:
+    """Idempotently creates the read-only S3 policy; returns its ARN."""
+    name = f'{self._S3_CSI_POLICY_NAME_PREFIX}-{bucket}'
+    doc = {
+        'Version': '2012-10-17',
+        'Statement': [
+            {
+                'Effect': 'Allow',
+                'Action': ['s3:ListBucket'],
+                'Resource': [f'arn:aws:s3:::{bucket}'],
+            },
+            {
+                'Effect': 'Allow',
+                'Action': ['s3:GetObject'],
+                'Resource': [f'arn:aws:s3:::{bucket}/*'],
+            },
+        ],
+    }
+    vm_util.IssueCommand(
+        util.AWS_PREFIX
+        + [
+            'iam',
+            'create-policy',
+            '--policy-name',
+            name,
+            '--policy-document',
+            json.dumps(doc),
+        ],
+        suppress_failure=lambda stdout, stderr, retcode: (
+            'EntityAlreadyExists' in stderr
+        ),
+    )
+    return f'arn:aws:iam::{self.account}:policy/{name}'
+
+  def _EnsureS3CsiRole(self, policy_arn: str) -> str:
+    """Idempotently creates the S3 CSI driver role; returns its ARN."""
+    trust = {
+        'Version': '2012-10-17',
+        'Statement': [{
+            'Effect': 'Allow',
+            'Principal': {'Service': 'pods.eks.amazonaws.com'},
+            'Action': ['sts:AssumeRole', 'sts:TagSession'],
+        }],
+    }
+    vm_util.IssueCommand(
+        util.AWS_PREFIX
+        + [
+            'iam',
+            'create-role',
+            '--role-name',
+            self._S3_CSI_ROLE_NAME,
+            '--assume-role-policy-document',
+            json.dumps(trust),
+        ],
+        suppress_failure=lambda stdout, stderr, retcode: (
+            'EntityAlreadyExists' in stderr
+        ),
+    )
+    # attach-role-policy is idempotent at the AWS API level.
+    vm_util.IssueCommand(
+        util.AWS_PREFIX
+        + [
+            'iam',
+            'attach-role-policy',
+            '--role-name',
+            self._S3_CSI_ROLE_NAME,
+            '--policy-arn',
+            policy_arn,
+        ]
+    )
+    return f'arn:aws:iam::{self.account}:role/{self._S3_CSI_ROLE_NAME}'
+
+  def _EnsureS3CsiPodIdentityAssociation(self, role_arn: str) -> None:
+    """Idempotently binds the role to s3-csi-driver-sa via Pod Identity."""
+    vm_util.IssueCommand(
+        util.AWS_PREFIX
+        + [
+            'eks',
+            'create-pod-identity-association',
+            '--region',
+            self.region,
+            '--cluster-name',
+            self.name,
+            '--namespace',
+            self._S3_CSI_SERVICE_ACCOUNT_NAMESPACE,
+            '--service-account',
+            self._S3_CSI_SERVICE_ACCOUNT_NAME,
+            '--role-arn',
+            role_arn,
+        ],
+        suppress_failure=lambda stdout, stderr, retcode: (
+            'already exists' in stderr.lower()
+        ),
+    )
+
+  def _InstallNeuronDevicePlugin(self):
+    """Applies the AWS Neuron Device Plugin DaemonSet to the cluster."""
+    # PKB only renders .j2 when ApplyManifest kwargs is non-empty
+    # (vm_util.ReadAndRenderJinja2Template). With no kwargs the literal
+    # "{{ neuron_device_plugin_image }}" would be sent to kubectl.
+    default_image = 'public.ecr.aws/neuron/neuron-device-plugin:2.22.4.0'
+    kubernetes_commands.ApplyManifest(
+        'container/aws/neuron-device-plugin.yaml.j2',
+        neuron_device_plugin_image=default_image,
+    )
+    logging.info('Successfully applied Neuron Device Plugin DaemonSet.')
 
   def _Delete(self):
     """Deletes the control plane and worker nodes."""
@@ -624,16 +804,14 @@ class EksAutoCluster(BaseEksCluster):
     selectors = {'eks.amazonaws.com/compute-type': 'auto'}
     if self.use_spot:
       selectors['karpenter.sh/capacity-type'] = 'spot'
-    if virtual_machine.GPU_TYPE.value:
-      selectors['eks.amazonaws.com/instance-gpu-name'] = (
-          virtual_machine.GPU_TYPE.value
-      )
+    if self.gpu_type:
+      selectors['eks.amazonaws.com/instance-gpu-name'] = self.gpu_type
     return selectors
 
 
 _KARPENTER_NAMESPACE = 'kube-system'
 _KARPENTER_VERSION = '1.8.1'
-_DEAULT_K8S_VERSION = '1.34'
+_DEFAULT_K8S_VERSION = '1.34'
 
 
 class EksKarpenterCluster(BaseEksCluster):
@@ -649,14 +827,11 @@ class EksKarpenterCluster(BaseEksCluster):
     super().__init__(spec)
     self._ChooseSecondZone()
     self.stack_name = f'Karpenter-{self.name}'
-    self.cluster_version: str = self.cluster_version or _DEAULT_K8S_VERSION
-
-  def InitializeNodePoolForCloud(
-      self,
-      vm_config: virtual_machine_spec.BaseVmSpec,
-      nodepool_config: container.BaseNodePoolConfig,
-  ):
-    pass
+    self.cluster_version: str = self.cluster_version or _DEFAULT_K8S_VERSION
+    # The AMI version for current kubernetes version.
+    # See e.g. https://karpenter.sh/docs/tasks/managing-amis/ for not using
+    # @latest.
+    self.alias_version: str | None = None
 
   def _Create(self):
     """Creates the control plane and worker nodes."""
@@ -689,6 +864,13 @@ class EksKarpenterCluster(BaseEksCluster):
         ]
         + formation_tags,
     )
+    # The default control plane nodepool is only used for initial commands
+    # to setup Karpenter. Karpenter will setup its own nodepools later.
+    bootstrapping_nodepool = copy.copy(self.default_nodepool)
+    bootstrapping_nodepool.num_nodes = 1
+    bootstrapping_nodepool.min_nodes = 1
+    bootstrapping_nodepool.max_nodes = 1
+    bootstrapping_nodepool.machine_type = 'm7i.2xlarge'
     create_json: dict[str, Any] = {
         'metadata': {
             'tags': {'karpenter.sh/discovery': self.name},
@@ -711,7 +893,9 @@ class EksKarpenterCluster(BaseEksCluster):
             'groups': ['system:bootstrappers', 'system:nodes'],
         }],
         'addons': [{'name': 'eks-pod-identity-agent'}],
-        'managedNodeGroups': [self._RenderNodeGroupJson(self.default_nodepool)],
+        'managedNodeGroups': [
+            self._RenderNodeGroupJson(bootstrapping_nodepool)
+        ],
     }
     self._EksCtlCreate(create_json)
 
@@ -803,7 +987,7 @@ class EksKarpenterCluster(BaseEksCluster):
         suppress_failure=lambda stdout, stderr, retcode: 'already exists'
         in stderr,
     )
-    # 5) Installs Helm chart
+    # 5) Install via helm.
     vm_util.IssueCommand(
         ['helm', 'repo', 'add', 'eks', 'https://aws.github.io/eks-charts'],
         suppress_failure=lambda stdout, stderr, retcode: 'already exists'
@@ -995,6 +1179,37 @@ class EksKarpenterCluster(BaseEksCluster):
   def _PostCreate(self):
     """Performs post-creation steps for the cluster."""
     super()._PostCreate()
+    if FLAGS.eks_tune_vpc_cni_for_scale:
+      logging.info('Tuning aws-node (VPC CNI) for kubernetes_node_scale')
+      kubectl.RunKubectlCommand([
+          'set',
+          'env',
+          'daemonset/aws-node',
+          '-n',
+          'kube-system',
+          'WARM_ENI_TARGET=0',
+          'WARM_IP_TARGET=1',
+          'MINIMUM_IP_TARGET=1',
+      ])
+      kubectl.RunRetryableKubectlCommand(
+          [
+              'rollout',
+              'status',
+              'daemonset/aws-node',
+              '-n',
+              'kube-system',
+              '--timeout=%ds' % vm_util.DEFAULT_TIMEOUT,
+          ],
+          timeout=vm_util.DEFAULT_TIMEOUT,
+      )
+    # Karpenter controller resources: default 1/1Gi; scale up controller when
+    # more nodes are expected.
+    if self.max_total_nodes > 1000:
+      controller_cpu, controller_memory = 4, '16Gi'
+    elif self.max_total_nodes >= 500:
+      controller_cpu, controller_memory = 2, '8Gi'
+    else:
+      controller_cpu, controller_memory = 1, '1Gi'
     vm_util.IssueCommand([
         'helm',
         'upgrade',
@@ -1012,14 +1227,17 @@ class EksKarpenterCluster(BaseEksCluster):
         f'settings.clusterName={self.name}',
         '--set',
         f'settings.interruptionQueue={self.name}',
+        # Not always needed but enable the feature.
         '--set',
-        'controller.resources.requests.cpu=1',
+        'settings.featureGates.staticCapacity=true',
         '--set',
-        'controller.resources.requests.memory=1Gi',
+        f'controller.resources.requests.cpu={controller_cpu}',
         '--set',
-        'controller.resources.limits.cpu=1',
+        f'controller.resources.requests.memory={controller_memory}',
         '--set',
-        'controller.resources.limits.memory=1Gi',
+        f'controller.resources.limits.cpu={controller_cpu}',
+        '--set',
+        f'controller.resources.limits.memory={controller_memory}',
         '--set',
         'logLevel=debug',
         '--wait',
@@ -1027,6 +1245,44 @@ class EksKarpenterCluster(BaseEksCluster):
     # Ensure ALB ingress support: installs AWS Load Balancer Controller.
     if FLAGS.eks_install_alb_controller:
       self._InstallAwsLoadBalancerController()
+    if virtual_machine.GPU_TYPE.value:
+      # Install NVIDIA drivers.
+      vm_util.IssueCommand(
+          [
+              'helm',
+              'repo',
+              'add',
+              'nvdp',
+              'https://nvidia.github.io/k8s-device-plugin',
+          ],
+          suppress_failure=lambda stdout, stderr, retcode: 'already exists'
+          in stderr,
+      )
+      vm_util.IssueCommand(['helm', 'repo', 'update', 'nvdp'])
+      # Allow node discovery pod to schedule even over NoSchedule taint.
+      tolerations_string = (
+          'tolerations=[{"key":"nvidia.com/gpu","operator":'
+          + '"Exists","effect":"NoSchedule"}]'
+      )
+      vm_util.IssueCommand([
+          'helm',
+          'upgrade',
+          '--install',
+          'nvdp',
+          'nvdp/nvidia-device-plugin',
+          '--namespace',
+          'kube-system',
+          '--kubeconfig',
+          FLAGS.kubeconfig,
+          '--set',
+          'gfd.enabled=true',
+          '--set',
+          'node-feature-discovery.enabled=true',
+          '--set-json',
+          f'nfd.worker.{tolerations_string}',
+          '--set-json',
+          tolerations_string,
+      ])
     # Get the AMI version for current kubernetes version.
     # See e.g. https://karpenter.sh/docs/tasks/managing-amis/ for not using
     # @latest.
@@ -1053,15 +1309,56 @@ class EksKarpenterCluster(BaseEksCluster):
         '--region',
         self.region,
     ])
-    alias_version = (
+    self.alias_version = (
         'v'
         + full_version.strip().strip('"').split(f'{self.cluster_version}-v')[1]
     )
-    kubernetes_commands.ApplyManifest(
+    self._CreateKarpenterNodePool(self.default_nodepool)
+    for nodepool in self.nodepools.values():
+      self._CreateKarpenterNodePool(nodepool)
+
+  def _CreateKarpenterNodePool(self, nodepool: container.BaseNodePoolConfig):
+    """Creates the Karpenter NodePool and EC2NodeClass."""
+    yaml_nodepool = kubernetes_commands.ConvertManifestToYamlDicts(
         'container/karpenter/nodepool.yaml.j2',
+        NODEPOOL_NAME=nodepool.name,
         CLUSTER_NAME=self.name,
-        ALIAS_VERSION=alias_version,
+        ALIAS_VERSION=self.alias_version,
     )
+    if nodepool.machine_families:
+      machine_requirements = [
+          {
+              'key': 'karpenter.k8s.aws/instance-family',
+              'operator': 'In',
+              'values': nodepool.machine_families,
+          },
+          {
+              'key': 'karpenter.k8s.aws/instance-generation',
+              'operator': 'Gt',
+              'values': ['2'],
+          },
+      ]
+    else:
+      machine_requirements = [{
+          'key': 'node.kubernetes.io/instance-type',
+          'operator': 'In',
+          'values': [nodepool.machine_type],
+      }]
+    yaml_nodepool[0]['spec']['template']['spec']['requirements'].extend(
+        machine_requirements
+    )
+    if nodepool.min_nodes == nodepool.max_nodes:
+      # Not using autoscaling; set static replica count & don't consolidate.
+      del yaml_nodepool[0]['spec']['disruption']
+      yaml_nodepool[0]['spec']['replicas'] = nodepool.num_nodes
+    else:
+      # NodePool CPU limit: max nodes * vCPU + 5%, max 1000.
+      vcpu_per_node = FLAGS.eks_karpenter_limits_vcpu_per_node
+      cpu_limit = max(
+          1000, math.ceil(nodepool.max_nodes * vcpu_per_node * 1.05)
+      )
+      yaml_nodepool[0]['spec']['limits'] = {'cpu': cpu_limit}
+    kubernetes_commands.ApplyYaml(yaml_nodepool)
 
   def _Delete(self):
     """Deletes the control plane and worker nodes."""
@@ -1093,16 +1390,33 @@ class EksKarpenterCluster(BaseEksCluster):
     # Start deleting the stack but likely to fail to delete this role.
     vm_util.IssueCommand(delete_stack_cmd)
     node_role = f'KarpenterNodeRole-{self.name}'
-    out, _, _ = vm_util.IssueCommand([
-        'aws',
-        'iam',
-        'list-instance-profiles-for-role',
-        '--role-name',
-        node_role,
-        '--region',
-        f'{self.region}',
-    ])
-    profiles_json = json.loads(out)
+    out, _, retcode = vm_util.IssueCommand(
+        [
+            'aws',
+            'iam',
+            'list-instance-profiles-for-role',
+            '--role-name',
+            node_role,
+            '--region',
+            f'{self.region}',
+        ],
+        suppress_failure=lambda stdout, stderr, rc: (
+            rc != 0
+            and (
+                'nosuchentity' in (stderr or '').lower()
+                or 'cannot be found' in (stderr or '').lower()
+            )
+        ),
+    )
+    if retcode == 0 and out.strip():
+      profiles_json = json.loads(out)
+    else:
+      logging.info(
+          'Karpenter node role %s not found or empty response; skipping'
+          ' instance profile cleanup',
+          node_role,
+      )
+      profiles_json = {'InstanceProfiles': []}
     for profile in profiles_json.get('InstanceProfiles', []):
       profile_name = profile['InstanceProfileName']
       vm_util.IssueCommand([
@@ -1139,6 +1453,7 @@ class EksKarpenterCluster(BaseEksCluster):
             '--timeout=600s',
         ],
         timeout=660,
+        raise_on_timeout=False,
         suppress_failure=lambda stdout, stderr, retcode: (
             'deleted' in stdout
             and 'timed out waiting for the condition' in stderr
@@ -1149,21 +1464,21 @@ class EksKarpenterCluster(BaseEksCluster):
     """Cleanup Karpenter managed nodes before cluster deletion."""
     logging.info('Cleaning up Karpenter nodes...')
     # Delete NodePool resources - this will trigger node termination
-    kubectl.RunKubectlCommand(
+    kubectl.RunRetryableKubectlCommand(
         [
             'delete',
             'nodepool,ec2nodeclass',
             '--all',
             '--timeout=120s',
         ],
+        timeout=300,
         suppress_failure=lambda stdout, stderr, retcode: (
             'no resources found' in stderr.lower()
             or 'not found' in stderr.lower()
-            or 'timed out waiting for the condition' in stderr.lower()
         ),
     )
     # Wait for all Karpenter nodes to be deleted
-    kubectl.RunKubectlCommand(
+    kubectl.RunRetryableKubectlCommand(
         [
             'wait',
             '--for=delete',
@@ -1172,11 +1487,13 @@ class EksKarpenterCluster(BaseEksCluster):
             'karpenter.sh/nodepool',
             '--timeout=120s',
         ],
+        timeout=300,
         suppress_failure=lambda stdout, stderr, retcode: (
             'no matching resources found' in stderr.lower()
-            or 'timed out' in stderr.lower()
+            or 'no resources found' in stderr.lower()
         ),
     )
+
     # Force terminate remaining EC2 instances
     stdout, _, _ = vm_util.IssueCommand(
         [
@@ -1246,21 +1563,40 @@ class EksKarpenterCluster(BaseEksCluster):
     if eni_ids:
       logging.info('Deleting %d orphaned network interfaces', len(eni_ids))
       for eni_id in eni_ids:
-        vm_util.IssueCommand(
-            [
-                'aws',
-                'ec2',
-                'delete-network-interface',
-                '--region',
-                self.region,
-                '--network-interface-id',
-                eni_id,
-            ],
-            suppress_failure=lambda stdout, stderr, retcode: (
-                'not found' in stderr.lower()
-                or 'does not exist' in stderr.lower()
-            ),
-        )
+        # Bind eni_id by default to avoid loop closure issues if
+        # this is refactored.
+        def _DeleteOneEni(eni_id=eni_id) -> None:
+          _, stderr, retcode = vm_util.IssueCommand(
+              [
+                  'aws',
+                  'ec2',
+                  'delete-network-interface',
+                  '--region',
+                  self.region,
+                  '--network-interface-id',
+                  eni_id,
+              ],
+              raise_on_failure=False,
+          )
+          if retcode == 0:
+            return
+          stderr_lower = (stderr or '').lower()
+          # ENI already deleted (e.g. by another process or previous attempt).
+          if 'invalidnetworkinterfaceid.notfound' in stderr_lower:
+            return
+          # RequestLimitExceeded (throttle): retry via vm_util.Retry.
+          if 'requestlimitexceeded' in stderr_lower:
+            raise errors.Resource.RetryableDeletionError(stderr or '')
+          raise errors.VmUtil.IssueCommandError(
+              f'DeleteNetworkInterface failed: {stderr}'
+          )
+
+        # max_retries=5 yields 6 CLI attempts (tries > 5 on 6th failure).
+        vm_util.Retry(
+            poll_interval=10,
+            max_retries=5,
+            retryable_exceptions=(errors.Resource.RetryableDeletionError,),
+        )(_DeleteOneEni)()
 
   def _IsReady(self):
     """Returns True if cluster is running. Autopilot defaults to 0 nodes."""
@@ -1282,14 +1618,9 @@ class EksKarpenterCluster(BaseEksCluster):
   def GetNodeSelectors(self, machine_type: str | None = None) -> dict[str, str]:
     """Gets the node selectors section of a yaml for the provider."""
     selectors = {}
-    # If GPU is requested, use the GPU nodepool
-    if virtual_machine.GPU_TYPE.value:
-      selectors['karpenter.sh/nodepool'] = 'gpu'
-    else:
-      # Otherwise, use instance-family selector if machine_type is specified
-      machine_family = util.GetMachineFamily(machine_type)
-      if machine_family:
-        selectors['karpenter.k8s.aws/instance-family'] = machine_family
+    machine_family = util.GetMachineFamily(machine_type)
+    if machine_family:
+      selectors['karpenter.k8s.aws/instance-family'] = machine_family
     return selectors
 
   def GetNodePoolNames(self) -> list[str]:

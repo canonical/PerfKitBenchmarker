@@ -18,6 +18,7 @@ from typing import Any
 
 from absl import flags
 from perfkitbenchmarker import data
+from perfkitbenchmarker import flags as pkb_flags
 from perfkitbenchmarker import resource
 from perfkitbenchmarker import virtual_machine_spec
 from perfkitbenchmarker.configs import container_spec as container_spec_lib
@@ -115,11 +116,12 @@ class BaseContainerService(resource.BaseResource):
 class ContainerImage:
   """Simple class for tracking container image names and source locations."""
 
-  def __init__(self, name: str):
+  def __init__(self, name: str, directory: str | None = None):
     self.name: str = name
-    self.directory: str = os.path.dirname(
-        data.ResourcePath(os.path.join('docker', self.name, 'Dockerfile'))
-    )
+    if directory:
+      self.directory: str = data.ResourcePath(directory)
+    else:
+      self.directory: str = data.ResourcePath(os.path.join('docker', self.name))
 
 
 def NodePoolName(name: str) -> str:
@@ -134,23 +136,62 @@ class BaseNodePoolConfig:
   """A node pool's config, where each node in the node pool has the same config.
 
   See also: https://cloud.google.com/kubernetes-engine/docs/concepts/node-pools
+
+  Attributes:
+    machine_type: str. The machine type of the node pool.
+    machine_families: list[str]. If set, overrides machine_type. The machine
+      families allowed in the node pool.
+    zone: str. The zone the node pool is in.
+    name: str. The name of the node pool.
+    num_nodes: int. The starting number of nodes in the node pool; can vary
+      after that with autoscaling. Given sentinel value here; defined with an
+      actual value in _InitializeDefaultNodePool.
+    min_nodes: int. The minimum number of nodes in the node pool. If set to a
+      non-num_nodes value, the nodepool uses auLike above.
+    max_nodes: int. The maximum number of nodes in the node pool. Like above.
+    disk_type: str. The type of disk for the nodes in the node pool.
+    disk_size: int. The size of the disk for the nodes in the node pool in GB.
+    gpu_type: str. The type of GPU for the nodes in the node pool.
+    gpu_count: int. The number of GPUs per node.
   """
 
-  def __init__(self, vm_spec: virtual_machine_spec.BaseVmSpec, name: str):
-    self.machine_type = vm_spec.machine_type
+  def __init__(
+      self,
+      vm_spec: virtual_machine_spec.BaseVmSpec,
+      name: str,
+      machine_families: list[str] | None = None,
+  ):
+    self.machine_type: str | None = vm_spec.machine_type
+    self.machine_families: list[str] = machine_families or []
+    if self.machine_families and self.machine_type:
+      if pkb_flags.K8S_MACHINE_FAMILIES.value:
+        # Setting machine families via flag will override config specific
+        # machine type for convenience, but specifying both via config_override
+        # is a clear error.
+        self.machine_type = None
+      else:
+        raise ValueError(
+            f'Machine families was set to {self.machine_families}'
+            f' while machine type was set to {self.machine_type}.'
+            ' Specify only one at a time.'
+        )
     self.zone: str = vm_spec.zone
     self.name = NodePoolName(name)
-    self.sandbox_config: container_spec_lib.SandboxSpec | None = None
-    self.num_nodes: int
+    self.num_nodes: int = 1
+    self.min_nodes: int = 1
+    self.max_nodes: int = 1
     self.disk_type: str | None = vm_spec.boot_disk_type
     self.disk_size: int = vm_spec.boot_disk_size
+    self.gpu_type: str | None = vm_spec.gpu_type
+    self.gpu_count: int | None = vm_spec.gpu_count
     # Defined by GceVirtualMachineConfig. Used by google_kubernetes_engine
+    # pylint: disable=g-missing-from-attributes
+    self.sandbox_config: container_spec_lib.SandboxSpec | None = None
     self.max_local_disks: int | None
     self.ssd_interface: str | None
-    self.gpu_type: str | None
-    self.gpu_count: int | None
     self.threads_per_core: int
     self.gce_tags: list[str]
     self.min_cpu_platform: str
     self.cpus: int
     self.memory_mib: int
+    # pylint: enable=g-missing-from-attributes

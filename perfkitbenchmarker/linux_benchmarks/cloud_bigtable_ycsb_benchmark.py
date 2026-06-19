@@ -91,11 +91,6 @@ _USE_UPGRADED_DRIVER = flags.DEFINE_boolean(
     'If true, will use the googlebigtable2 binding with ycsb. Requires'
     ' --google_bigtable_use_java_veneer_client to be true.',
 )
-_ENABLE_DIRECT_PATH = flags.DEFINE_boolean(
-    'google_bigtable_enable_direct_path',
-    False,
-    'If true, sets an environment variable to enable DirectPath.',
-)
 _ENABLE_TRAFFIC_DIRECTOR = flags.DEFINE_boolean(
     'google_bigtable_enable_traffic_director',
     False,
@@ -122,6 +117,12 @@ _CHANNEL_COUNT = flags.DEFINE_integer(
         'Bigtable RPCs instead of the default number. Note: has no effect on '
         'the googlebigtable binding.'
     ),
+)
+
+_YCSB_JVM_ARGS = flags.DEFINE_list(
+    'google_bigtable_ycsb_jvm_args',
+    [],
+    'A list of custom JVM arguments to pass to the YCSB runner.',
 )
 
 BENCHMARK_NAME = 'cloud_bigtable_ycsb'
@@ -279,13 +280,6 @@ def _Install(vm: virtual_machine.VirtualMachine, bigtable: _Bigtable) -> None:
       else:
         vm.RemoteCopy(file_path, remote_path)
 
-  if _ENABLE_DIRECT_PATH.value:
-    # Requires minimum client bigtable 2.45.0 or bigtable-hbase 2.14.5.
-    vm.RemoteCommand(
-        'echo "export CBT_ENABLE_DIRECTPATH=true" | sudo tee -a'
-        ' /etc/environment'
-    )
-
 
 @vm_util.Retry()
 def _GetCpuUtilizationSample(
@@ -403,11 +397,11 @@ def _GetYcsbExecutor(
 ) -> ycsb.YCSBExecutor:
   """Gets the YCSB executor class for loading and running the benchmark."""
   ycsb_memory = min(vms[0].total_memory_kb // 1024, 4096)
-  jvm_args = shlex.quote(f' -Xmx{ycsb_memory}m')
+  jvm_args_list = [f'-Xmx{ycsb_memory}m']
+  if _YCSB_JVM_ARGS.value:
+    jvm_args_list.extend(_YCSB_JVM_ARGS.value)
+  jvm_args = shlex.quote(' ' + shlex.join(jvm_args_list))
   env = {}
-  if _ENABLE_DIRECT_PATH.value:
-    env['CBT_ENABLE_DIRECTPATH'] = str(_ENABLE_DIRECT_PATH.value)
-
   if _USE_JAVA_VENEER_CLIENT.value:
     executor_flags = {'jvm-args': jvm_args, 'table': _GetTableName()}
     # Temporary until old driver is deprecated.
@@ -463,7 +457,7 @@ def Run(benchmark_spec: bm_spec.BenchmarkSpec) -> List[sample.Sample]:
 
   metadata = {
       'ycsb_client_vms': len(vms),
-      'direct_path': _ENABLE_DIRECT_PATH.value,
+      'direct_path': True,
   }
   metadata.update(instance.GetResourceMetadata())
 

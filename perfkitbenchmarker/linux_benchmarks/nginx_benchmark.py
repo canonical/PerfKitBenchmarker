@@ -109,7 +109,7 @@ flags.DEFINE_enum(
     'Benchmark scenario. Can be "reverse_proxy" or "api_gateway". Set to'
     ' "reverse_proxy" by default.',
 )
-_P99_LATENCY_THRESHOLD = flags.DEFINE_integer(
+P99_LATENCY_THRESHOLD = flags.DEFINE_integer(
     'nginx_p99_latency_threshold',
     100,
     'The p99 latency threshold (in milliseconds) for the benchmark to output'
@@ -120,6 +120,12 @@ _NGINX_SERVER_PORT = flags.DEFINE_integer(
     0,
     'The port that nginx server will listen to. 0 will use '
     'default ports (80 or 443 depending on --nginx_use_ssl).',
+)
+
+_NGINX_CLIENT_RTO_MIN = flags.DEFINE_integer(
+    'nginx_client_rto_min',
+    None,
+    'The minimum retransmission timeout (in milliseconds) for the client',
 )
 
 
@@ -158,13 +164,14 @@ nginx:
       vm_count: null
 """
 
-_CONTENT_FILENAME = 'random_content'
-_API_GATEWAY_PATH = 'api_old'  # refer to data/nginx/rp_apigw.conf
+CONTENT_FILENAME = 'random_content'
+API_GATEWAY_PATH = 'api_old'  # refer to data/nginx/rp_apigw.conf
 _WORKER_CONNECTIONS = 1024
 # Target rates are per NIC.
-_TARGET_RATE_LOWER_BOUND = 0
-_TARGET_RATE_UPPER_BOUND = 1000000
-_RPS_RANGE_THRESHOLD = 1000
+TARGET_RATE_LOWER_BOUND = 0
+TARGET_RATE_UPPER_BOUND = 1000000
+RPS_RANGE_THRESHOLD = 1000
+RPS_BINARY_SEARCH_THRESHOLD = 0.01
 
 
 def GetConfig(user_config):
@@ -221,7 +228,7 @@ def _ConfigureNginxServer(server, upstream_servers):
 def _ConfigureNginxUpstreamServer(upstream_server):
   """Configures nginx upstream server."""
   root_dir = '/usr/share/nginx/html'
-  content_path = root_dir + '/' + _CONTENT_FILENAME
+  content_path = root_dir + '/' + CONTENT_FILENAME
   upstream_server.RemoteCommand(f'sudo mkdir -p {root_dir}')
   upstream_server.RemoteCommand(
       'sudo dd  bs=1 count=%s if=/dev/urandom of=%s'
@@ -356,6 +363,12 @@ def _TuneNetworkStack(vm):
   vm.RemoteCommand(f'sudo sysctl -w net.core.somaxconn={max_port_num}')
   vm.RemoteCommand('sudo sysctl net.ipv4.tcp_autocorking=0')
 
+  if _NGINX_CLIENT_RTO_MIN.value:
+    vm.RemoteCommand(
+        f'sudo ip route replace $(ip route show default | head -n 1) '
+        f'rto_min {_NGINX_CLIENT_RTO_MIN.value}'
+    )
+
 
 def Prepare(benchmark_spec):
   """Install Nginx on the server and a load generator on the clients.
@@ -378,7 +391,7 @@ def Prepare(benchmark_spec):
   )
 
 
-def _RunMultiClient(clients, targets, rate, connections, duration, threads):
+def RunMultiClient(clients, targets, rate, connections, duration, threads):
   """Run multiple instances of wrk2 against a single target."""
   results = []
   num_clients = len(clients)
@@ -429,9 +442,12 @@ def _RunMultiClient(clients, targets, rate, connections, duration, threads):
       'nginx_throttle': FLAGS.nginx_throttle,
       'nginx_worker_connections': _WORKER_CONNECTIONS,
       'nginx_use_ssl': FLAGS.nginx_use_ssl,
-      'p99_latency_threshold': _P99_LATENCY_THRESHOLD.value,
+      'p99_latency_threshold': P99_LATENCY_THRESHOLD.value,
       'num_server_targets': len(targets),
+      'nginx_content_size': FLAGS.nginx_content_size,
   }
+  if _NGINX_CLIENT_RTO_MIN.value:
+    metadata['nginx_client_rto_min'] = _NGINX_CLIENT_RTO_MIN.value
   if not FLAGS.nginx_file_server_conf:
     metadata['caching'] = True
   results += [
@@ -472,17 +488,17 @@ def Run(benchmark_spec):
     portstr = f':{FLAGS.nginx_server_port}' if FLAGS.nginx_server_port else ''
     if FLAGS.nginx_scenario == 'reverse_proxy':
       # e.g. "https://10.128.0.36/random_content"
-      target = f'{scheme}://{hoststr}{portstr}/{_CONTENT_FILENAME}'
+      target = f'{scheme}://{hoststr}{portstr}/{CONTENT_FILENAME}'
     # FLAGS.nginx_scenario = 'api_gateway'
     else:
       # e.g. "https://10.128.0.36/api_old/random_content"
       target = (
-          f'{scheme}://{hoststr}{portstr}/{_API_GATEWAY_PATH}/{_CONTENT_FILENAME}'
+          f'{scheme}://{hoststr}{portstr}/{API_GATEWAY_PATH}/{CONTENT_FILENAME}'
       )
     targets.append(target)
 
   if FLAGS.nginx_throttle:
-    return _RunMultiClient(
+    return RunMultiClient(
         clients,
         targets,
         rate=100000000,  # 100M aggregate requests/sec should max out requests.
@@ -492,15 +508,17 @@ def Run(benchmark_spec):
     )
 
   # Binary search for highest RPS under the p99 latency threshold.
-  if _P99_LATENCY_THRESHOLD.value:
+  if P99_LATENCY_THRESHOLD.value:
     lower_bound, upper_bound = (
-        _TARGET_RATE_LOWER_BOUND,
-        _TARGET_RATE_UPPER_BOUND,
+        TARGET_RATE_LOWER_BOUND,
+        TARGET_RATE_UPPER_BOUND,
     )
     target_rate = upper_bound
     valid_results = []
-    while (upper_bound - lower_bound) > _RPS_RANGE_THRESHOLD:
-      results = _RunMultiClient(
+    while (
+        (upper_bound - lower_bound) / (upper_bound)
+    ) > RPS_BINARY_SEARCH_THRESHOLD:
+      results = RunMultiClient(
           clients,
           targets,
           rate=target_rate,
@@ -511,7 +529,7 @@ def Run(benchmark_spec):
       for result in results:
         if result.metric == 'p99 latency':
           p99_latency = result.value
-          if p99_latency > _P99_LATENCY_THRESHOLD.value:
+          if p99_latency > P99_LATENCY_THRESHOLD.value:
             upper_bound = target_rate
           else:
             lower_bound = target_rate
@@ -524,7 +542,7 @@ def Run(benchmark_spec):
   results = []
   for config in FLAGS.nginx_load_configs:
     rate, duration, threads, connections = list(map(int, config.split(':')))
-    results += _RunMultiClient(
+    results += RunMultiClient(
         clients, targets, rate, connections, duration, threads
     )
   return results

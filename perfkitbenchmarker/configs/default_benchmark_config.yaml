@@ -37,7 +37,25 @@ dpdk_pktgen_multi_nic_small_pkt_loss:
     gce_nic_types: GVNIC,GVNIC,GVNIC
     gce_nic_queue_counts: default,default,default
     dpdk_pktgen_max_lcores: 128
-    dpdk_pktgen_tx_rx_lcores_list: ['[2:1]#[51:52];[1:2]#[51:52]','[51:52]#[2:1];[51:52]#[1:2]']
+    dpdk_pktgen_tx_rx_lcores_list: ['[2:1]#[51:52];[1:2]#[51:52]']
+
+dpdk_pktgen_multi_nic_small_pkt_loss_external_IP:
+  name: dpdk_pktgen
+  flags:
+    dpdk_pktgen_tx_burst: 64
+    dpdk_pktgen_rx_burst: 128
+    dpdk_pktgen_packet_loss_threshold_rates: 0.0001
+    dpdk_pktgen_txd: 2048
+    dpdk_pktgen_rxd: 2048
+    dpdk_pktgen_mbufs_per_port_multiplier: 8
+    gce_subnet_name: default,dpdk0,dpdk1
+    gce_nic_types: GVNIC,GVNIC,GVNIC
+    gce_nic_queue_counts: default,default,default
+    dpdk_pktgen_max_lcores: 128
+    assign_external_ip_all_nics: True
+    ip_addresses: EXTERNAL
+    dpdk_pktgen_initial_rate: 24_000_000
+    dpdk_pktgen_tx_rx_lcores_list: ['[2:1]#[51:52];[1:2]#[51:52]']
 
 dpdk_pktgen_multi_nic:
   name: dpdk_pktgen
@@ -46,7 +64,7 @@ dpdk_pktgen_multi_nic:
     gce_nic_types: GVNIC,GVNIC,GVNIC
     gce_nic_queue_counts: default,default,default
     dpdk_pktgen_max_lcores: 128
-    dpdk_pktgen_tx_rx_lcores_list: ['[2:1]#[51:52];[1:2]#[51:52]','[51:52]#[2:1];[51:52]#[1:2]']
+    dpdk_pktgen_tx_rx_lcores_list: ['[2:1]#[51:52];[1:2]#[51:52]']
 
 speccpu2017_int_rate_GCC_O3_x86:
   name: speccpu2017
@@ -295,6 +313,29 @@ redis_memtier_session_storage_single_node:
     servers:
       <<: *redis_memtier_session_storage_disk_spec
 
+gke_kubernetes_nginx:
+  name: kubernetes_nginx
+  flags:
+    nginx_scenario: 'reverse_proxy'
+    nginx_use_ssl: 'false'
+    nginx_content_size: 1024
+    nginx_p99_latency_threshold: 100
+
+gke_kubernetes_redis_memtier:
+  name: kubernetes_redis_memtier
+  flags:
+    redis_server_version: '7.4.7'
+    memtier_protocol: 'redis'
+    memtier_clients: 12
+    memtier_threads: 32
+    memtier_ratio: '1:4'
+    memtier_data_size: 1024
+    memtier_key_maximum: 6400000
+    memtier_run_duration: 15
+    redis_server_io_threads: '4'
+    redis_server_io_threads_do_reads: True
+    kubernetes_redis_memtier_save: '""'
+
 redis_memtier_session_storage_cluster:
   name: redis_memtier
   flags:
@@ -308,6 +349,33 @@ redis_memtier_session_storage_cluster:
       vm_count: 3
       <<: *redis_memtier_session_storage_disk_spec
 
+# GKE-optimized Redis 7 caching - uses PKB VMs with GKE optimization labels
+gke_optimized_redis_memtier:
+  name: gke_optimized_redis_memtier
+  flags:
+    # Standard Redis settings (using existing flags)
+    redis_server_version: '7.2.6'
+    redis_server_enable_snapshots: False
+    redis_server_io_threads_do_reads: True
+    redis_eviction_policy: allkeys-lru
+    enable_transparent_hugepages: False
+
+    # Memtier settings (using existing flags)
+    memtier_ratio: '1:4'
+    memtier_clients: 12
+    memtier_threads: 32
+    memtier_run_duration: 300
+    memtier_run_count: 10
+    memtier_data_size: 1024
+    memtier_key_maximum: 6400000
+    memtier_pipeline: 1
+
+    # GKE optimization
+    gke_redis_enable_optimization: True
+
+    # Monitoring
+    iostat: True
+    sar: True
 
 sparksql_tpcds_1t:
   name: dpb_sparksql_benchmark
@@ -408,6 +476,30 @@ mysql_sysbench_oltp_read_only_lssd:
     sysbench_testname: oltp_read_only
     <<: *sysbench_oltp_base_lssd
 
+mysql_sysbench_oltp_read_only_lssd_with_7T_fio_prefill:
+  name: unmanaged_mysql_sysbench_lssd
+  flags:
+    sysbench_testname: oltp_read_only
+    <<: *sysbench_oltp_base_lssd
+    sysbench_tables: 210
+    sysbench_load_threads: 210
+
+mysql_sysbench_oltp_read_write_lssd_with_4T_fio_prefill:
+  name: unmanaged_mysql_sysbench_lssd
+  flags:
+    sysbench_testname: oltp_read_write
+    <<: *sysbench_oltp_base_lssd
+    sysbench_tables: 210
+    sysbench_load_threads: 210
+
+mysql_sysbench_oltp_read_write_lssd_with_7T_fio_prefill:
+  name: unmanaged_mysql_sysbench_lssd
+  flags:
+    sysbench_testname: oltp_read_write
+    <<: *sysbench_oltp_base_lssd
+    sysbench_tables: 420
+    sysbench_load_threads: 420
+
 mysql_sysbench_oltp_read_write_lssd:
   name: unmanaged_mysql_sysbench
   flags:
@@ -428,6 +520,14 @@ mysql_sysbench_tpcc:
     sysbench_tables: 10
     sysbench_use_fk: False
     sysbench_txn_isolation_level: RC
+
+kubernetes_mysql_sysbench:
+  name: kubernetes_mysql_sysbench
+  flags:
+    sysbench_run_seconds: 300
+    sysbench_run_threads: 512
+    sysbench_tables: 8
+    sysbench_table_size: 50000000
 
 postgresql_sysbench_oltp_base: &postgresql_sysbench_oltp_base
   sysbench_table_size: 21000000
@@ -473,6 +573,12 @@ fio_latency:
     fio_runtime: 300
     fio_target_mode: against_device_with_fill
 
+fio_object_storage_latency_100GB_2mb:
+  name: fio_object_storage
+  flags:
+    blobfuse_block_size_mb: 2
+    fio_generate_scenarios: rand_2m_read_100GB_iodepth-1_numjobs-1
+
 fio_object_storage_latency_8kb:
   name: fio_object_storage
   flags:
@@ -480,7 +586,16 @@ fio_object_storage_latency_8kb:
     fio_fill_size: 80000K
     fio_fill_block_size: 8k
     fio_nr_files: 10000
-    fio_ramptime: 0
+    fio_runtime: 0
+
+fio_object_storage_latency_2mb:
+  name: fio_object_storage
+  flags:
+    blobfuse_block_size_mb: 2
+    fio_generate_scenarios: rand_2M_read_20000MB_iodepth-1_numjobs-1
+    fio_fill_size: 20000M
+    fio_fill_block_size: 2M
+    fio_nr_files: 10000
     fio_runtime: 0
 
 fio_remote_ssd_max_iops:
@@ -670,6 +785,13 @@ kvrocks_memtier:
 cassandra_stress_mixed_workload:
   name: cassandra_stress
   flags:
-    cassandra_stress_run_duration: 10m
     cassandra_stress_mixed_ratio: 'write=3,read=1'
     cassandra_stress_command: 'mixed'
+    cassandra_compaction_throughput_mb: 250
+    cassandra_stress_preload_num_keys: 550000000  # 550000000 preload keys are writing ~140G of data to the disk. The dataset size needs to be 5 times the VM memory and 8 vCPU standard machines usually have around 30G memory.
+    cassandra_stress_population_size: 550000000
+
+nginx_network_saturated_workload:
+  name: nginx
+  flags:
+    nginx_content_size: 256000

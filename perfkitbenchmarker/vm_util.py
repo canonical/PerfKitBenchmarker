@@ -32,6 +32,7 @@ from typing import Any, Callable, Dict, Iterable, Literal, Tuple
 
 from absl import flags
 import jinja2
+from perfkitbenchmarker import benchmark_status
 from perfkitbenchmarker import data
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import log_util
@@ -154,20 +155,23 @@ _SSH_PRIVATE_KEY = flags.DEFINE_string(
 _SSH_KEY_TYPE = flags.DEFINE_string('ssh_key_type', 'rsa', 'SSH key type.')
 
 
-class RetryError(Exception):
+class RetryError(errors.Error):
   """Base class for retry errors."""
 
 
 class TimeoutExceededRetryError(RetryError):
   """Exception that is raised when a retryable function times out."""
+  STATUS = benchmark_status.FailedSubstatus.COMMAND_TIMEOUT
 
 
 class RetriesExceededRetryError(RetryError):
   """Exception that is raised when a retryable function hits its retry limit."""
+  STATUS = benchmark_status.FailedSubstatus.RETRIES_EXCEEDED
 
 
-class ImageNotFoundError(Exception):
+class ImageNotFoundError(errors.Error):
   """Exception that is raised when an image is not found."""
+  STATUS = benchmark_status.FailedSubstatus.UNSUPPORTED
 
 
 class IpAddressSubset:
@@ -590,15 +594,15 @@ def IssueCommand(
     if should_time:
       timing_output = tf_timing.read().rstrip('\n')
 
-  logged_stdout = '[REDACTED]' if suppress_logging else stdout
-  logged_stderr = '[REDACTED]' if suppress_logging else stderr
-  debug_text = 'Ran: {%s}\nReturnCode:%s%s\nSTDOUT: %s\nSTDERR: %s' % (
+  debug_text = 'Ran: {%s}\nReturnCode:%s%s' % (
       full_cmd,
       process.returncode,
       timing_output,
-      logged_stdout,
-      logged_stderr,
   )
+  if not suppress_logging:
+    debug_text += f'\nSTDOUT: {stdout}\nSTDERR: {stderr}'
+  else:
+    debug_text += '  STDOUT & STDERR: [REDACTED]'
   if _VM_COMMAND_LOG_MODE.value == VmCommandLogMode.ALWAYS_LOG or (
       _VM_COMMAND_LOG_MODE.value == VmCommandLogMode.LOG_ON_ERROR
       and process.returncode
@@ -1067,6 +1071,9 @@ def ReadYamlAsDicts(file_contents: str) -> list[dict[str, Any]]:
   return return_yamls
 
 
+EMPTY_DICT_SENTINEL = 'empty_dict'
+
+
 def ConvertToDictType(yaml_doc: Any, dict_lambda: Any) -> dict[str, Any] | Any:
   """Converts a YAML document to the given dictionary type.
 
@@ -1091,6 +1098,9 @@ def ConvertToDictType(yaml_doc: Any, dict_lambda: Any) -> dict[str, Any] | Any:
     converted_value = ConvertToDictType(value, dict_lambda)
     if not bool(converted_value) and converted_value != 0:
       return None
+    # Allow for manually inserting empty dicts via sentinel value.
+    if converted_value == EMPTY_DICT_SENTINEL:
+      converted_value = {}
     return converted_value
 
   yaml_list = []

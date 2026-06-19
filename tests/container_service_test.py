@@ -1,3 +1,4 @@
+import itertools
 import os
 import pickle
 import tempfile
@@ -5,6 +6,7 @@ import time
 from typing import Callable, Iterable, Protocol, Tuple
 import unittest
 from unittest import mock
+from absl import flags
 from absl.testing import parameterized
 from perfkitbenchmarker import data
 from perfkitbenchmarker import errors
@@ -17,7 +19,6 @@ from perfkitbenchmarker.sample import Sample
 from tests import container_service_mock
 from tests import pkb_common_test_case
 
-
 kubectl_timeout_tuple = (
     '',
     (
@@ -26,6 +27,8 @@ kubectl_timeout_tuple = (
     ),
     1,
 )
+
+FLAGS = flags.FLAGS
 
 _ELECTION_EVENT_NO_NAME = """
 apiVersion: v1
@@ -110,6 +113,11 @@ class ContainerServiceTest(pkb_common_test_case.PkbCommonTestCase):
     self.kubernetes_cluster = (
         container_service_mock.CreateTestKubernetesCluster()
     )
+
+    self.enter_context(
+        mock.patch.object(time, 'time', side_effect=itertools.count(10, 10))
+    )
+    self.enter_context(mock.patch.object(time, 'sleep', autospec=True))
 
   @parameterized.parameters('created', 'configured')
   def test_apply_manifest_gets_deployment_name(self, suffix):
@@ -216,9 +224,8 @@ class ContainerServiceTest(pkb_common_test_case.PkbCommonTestCase):
       ],
       autospec=True,
   )
-  @mock.patch.object(time, 'sleep', autospec=True)
   def test_retriable_kubectl_command_retries_on_retriable_error(
-      self, sleep_mock, issue_command_mock
+      self, issue_command_mock
   ):
     out, err, ret = kubectl.RunRetryableKubectlCommand(['get', 'pods'])
     self.assertEqual(out, 'pod1, pod2')
@@ -321,6 +328,23 @@ class ContainerServiceTest(pkb_common_test_case.PkbCommonTestCase):
         ],
     )
 
+  def testContainerClusterSpecMissingGpuCount(self):
+    vm_spec = {
+        container_service_mock.TEST_CLOUD: {
+            'gpu_type': 'k80',
+        },
+    }
+    with self.assertRaises(errors.Config.MissingOption) as cm:
+      container_spec.ContainerClusterSpec(
+          'test-cluster',
+          flag_values=FLAGS,
+          cloud=container_service_mock.TEST_CLOUD,
+          vm_spec=vm_spec,
+      )
+    self.assertEqual(
+        str(cm.exception), 'gpu_count must be specified if gpu_type is set'
+    )
+
   @parameterized.named_parameters(
       ('aks default', 'aks-default-30566860-vmss000000', 'default'),
       ('gke default', 'gke-pkb-8ee57c86-default-pool-232fa391-34qh', 'default'),
@@ -385,6 +409,128 @@ class ContainerServiceTest(pkb_common_test_case.PkbCommonTestCase):
       nodepool_cluster.GetNodePoolFromNodeName(
           'gke-pkb-8ee57c86-default-for-serving-232fa391-34qh'
       )
+
+  def testGetNodepoolMetadata(self):
+    vm_spec = {
+        container_service_mock.TEST_CLOUD: {
+            'machine_type': 'fake-machine-type',
+            'zone': 'us-east2-a',
+        },
+    }
+    nodepool_cluster = container_service_mock.TestKubernetesCluster(
+        container_spec.ContainerClusterSpec(
+            'test-cluster',
+            **{
+                'cloud': container_service_mock.TEST_CLOUD,
+                'vm_spec': vm_spec,
+                'nodepools': {
+                    'default-for-serving': {
+                        'vm_spec': vm_spec,
+                    },
+                },
+            },
+        )
+    )
+    self.assertEqual(
+        nodepool_cluster.GetResourceMetadata()['nodepools'],
+        {
+            'default-for-serving': {
+                'size': 1,
+                'machine_type': 'fake-machine-type',
+                'name': 'default-for-serving',
+            },
+        },
+    )
+
+  def testGetMetadata(self):
+    vm_spec = {
+        container_service_mock.TEST_CLOUD: {
+            'machine_type': 'fake-machine-type',
+            'zone': 'us-east2-a',
+        },
+    }
+    cluster = container_service_mock.TestKubernetesCluster(
+        container_spec.ContainerClusterSpec(
+            'test-cluster',
+            **{
+                'cloud': container_service_mock.TEST_CLOUD,
+                'vm_spec': vm_spec,
+            },
+        )
+    )
+    self.assertEqual(
+        cluster.GetResourceMetadata(),
+        {
+            'cloud': 'UnitTest',
+            'cluster_type': 'Kubernetes',
+            'machine_type': 'fake-machine-type',
+            'nodepools': {},
+            'num_nodepools': 1,
+            'size': 1,
+            'zone': 'us-east2-a',
+        },
+    )
+
+  def testNumNodes_overridenByMaxNodes(self):
+    vm_spec = {
+        container_service_mock.TEST_CLOUD: {
+            'machine_type': 'fake-machine-type',
+            'zone': 'us-east2-a',
+        },
+    }
+    cluster = container_service_mock.TestKubernetesCluster(
+        container_spec.ContainerClusterSpec(
+            'test-cluster',
+            **{
+                'cloud': container_service_mock.TEST_CLOUD,
+                'vm_spec': vm_spec,
+                'min_vm_count': 6,
+                'max_vm_count': 10,
+            },
+        )
+    )
+    self.assertDictContainsSubset(
+        {
+            'size': 6,
+            'min_size': 6,
+            'max_size': 10,
+        },
+        cluster.GetResourceMetadata(),
+    )
+
+  def testMinMaxNodes_withNodepools(self):
+    vm_spec = {
+        container_service_mock.TEST_CLOUD: {
+            'machine_type': 'fake-machine-type',
+            'zone': 'us-east2-a',
+        },
+    }
+    cluster = container_service_mock.TestKubernetesCluster(
+        container_spec.ContainerClusterSpec(
+            'test-cluster',
+            **{
+                'cloud': container_service_mock.TEST_CLOUD,
+                'vm_spec': vm_spec,
+                'min_vm_count': 2,
+                'max_vm_count': 3,
+                'nodepools': {
+                    'pool1': {
+                        'vm_spec': vm_spec,
+                        'vm_count': 4,
+                        'min_vm_count': 3,
+                        'max_vm_count': 10,
+                    },
+                },
+            },
+        )
+    )
+    self.assertEqual(cluster.num_nodes, 2)
+    self.assertEqual(cluster.min_nodes, 2)
+    self.assertEqual(cluster.max_nodes, 3)
+    nodepool = cluster.nodepools['pool1']
+    self.assertEqual(nodepool.num_nodes, 4)
+    self.assertEqual(nodepool.min_nodes, 3)
+    self.assertEqual(nodepool.max_nodes, 10)
 
   @parameterized.named_parameters(
       ('eks_auto', 'hostname', 'k8s-fib-fib-123.elb.us-east-1.amazonaws.com'),

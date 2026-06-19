@@ -22,6 +22,8 @@ https://toonk.io/building-a-high-performance-linux-based-traffic-generator-with-
 """
 
 import copy
+import dataclasses
+import logging
 from typing import Any, Mapping
 
 from absl import flags
@@ -32,6 +34,24 @@ from perfkitbenchmarker import linux_virtual_machine
 from perfkitbenchmarker import sample
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.linux_packages import dpdk_pktgen
+
+
+@dataclasses.dataclass
+class PktgenStats:
+  """Stats from a Pktgen run."""
+
+  sender_tx_pkts: int | None = None
+  sender_rx_pkts: int | None = None
+  receiver_rx_pkts: int | None = None
+  packet_loss_rate: float | None = None
+
+  def GetPacketLossRate(self) -> float:
+    """Calculates packet loss rate from sender and receiver stats."""
+    return (
+        int(self.sender_tx_pkts)
+        + int(self.sender_rx_pkts)
+        - int(self.receiver_rx_pkts)
+    ) / int(self.sender_tx_pkts)
 
 
 BENCHMARK_NAME = 'dpdk_pktgen'
@@ -57,6 +77,9 @@ FLAGS = flags.FLAGS
 _DPDK_PKTGEN_DURATION = flags.DEFINE_integer(
     'dpdk_pktgen_duration', 60, 'Run duration in seconds.'
 )
+_DPDK_PKTGEN_PACKET_SIZE = flags.DEFINE_integer(
+    'dpdk_pktgen_packet_size', 64, 'The packet size in bytes.'
+)
 _DPDK_PKTGEN_PACKET_LOSS_THRESHOLDS = flags.DEFINE_multi_float(
     'dpdk_pktgen_packet_loss_threshold_rates',
     [0],
@@ -69,15 +92,20 @@ _DPDK_PKTGEN_NUM_FLOWS = flags.DEFINE_integer(
     'Number of flows to use by taking a range of source ports.',
     lower_bound=0,
 )
-# Pktgen-dpdk perform incorrectly with multiple threads, causing both incorrect
-# count on the receiver and severe performance limitations. Hence restrict the
-# test to single thread. This limits the sending rate to approximately 50-55Mpps
-# but the TX path on the NIC is throttled at 48Mpps anyways.
+# On GCP, Pktgen-dpdk perform incorrectly with multiple threads, causing both
+# incorrect count on the receiver and severe performance limitations. Hence
+# restrict the test to single thread. This limits the sending rate to
+# approximately 50-55Mpps but the TX path on the NIC is throttled at 48Mpps
+# anyways.
 # https://github.com/pktgen/Pktgen-DPDK/issues/369#issue-3777028887
 _DPDK_PKTGEN_TX_RX_LCORES_LIST = flags.DEFINE_list(
     'dpdk_pktgen_tx_rx_lcores_list',
     [
+        # This is optimal on GCP since multiple queues leads to incorrect
+        # counters and cache contention.
         '[2:1];[1:2]',
+        # This is optimal on AWS.
+        '[8:1-7];[1-7:8]',
     ],
     'A list of strings designating logical cores assigned to TX and RX. Each'
     ' string is in the form'
@@ -106,6 +134,13 @@ _DPDK_PKTGEN_TXD = flags.DEFINE_integer(
 _DPDK_PKTGEN_RXD = flags.DEFINE_integer(
     'dpdk_pktgen_rxd', 8192, 'The size of the RX descriptor ring size.'
 )
+_DPDK_PKTGEN_INITIAL_RATE = flags.DEFINE_integer(
+    'dpdk_pktgen_initial_rate',
+    50_000_000,
+    'Custom initial rate (PPS) per NIC to start the binary search for max'
+    ' throughput in specific tests. If not set, the benchmark will use a'
+    'default initial rate of 50,000,000.',
+)
 
 # DPDK Pktgen maximum logical cores
 # _MAX_LCORES is not really useful, pktgen-dpdk is buggy with multiple tx/rx
@@ -116,8 +151,8 @@ _MAX_LCORES = flags.DEFINE_integer(
     16,
     'Maximum number of logical cores to use.',
 )
-
-_START_RATE = 50_000_000
+# This is the default rate defined in dpdk pktgen per NIC.
+_PKTGEN_DEFAULT_RATE = 50_000_000
 # Percent difference in PPS between consecutive iterations to terminate binary
 # search.
 _PPS_BINARY_SEARCH_THRESHOLD = 0.01
@@ -307,6 +342,11 @@ def PrepareVM(
       f'sudo sed -i "s/<RX_BURST>/{_DPDK_PKTGEN_RX_BURST.value}/g"'
       f' {dpdk_pktgen.DPDK_PKTGEN_GIT_REPO_DIR}/pktgen.pkt'
   )
+  # Update packet size.
+  vm.RemoteCommand(
+      f'sudo sed -i "s/<PACKET_SIZE>/{_DPDK_PKTGEN_PACKET_SIZE.value}/g"'
+      f' {dpdk_pktgen.DPDK_PKTGEN_GIT_REPO_DIR}/pktgen.pkt'
+  )
 
 
 def IssueCommand(vm: linux_virtual_machine.BaseLinuxVirtualMachine, cmd: str):
@@ -346,6 +386,7 @@ def Run(benchmark_spec: bm_spec.BenchmarkSpec) -> list[sample.Sample]:
   base_metadata = {
       'dpdk_pktgen_tx_burst': _DPDK_PKTGEN_TX_BURST.value,
       'dpdk_pktgen_rx_burst': _DPDK_PKTGEN_RX_BURST.value,
+      'dpdk_pktgen_packet_size': _DPDK_PKTGEN_PACKET_SIZE.value,
       'dpdk_pktgen_lcores': num_lcores,
       'dpdk_pktgen_num_memory_channels': num_memory_channels,
       'dpdk_pktgen_duration': _DPDK_PKTGEN_DURATION.value,
@@ -369,121 +410,182 @@ def Run(benchmark_spec: bm_spec.BenchmarkSpec) -> list[sample.Sample]:
     if receiver_vm.tertiary_nic_bus_info:
       aws_eal_arg += f' -a "{receiver_vm.tertiary_nic_bus_info},llq_policy=1"'
 
-  def _FindMaxRateFromConfig(
-      tx_cmd: str, rx_cmd: str, packet_loss_threshold: float, start_rate: float
-  ) -> tuple[int | None, int | None, int | None, float]:
-    """Runs a binary search to find the max PPS for a given configuration."""
-    valid_total_sender_tx_pkts = None
-    valid_total_sender_rx_pkts = None
-    valid_total_receiver_rx_pkts = None
-    valid_packet_loss_rate = 1
+  def RunPktgen(
+      tx_cmd: str, rx_cmd: str
+  ) -> PktgenStats:
+    """Runs a Pktgen instance."""
+    background_tasks.RunParallelThreads(
+        [
+            (IssueCommand, [receiver_vm, rx_cmd], {}),
+            (IssueCommand, [sender_vm, tx_cmd], {}),
+        ],
+        post_task_delay=1,  # Ensure receiver starts before sender.
+        max_concurrency=2,
+    )
+    # Parse ANSI codes from pktgen output to get packet counts.
+    stdout_rx_parser = (
+        f'cat {dpdk_pktgen.DPDK_PKTGEN_GIT_REPO_DIR}/{_STDOUT_LOG_FILE} |'
+        r' grep -oP "\[7;22H\s*\K[0-9]+" | tail -1'
+    )
+    stdout_tx_parser = (
+        f'cat {dpdk_pktgen.DPDK_PKTGEN_GIT_REPO_DIR}/{_STDOUT_LOG_FILE} |'
+        r' grep -oP "\[8;22H\s*\K[0-9]+" | tail -1'
+    )
+    total_sender_tx_pkts, _ = sender_vm.RemoteCommand(stdout_tx_parser)
+    total_sender_rx_pkts, _ = sender_vm.RemoteCommand(stdout_rx_parser)
+    total_receiver_rx_pkts, _ = receiver_vm.RemoteCommand(stdout_rx_parser)
 
-    prev_pps, curr_pps = -float('inf'), 0
+    if receiver_vm.tertiary_nic_bus_info:
+      stdout_rx_parser_2 = stdout_rx_parser.replace('7;22H', '7;46H')
+      stdout_tx_parser_2 = stdout_tx_parser.replace('8;22H', '8;46H')
+      total_sender_rx_pkts_2, _ = sender_vm.RemoteCommand(stdout_rx_parser_2)
+      total_sender_tx_pkts_2, _ = sender_vm.RemoteCommand(stdout_tx_parser_2)
+      total_receiver_rx_pkts_2, _ = receiver_vm.RemoteCommand(
+          stdout_rx_parser_2
+      )
+      total_sender_rx_pkts = int(total_sender_rx_pkts) + int(
+          total_sender_rx_pkts_2
+      )
+      total_sender_tx_pkts = int(total_sender_tx_pkts) + int(
+          total_sender_tx_pkts_2
+      )
+      total_receiver_rx_pkts = int(total_receiver_rx_pkts) + int(
+          total_receiver_rx_pkts_2
+      )
+    return PktgenStats(
+        sender_tx_pkts=total_sender_tx_pkts,
+        sender_rx_pkts=total_sender_rx_pkts,
+        receiver_rx_pkts=total_receiver_rx_pkts,
+    )
+
+  def UpdatePpsAndRecompile(
+      vm: linux_virtual_machine.BaseLinuxVirtualMachine,
+      curr_rate: int,
+      prev_rate: int,
+  ) -> None:
+    """Updates PPS in app/pktgen.c and compiles Pktgen."""
+    vm.RemoteCommand(
+        f'sudo sed -i "s/pps        = {prev_rate};/pps        ='
+        f' {curr_rate};/g"'
+        f' {dpdk_pktgen.DPDK_PKTGEN_GIT_REPO_DIR}/app/pktgen.c'
+    )
+    vm.RemoteCommand(
+        f'cd {dpdk_pktgen.DPDK_PKTGEN_GIT_REPO_DIR} && make'
+    )
+
+  def _FindMaxRateFromConfig(
+      tx_cmd: str,
+      rx_cmd: str,
+      packet_loss_threshold: float,
+      pktgen_default_rate: float,
+      best_config_receiver_pps: int,
+  ) -> PktgenStats:
+    """Runs a binary search to find the max PPS for a given configuration."""
+    valid_run = PktgenStats(packet_loss_rate=1.0)
+
+    # Tracks the set rate to ensure standard binary search convergence.
+    prev_offered_pps, curr_offered_pps = -float('inf'), 0
+    # Tracks the valid receiver rate to allow early termination on bottleneck.
+    prev_achieved_pps, curr_achieved_pps = -float('inf'), 0
     curr_rate = None
-    lb, ub = 0, start_rate * 2
-    prev_rate = start_rate
+    lb, ub = 0, pktgen_default_rate * 2
+    prev_rate = pktgen_default_rate
+    runs_per_rate = 10
+    min_successful_runs = 8
+    max_failed_runs = runs_per_rate - min_successful_runs
 
     while (
-        (abs(curr_pps - prev_pps) / (curr_pps + 1))
-        > _PPS_BINARY_SEARCH_THRESHOLD
-    ) or (valid_total_receiver_rx_pkts is None):
-      curr_rate = (lb + ub) // 2
-      sender_vm.RemoteCommand(
-          f'sudo sed -i "s/pps        = {prev_rate};/pps        ='
-          f' {curr_rate};/g"'
-          f' {dpdk_pktgen.DPDK_PKTGEN_GIT_REPO_DIR}/app/pktgen.c'
-      )
-      sender_vm.RemoteCommand(
-          f'cd {dpdk_pktgen.DPDK_PKTGEN_GIT_REPO_DIR} && make'
-      )
-      background_tasks.RunParallelThreads(
-          [
-              (IssueCommand, [receiver_vm, rx_cmd], {}),
-              (IssueCommand, [sender_vm, tx_cmd], {}),
-          ],
-          post_task_delay=1,  # Ensure receiver starts before sender.
-          max_concurrency=2,
-      )
+        (
+            (
+                abs(curr_offered_pps - prev_offered_pps)
+                / (curr_offered_pps + 1)
+            )
+            > _PPS_BINARY_SEARCH_THRESHOLD
+        )
+        and (
+            valid_run.receiver_rx_pkts is None
+            or (
+                abs(curr_achieved_pps - prev_achieved_pps)
+                / (curr_achieved_pps + 1)
+            )
+            > _PPS_BINARY_SEARCH_THRESHOLD
+        )
+    ) and (ub > best_config_receiver_pps):
+      if curr_rate is None:
+        # If the best config receiver PPS is known from a previous
+        # configuration run, use it as the starting rate.
+        # Otherwise, start with the default rate.
+        if best_config_receiver_pps > 0:
+          curr_rate = best_config_receiver_pps
+        else:
+          curr_rate = _DPDK_PKTGEN_INITIAL_RATE.value
+      else:
+        curr_rate = (lb + ub) // 2
+      run_count, fail_count, pass_count = 0, 0, 0
+      curr_run = PktgenStats()
+      UpdatePpsAndRecompile(sender_vm, int(curr_rate), int(prev_rate))
+      while (
+          run_count < runs_per_rate
+          and fail_count <= max_failed_runs
+          and pass_count < min_successful_runs
+      ):
+        stats = RunPktgen(tx_cmd, rx_cmd)
+        run_count += 1
+        if not all([
+            stats.sender_tx_pkts,
+            stats.sender_rx_pkts,
+            stats.receiver_rx_pkts,
+        ]):
+          # Failed run, treat as 100% loss.
+          fail_count += 1
+          continue
 
-      # Parse ANSI codes from pktgen output to get packet counts.
-      stdout_rx_parser = (
-          f'cat {dpdk_pktgen.DPDK_PKTGEN_GIT_REPO_DIR}/{_STDOUT_LOG_FILE} |'
-          r' grep -oP "\[7;22H\s*\K[0-9]+" | tail -1'
-      )
-      stdout_tx_parser = (
-          f'cat {dpdk_pktgen.DPDK_PKTGEN_GIT_REPO_DIR}/{_STDOUT_LOG_FILE} |'
-          r' grep -oP "\[8;22H\s*\K[0-9]+" | tail -1'
-      )
-      total_sender_tx_pkts, _ = sender_vm.RemoteCommand(stdout_tx_parser)
-      total_sender_rx_pkts, _ = sender_vm.RemoteCommand(stdout_rx_parser)
-      total_receiver_rx_pkts, _ = receiver_vm.RemoteCommand(stdout_rx_parser)
+        stats.packet_loss_rate = stats.GetPacketLossRate()
+        logging.info('Target PPS rate: %s', curr_rate)
+        logging.info(
+            'Sender PPS: %s',
+            int(stats.sender_tx_pkts) // _DPDK_PKTGEN_DURATION.value,
+        )
+        logging.info(
+            'Receiver PPS: %s',
+            int(stats.receiver_rx_pkts) // _DPDK_PKTGEN_DURATION.value,
+        )
+        logging.info('Packet loss rate: %s', stats.packet_loss_rate)
+        if stats.packet_loss_rate > packet_loss_threshold:
+          fail_count += 1
+          if curr_run.sender_tx_pkts is None:
+            curr_run = stats
+        else:
+          pass_count += 1
+          curr_run = stats
 
-      if receiver_vm.tertiary_nic_bus_info:
-        stdout_rx_parser_2 = stdout_rx_parser.replace('7;22H', '7;46H')
-        stdout_tx_parser_2 = stdout_tx_parser.replace('8;22H', '8;46H')
-        total_sender_rx_pkts_2, _ = sender_vm.RemoteCommand(stdout_rx_parser_2)
-        total_sender_tx_pkts_2, _ = sender_vm.RemoteCommand(stdout_tx_parser_2)
-        total_receiver_rx_pkts_2, _ = receiver_vm.RemoteCommand(
-            stdout_rx_parser_2
-        )
-        total_sender_rx_pkts = int(total_sender_rx_pkts) + int(
-            total_sender_rx_pkts_2
-        )
-        total_sender_tx_pkts = int(total_sender_tx_pkts) + int(
-            total_sender_tx_pkts_2
-        )
-        total_receiver_rx_pkts = int(total_receiver_rx_pkts) + int(
-            total_receiver_rx_pkts_2
-        )
-      if not all([
-          total_sender_tx_pkts,
-          total_sender_rx_pkts,
-          total_receiver_rx_pkts,
-      ]):
-        # Failed run, treat as 100% loss and narrow the search space.
-        ub = curr_rate
-        prev_rate = curr_rate
-        continue
-
-      packet_loss_rate = (
-          int(total_sender_tx_pkts)
-          + int(total_sender_rx_pkts)
-          - int(total_receiver_rx_pkts)
-      ) / int(total_sender_tx_pkts)
-      if packet_loss_rate > packet_loss_threshold:
+      if fail_count > max_failed_runs:
         ub = curr_rate
       else:
-        # This is a valid run, save the results.
-        valid_total_sender_tx_pkts = total_sender_tx_pkts
-        valid_total_sender_rx_pkts = total_sender_rx_pkts
-        valid_total_receiver_rx_pkts = total_receiver_rx_pkts
-        valid_packet_loss_rate = packet_loss_rate
+        valid_run = curr_run
         lb = curr_rate
-      prev_pps, curr_pps = (
-          curr_pps,
-          int(total_receiver_rx_pkts) // _DPDK_PKTGEN_DURATION.value,
+      # Always update offered PPS to track binary search progress.
+      prev_offered_pps, curr_offered_pps = (
+          curr_offered_pps,
+          curr_rate,
       )
+      # Only update achieved PPS on valid runs to avoid early termination on
+      # bottleneck.
+      if fail_count <= max_failed_runs:
+        if valid_run.receiver_rx_pkts is not None:
+          prev_achieved_pps, curr_achieved_pps = (
+              curr_achieved_pps,
+              int(valid_run.receiver_rx_pkts) // _DPDK_PKTGEN_DURATION.value,
+          )
       prev_rate = curr_rate
 
     # Reset PPS target in app/pktgen.c so sed command can work on next
     # function invocation.
     if curr_rate:
-      sender_vm.RemoteCommand(
-          f'sudo sed -i "s/pps        = {curr_rate};/pps        ='
-          f' {start_rate};/g"'
-          f' {dpdk_pktgen.DPDK_PKTGEN_GIT_REPO_DIR}/app/pktgen.c'
-      )
-      sender_vm.RemoteCommand(
-          f'cd {dpdk_pktgen.DPDK_PKTGEN_GIT_REPO_DIR} && make'
-      )
-    return (
-        valid_total_sender_tx_pkts,
-        valid_total_sender_rx_pkts,
-        valid_total_receiver_rx_pkts,
-        valid_packet_loss_rate,
-    )
+      UpdatePpsAndRecompile(sender_vm, int(pktgen_default_rate), int(curr_rate))
+    return valid_run
 
-  prev_rate = _START_RATE
+  prev_rate = _PKTGEN_DEFAULT_RATE
   for packet_loss_threshold in _DPDK_PKTGEN_PACKET_LOSS_THRESHOLDS.value:
     best_run_results = {}
     max_receiver_pkts = -1
@@ -519,8 +621,18 @@ def Run(benchmark_spec: bm_spec.BenchmarkSpec) -> list[sample.Sample]:
           f' > {_STDOUT_LOG_FILE}'
       )
       # Find the max rate for this specific core configuration
-      s_tx, s_rx, r_rx, loss = _FindMaxRateFromConfig(
-          tx_cmd, rx_cmd, packet_loss_threshold, prev_rate
+      stats = _FindMaxRateFromConfig(
+          tx_cmd,
+          rx_cmd,
+          packet_loss_threshold,
+          prev_rate,
+          max_receiver_pkts // _DPDK_PKTGEN_DURATION.value,
+      )
+      s_tx, s_rx, r_rx, loss = (
+          stats.sender_tx_pkts,
+          stats.sender_rx_pkts,
+          stats.receiver_rx_pkts,
+          stats.packet_loss_rate,
       )
       if r_rx and int(r_rx) > max_receiver_pkts:
         max_receiver_pkts = int(r_rx)

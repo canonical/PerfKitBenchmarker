@@ -76,7 +76,6 @@
     `--azure_preprovisioned_data_account` and
     `--azure_preprovisioned_data_subscription`, which allows cross-subscription
     access.
--   Remove Rocky Linux on Azure.
 -   Changed supported Python version to 3.11.
 -   Deprecate CentOS Linux 7 as it is EOL on 2024-06-30.
 -   Remove EOL CentOS 8 and CentOS Stream 8.
@@ -119,6 +118,15 @@
     --dpb_storage_uri is provided, files are staged in a subfolder named after
     the PKB run_uri within the given URI. If not provided, a new bucket is still
     created and managed by PKB.
+-   Refactored `kubernetes_redis_memtier_benchmark`, including removal of
+    non-functioning Redis Cluster testing.
+-   Allow/require setting individual nodepools' min/max node counts
+    independently of the overall K8s cluster's default nodepool. For Standard &
+    Karpenter clusters.
+-   Support more of the Kubernetes spec in the Karpenter implementation,
+    bringing this variant more in-line with others.
+-   Rename GKE Autopilot & EKS Auto mode's cluster_type within PKB from
+    'Autopilot' to 'Auto'.
 
 ### New features:
 
@@ -204,7 +212,7 @@
 -   Add support for multi-network creation/attachment. PKB currently does not
     handle subnet creation on an existing network.
 -   Add support for GCE Confidential VM's.
--   Add cos-dev, cos125, cos121, cos117, and cos113 OS support for GCP.
+-   Add cos-dev, cos129, cos125, cos121, cos117, and OS support for GCP.
 -   Add --object_ttl_days flag for lifecycle management of created buckets.
 -   Add support for multi-NIC netperf throughput on AWS.
 -   Added AWS/GCP support for Data Plane Development Kit (DPDK) on Linux VM's to
@@ -272,10 +280,17 @@
     benchmarks.
 -   Truncate duplicated logs to make the pkb.log more human readable. If not
     desired, turn it off with `--notruncate_duplicate_logs`.
+-   Add support for Alma Linux 8, 9, and 10 for the Azure provider.
+-   Re-enable support for Rocky Linux 8, 9, and 10 for the Azure provider.
+-   Add Ubuntu 26.04 support for GCP, AWS, and Azure Providers.
+-   Add a kubernetes-native benchmark for MySQL using sysbench
+-   Add `kafka_benchmark` support.
 
 ### Enhancements:
 
 -   Add numactl and perf support to netperf for analysis
+-   Add support for multi-NIC setups in Redis Memtier benchmark to distribute
+    load across multiple network interfaces.
 -   Additions to MongoDB in Artemis/PKB to facilitate workload analysis
 -   Updated `sar` switch to efficiently collect all sar metrics during the run,
     and download the file for hands-on analysis (no parsing).
@@ -448,9 +463,16 @@
 -   Add support for enabling live migration on AMD SEV
 -   Increased maintenance simulation notification timeout to 4 hours in
     maintenance_simulation_trigger.py.
+-   Added `--retry_on_insufficient_capacity_cloud_failure` so that resource
+    creation can be retried on stock outs.
+-   Add support for deploying VMs inside managed VM groups with
+    `--use_managed_vm_groups`.
+-   Add support for configuring IMDSv2 Http Tokens on AWS VMs via
+    `aws_metadata_http_tokens`.
 
 ### Bug fixes and maintenance updates:
 
+-   Update `sysbench_thread_init_timeout` default to 180 seconds.
 -   Add 'runcpu --update' and 'runcpu --version' commands to install phase.
 -   Set the command to download preprovisioned data to be robust and have a five
     minute timeout.
@@ -657,3 +679,7 @@
     general solution that can be used with or instead of --ycsb_max_error_rate
     and --ycsb_fail_on_incomplete_loading.
 -   Support basic TPU vm provisioning.
+-   Set firewall rule as PKB-created before deletion when using
+    --gce_firewall_rules_clean_all.
+-   Added gke_kubernetes_nginx to default benchmark config.
+-   Added gke_kubernetes_redis_memtier to default benchmark config.

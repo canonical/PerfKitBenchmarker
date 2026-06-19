@@ -1573,6 +1573,7 @@ class MemtierTestCase(
                     'pipeline': 3,
                     'password': None,
                     'unique_id': vm1.ip_address,
+                    'retry_on_failure': True,
                 },
             ),
         ],
@@ -1618,6 +1619,7 @@ class MemtierTestCase(
                         '10.0.1.117:6379,10.0.2.104:6379,10.0.3.217:6379'
                     ),
                     'unique_id': 'vm1',
+                    'retry_on_failure': False,
                 },
             ),
             (
@@ -1634,6 +1636,7 @@ class MemtierTestCase(
                         '10.0.2.177:6379,10.0.1.174:6379,10.0.3.6:6379'
                     ),
                     'unique_id': 'vm2',
+                    'retry_on_failure': False,
                 },
             ),
         ],
@@ -1781,21 +1784,109 @@ class MemtierTestCase(
     vm1 = mock.Mock()
     vm2 = mock.Mock()
     test_vms = [vm1, vm2]
+    vm1.RobustRemoteCommand.return_value = ('', '')
+    vm2.RobustRemoteCommand.return_value = ('', '')
 
-    memtier.Load(test_vms, 'test_ip', 9999)
+    memtier.Load(test_vms, ['test_ip'], 9999)
 
-    vm1.RemoteCommand.assert_called_once_with(
-        matchers.HAS('--key-minimum 1 --key-maximum 500')
+    vm1.RobustRemoteCommand.assert_called_once_with(
+        matchers.HAS('--key-minimum 1 --key-maximum 500'), timeout=mock.ANY
     )
-    vm2.RemoteCommand.assert_called_once_with(
-        matchers.HAS('--key-minimum 500 --key-maximum 1000')
+    vm2.RobustRemoteCommand.assert_called_once_with(
+        matchers.HAS('--key-minimum 500 --key-maximum 1000'), timeout=mock.ANY
     )
-    vm1.RemoteCommand.assert_called_once_with(
-        matchers.HAS('--data-size-list 1024:1,32:1')
+    vm1.RobustRemoteCommand.assert_called_once_with(
+        matchers.HAS('--data-size-list 1024:1,32:1'), timeout=mock.ANY
     )
-    vm2.RemoteCommand.assert_called_once_with(
-        matchers.HAS('--data-size-list 1024:1,32:1')
+    vm2.RobustRemoteCommand.assert_called_once_with(
+        matchers.HAS('--data-size-list 1024:1,32:1'), timeout=mock.ANY
     )
+
+  def testLoadMultiIp(self):
+    vm1 = mock.Mock()
+    vm2 = mock.Mock()
+    test_vms = [vm1, vm2]
+    vm1.RobustRemoteCommand.return_value = ('', '')
+    vm2.RobustRemoteCommand.return_value = ('', '')
+
+    memtier.Load(test_vms, ['ip1', 'ip2'], 9999)
+
+    vm1.RobustRemoteCommand.assert_called_with(
+        matchers.HAS('--server ip1'), timeout=mock.ANY
+    )
+    vm2.RobustRemoteCommand.assert_called_with(
+        matchers.HAS('--server ip2'), timeout=mock.ANY
+    )
+
+  def testRunOverAllClientVMsSingleIp(self):
+    vm1 = mock.Mock()
+    vm2 = mock.Mock()
+    vm1.ip_address = 'vm1'
+    vm2.ip_address = 'vm2'
+    with mock.patch.object(memtier, '_Run') as mock_run:
+      memtier.RunOverAllClientVMs([vm1, vm2], ['ip1'], [6379, 6380], 1, 4, 50)
+
+      self.assertEqual(mock_run.call_count, 2)
+      # Both ports connect to the same single IP
+      mock_run.assert_any_call(
+          vm=vm1,
+          server_ip='ip1',
+          server_port=6379,
+          threads=4,
+          pipeline=1,
+          clients=50,
+          password=None,
+          unique_id='0',
+          retry_on_failure=False,
+      )
+      mock_run.assert_any_call(
+          vm=vm2,
+          server_ip='ip1',
+          server_port=6380,
+          threads=4,
+          pipeline=1,
+          clients=50,
+          password=None,
+          unique_id='1',
+          retry_on_failure=False,
+      )
+
+  def testRunOverAllClientVMsMultiIp(self):
+    vm1 = mock.Mock()
+    vm2 = mock.Mock()
+    vm1.ip_address = 'vm1'
+    vm2.ip_address = 'vm2'
+    # Mocking _Run because it involves a lot of VM interaction
+    with mock.patch.object(memtier, '_Run') as mock_run:
+      memtier.RunOverAllClientVMs(
+          [vm1, vm2], ['ip1', 'ip2'], [6379, 6380], 1, 4, 50
+      )
+
+      self.assertEqual(mock_run.call_count, 2)
+      # Port 6379 is index 0 -> client_index 0 -> ip1
+      mock_run.assert_any_call(
+          vm=vm1,
+          server_ip='ip1',
+          server_port=6379,
+          threads=4,
+          pipeline=1,
+          clients=50,
+          password=None,
+          unique_id='0',
+          retry_on_failure=False,
+      )
+      # Port 6380 is index 1 -> client_index 1 -> ip2
+      mock_run.assert_any_call(
+          vm=vm2,
+          server_ip='ip2',
+          server_port=6380,
+          threads=4,
+          pipeline=1,
+          clients=50,
+          password=None,
+          unique_id='1',
+          retry_on_failure=False,
+      )
 
   @parameterized.named_parameters(
       {
@@ -1816,7 +1907,7 @@ class MemtierTestCase(
   )
   def testBuildMemtierCommand(self, input_args, expected_cmd_regex):
     cmd = memtier.BuildMemtierCommand(**input_args)
-    self.assertRegex(cmd, expected_cmd_regex)
+    self.assertRegex(' '.join(cmd), expected_cmd_regex)
 
   def testGetMetadataDefault(self):
     meta = memtier.GetMetadata(clients=100, threads=4, pipeline=1)

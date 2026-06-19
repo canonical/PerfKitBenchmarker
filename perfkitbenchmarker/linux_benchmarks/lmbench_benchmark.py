@@ -20,6 +20,7 @@ Homepage: http://www.bitmover.com/lmbench/index.html
 
 import itertools
 import logging
+import re
 from absl import flags
 from perfkitbenchmarker import configs
 from perfkitbenchmarker import regex_util
@@ -65,12 +66,18 @@ def _PrepareLmbench(vm):
   vm.Install('lmbench')
 
 
+def _GetArch(vm):
+  """Returns the lmbench architecture triplet."""
+  return 'aarch64-linux-gnu' if vm.is_aarch64 else 'x86_64-linux-gnu'
+
+
 def _ConfigureRun(vm):
   """Configure Lmbench tests."""
   logging.info('Set Lmbench run parameters')
+  arch = _GetArch(vm)
   vm.RemoteCommand(
-      'cd {} && mkdir bin && cd bin && mkdir x86_64-linux-gnu'.format(
-          lmbench.LMBENCH_DIR
+      'cd {} && mkdir bin && cd bin && mkdir {}'.format(
+          lmbench.LMBENCH_DIR, arch
       )
   )
   vm.RobustRemoteCommand(
@@ -81,14 +88,14 @@ def _ConfigureRun(vm):
   )
   sed_cmd = (
       'sed -i -e "s/OUTPUT=\\/dev\\/tty/OUTPUT=\\/dev\\/null/" '
-      '{}/bin/x86_64-linux-gnu/CONFIG.*'.format(lmbench.LMBENCH_DIR)
+      '{}/bin/{}/CONFIG.*'.format(lmbench.LMBENCH_DIR, arch)
   )
   vm.RemoteCommand(sed_cmd)
 
   if FLAGS.lmbench_mem_size:
     sed_cmd = (
-        'sed -i -e "s/MB=/MB={}/" {}/bin/x86_64-linux-gnu/CONFIG.*'.format(
-            FLAGS.lmbench_mem_size, lmbench.LMBENCH_DIR
+        'sed -i -e "s/MB=/MB={}/" {}/bin/{}/CONFIG.*'.format(
+            FLAGS.lmbench_mem_size, lmbench.LMBENCH_DIR, arch
         )
     )
     vm.RemoteCommand(sed_cmd)
@@ -96,8 +103,8 @@ def _ConfigureRun(vm):
   if FLAGS.lmbench_hardware == _LMBENCH_HARDWARE_DEFAULT:
     sed_cmd = (
         'sed -i -e "s/BENCHMARK_HARDWARE=YES/BENCHMARK_HARDWARE={}/" '
-        '{}/bin/x86_64-linux-gnu/CONFIG.*'.format(
-            FLAGS.lmbench_hardware, lmbench.LMBENCH_DIR
+        '{}/bin/{}/CONFIG.*'.format(
+            FLAGS.lmbench_hardware, lmbench.LMBENCH_DIR, arch
         )
     )
     vm.RemoteCommand(sed_cmd)
@@ -156,6 +163,32 @@ def _ParseContextSwitching(lines, title, metadata, results):
             current_metadata,
         )
     )
+
+
+def _ParseSocketBandwidth(lines, unused_title, metadata, results):
+  """Parse the socket bandwidth test results.
+
+  Args:
+    lines: The lines following socket bandwidth title.
+    metadata: A dictionary of metadata.
+    results: A list of samples to be published.
+  """
+  for line in lines:
+    parts = line.split()
+    if len(parts) == 3 and parts[2] == 'MB/sec':
+      msg_size_mb = float(parts[0])
+      bandwidth = float(parts[1])
+      unit = parts[2]
+      current_metadata = metadata.copy()
+      current_metadata['message_size_MB'] = msg_size_mb
+      results.append(
+          sample.Sample(
+              'socket_bandwidth',
+              bandwidth,
+              unit,
+              current_metadata,
+          )
+      )
 
 
 def _UpdataMetadata(lmbench_output, metadata):
@@ -239,10 +272,13 @@ def _AddProcessorMetricSamples(
   """
 
   for metric in processor_metric_list:
-    regex = '%s: (.*)' % metric
-    value_unit = regex_util.ExtractGroup(regex, lmbench_output)
-    [value, unit] = value_unit.split(' ')
-    if unit == 'microseconds':
+    regex = rf'{metric}: ([^ ]+) (.+)'
+    match = re.search(regex, lmbench_output)
+    if not match:
+      logging.warning('Failed to extract metric: %s', metric)
+      continue
+    value, unit = match.groups()
+    if unit in ['microseconds', 'MB/sec']:
       results.append(
           sample.Sample(
               '%s' % metric.replace('\\', ''), float(value), unit, metadata
@@ -278,9 +314,14 @@ def _ParseOutput(lmbench_output):
       'Signal handler overhead',
       'Protection fault',
       'Pipe latency',
+      'Pipe bandwidth',
+      'AF_UNIX sock stream bandwidth',
       r'Process fork\+exit',
       r'Process fork\+execve',
       r'Process fork\+/bin/sh -c',
+      'Pagefaults on /var/tmp/XXX',
+      'TCP latency using localhost',
+      'TCP/IP connection cost to localhost',
   )
   _AddProcessorMetricSamples(
       lmbench_output, processor_metric_list, metadata, results
@@ -288,6 +329,10 @@ def _ParseOutput(lmbench_output):
 
   # Parse some sections from the output.
   parse_section_func_dict = {}
+  if 'Socket bandwidth using localhost' in lmbench_output:
+    parse_section_func_dict['Socket bandwidth using localhost'] = (
+        _ParseSocketBandwidth
+    )
   contex_switching_titles = regex_util.ExtractAllMatches(
       '"size=.* ovr=.*', lmbench_output
   )
@@ -311,6 +356,7 @@ def Run(benchmark_spec):
   """
   vms = benchmark_spec.vms
   vm = vms[0]
+  arch = _GetArch(vm)
 
   # Use the current configuration to run the benchmark tests.
   vm.RobustRemoteCommand(
@@ -318,15 +364,15 @@ def Run(benchmark_spec):
   )
 
   stdout, _ = vm.RobustRemoteCommand(
-      'cd {} && cd results/x86_64-linux-gnu && cat *.*'.format(
-          lmbench.LMBENCH_DIR
+      'cd {} && cd results/{} && cat *.*'.format(
+          lmbench.LMBENCH_DIR, arch
       )
   )
 
   vm.RobustRemoteCommand(
-      'cd {} && cd results/x86_64-linux-gnu && '
+      'cd {} && cd results/{} && '
       'mkdir -p /tmp/lmbench && '
-      'sudo mv *.* /tmp/lmbench; '.format(lmbench.LMBENCH_DIR)
+      'sudo mv *.* /tmp/lmbench; '.format(lmbench.LMBENCH_DIR, arch)
   )
 
   return _ParseOutput(stdout)

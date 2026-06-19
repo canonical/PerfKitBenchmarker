@@ -2,26 +2,22 @@
 
 import collections
 from collections import abc
-import dataclasses
-import json
 import time
-from typing import Any
 
 from absl import flags
 from absl import logging
-from dateutil import parser
 import numpy as np
 from perfkitbenchmarker import benchmark_spec
 from perfkitbenchmarker import configs
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import sample
-from perfkitbenchmarker import virtual_machine
 from perfkitbenchmarker import vm_util
+from perfkitbenchmarker.resources.container_service import container_cluster
 from perfkitbenchmarker.resources.container_service import kubectl
 from perfkitbenchmarker.resources.container_service import kubernetes_cluster
 from perfkitbenchmarker.resources.container_service import kubernetes_commands
+from perfkitbenchmarker.resources.container_service import kubernetes_conditions
 from perfkitbenchmarker.resources.container_service import kubernetes_events
-
 
 FLAGS = flags.FLAGS
 
@@ -63,15 +59,26 @@ CONTAINER_IMAGE = flags.DEFINE_string(
     'The container image to use for the Kubernetes scale benchmark.'
     'If not specified, the default image will be used.',
 )
+EXPECTED_NODES_CREATED = flags.DEFINE_integer(
+    'kubernetes_scale_nodes_created',
+    None,
+    'If defined, the benchmark will fail if there are not this many node ready'
+    ' events during scale up.',
+)
+_SPECIFY_NODEPOOL = flags.DEFINE_string(
+    'kubernetes_scale_nodepool',
+    None,
+    'If specified, only use this nodepool for the scale up workload.',
+)
 
 MANIFEST_TEMPLATE = 'container/kubernetes_scale/kubernetes_scale.yaml.j2'
 DEFAULT_IMAGE = 'busybox:1.37'
 NVIDIA_GPU_IMAGE = 'nvidia/cuda:11.0.3-runtime-ubuntu20.04'
 
 
-def _GetImage() -> str:
+def _GetImage(cluster: container_cluster.BaseContainerCluster) -> str:
   """Get the image for the scale deployment."""
-  if virtual_machine.GPU_COUNT.value:
+  if cluster.gpu_count:
     return NVIDIA_GPU_IMAGE
   if CONTAINER_IMAGE.value:
     return CONTAINER_IMAGE.value
@@ -92,66 +99,31 @@ def GetConfig(user_config):
   return config
 
 
-def _IsEksKarpenterAwsGpu(
-    cluster: kubernetes_cluster.KubernetesCluster,
-) -> bool:
-  return bool(
-      virtual_machine.GPU_COUNT.value
-      and FLAGS.cloud.lower() == 'aws'
-      and getattr(cluster, 'CLUSTER_TYPE', None) == 'Karpenter'
-  )
-
-
-def _EnsureEksKarpenterGpuNodepool(
-    cluster: kubernetes_cluster.KubernetesCluster,
-) -> None:
-  """Ensures a GPU NodePool exists for EKS Karpenter before applying workloads."""
-  if not _IsEksKarpenterAwsGpu(cluster):
-    return
-  kubernetes_commands.ApplyManifest(
-      'container/kubernetes_scale/aws-gpu-nodepool.yaml.j2',
-      gpu_nodepool_name='gpu',
-      gpu_nodepool_label='gpu',
-      karpenter_ec2nodeclass_name='default',
-      gpu_instance_categories=['g'],
-      gpu_instance_families=['g6', 'g6e'],
-      gpu_capacity_types=['on-demand'],
-      gpu_arch=['amd64'],
-      gpu_os=['linux'],
-      gpu_taint_key='nvidia.com/gpu',
-      gpu_consolidate_after='1m',
-      gpu_consolidation_policy='WhenEmptyOrUnderutilized',
-      gpu_nodepool_cpu_limit=1000,
-  )
-
-
 def Prepare(bm_spec: benchmark_spec.BenchmarkSpec):
   """Sets additional spec attributes."""
   bm_spec.always_call_cleanup = True
   assert bm_spec.container_cluster
-  _EnsureEksKarpenterGpuNodepool(bm_spec.container_cluster)
+  cluster = bm_spec.container_cluster
+  assert isinstance(cluster, kubernetes_cluster.KubernetesCluster)
 
 
-def _GetRolloutCreationTime(rollout_name: str) -> int:
-  """Returns the time when the rollout was created."""
-  out, _, _ = kubectl.RunRetryableKubectlCommand([
-      'get',
-      rollout_name,
-      '-o',
-      'jsonpath={.metadata.creationTimestamp}',
-  ])
-  return ConvertToEpochTime(out)
-
-
-def _GetScaleTimeout() -> int:
+def _GetScaleTimeout(cluster: container_cluster.BaseContainerCluster) -> int:
   """Returns the timeout for the scale up & teardown."""
   base_timeout = 60 * 10  # 10 minutes
   per_pod_timeout = NUM_PODS.value * 3  # 3 seconds per pod
-  if virtual_machine.GPU_COUNT.value:
+  if cluster.gpu_count:
     base_timeout = 60 * 30  # 30 minutes
   proposed_timeout = base_timeout + per_pod_timeout
   max_timeout = 60 * 60  # 1 hour
   return min(proposed_timeout, max_timeout)
+
+
+def _ShouldSuppressLogging() -> bool:
+  """Returns true if logging should be suppressed."""
+  return (
+      NUM_PODS.value > 20
+      or getattr(FLAGS, 'kubernetes_scale_num_nodes', 5) > 20
+  )
 
 
 def Run(bm_spec: benchmark_spec.BenchmarkSpec) -> list[sample.Sample]:
@@ -164,36 +136,45 @@ def Run(bm_spec: benchmark_spec.BenchmarkSpec) -> list[sample.Sample]:
   # Warm up the cluster by creating a single pod. This compensates for
   # differences between Standard & Autopilot, where Standard already has 1 node
   # due to its starting nodepool but Autopilot does not.
-  scale_one_samples, _ = ScaleUpPods(cluster, 1)
-  if not scale_one_samples:
-    logging.exception(
-        'Failed to scale up to 1 pod; now investigating failure reasons.'
-    )
-    unused = 0
-    pod_samples = ParseStatusChanges('pod', unused)
-    # Log & check for quota failure.
-    CheckForFailures(cluster, pod_samples, 1)
+  if NUM_PODS.value == 1:
+    logging.info('Warming up to 0 pods given end goal is only 1 pod.')
+    ScaleUpPods(cluster, 0)
+  else:
+    scale_one_samples = ScaleUpPods(cluster, 1)
+    if not scale_one_samples:
+      logging.exception(
+          'Failed to scale up to 1 pod; now investigating failure reasons.'
+      )
+      unused = 0
+      pod_samples = ParseStatusChanges('pod', unused)
+      # Log & check for quota failure.
+      CheckForFailures(cluster, pod_samples, 1)
 
-  initial_nodes = set(kubernetes_commands.GetNodeNames())
-  initial_pods = set(kubernetes_commands.GetPodNames())
+  initial_nodes = kubernetes_commands.GetNodeNames()
+  initial_pods = kubernetes_commands.GetPodNames()
 
-  samples, rollout_name = ScaleUpPods(cluster, NUM_PODS.value)
-  start_time = _GetRolloutCreationTime(rollout_name)
+  start_time = time.time()
+  samples = ScaleUpPods(cluster, NUM_PODS.value)
   pod_samples = ParseStatusChanges('pod', start_time, initial_pods)
   samples += pod_samples
-  CheckForFailures(cluster, pod_samples, NUM_PODS.value - 1)
-  samples += ParseStatusChanges(
+  CheckForFailures(cluster, pod_samples, max(NUM_PODS.value - 1, 1))
+  node_samples = ParseStatusChanges(
       'node', start_time, resources_to_ignore=initial_nodes
   )
+  samples += node_samples
+  ValidateNodesCreated(node_samples)
+  samples += GetStartEndCountSamples(initial_nodes, initial_pods)
   metadata = {
       'pod_memory': MEMORY_PER_POD.value,
       'pod_cpu': CPUS_PER_POD.value,
       'goal_replicas': NUM_PODS.value,
-      'image': _GetImage(),
+      'image': _GetImage(cluster),
   }
-  if virtual_machine.GPU_COUNT.value:
-    metadata['gpu_count'] = virtual_machine.GPU_COUNT.value
-    metadata['gpu_type'] = virtual_machine.GPU_TYPE.value
+  if cluster.gpu_count:
+    metadata['gpu_count'] = cluster.gpu_count
+    metadata['gpu_type'] = cluster.gpu_type
+  if EXPECTED_NODES_CREATED.value:
+    metadata['validated_num_nodes'] = EXPECTED_NODES_CREATED.value
   for s in samples:
     s.metadata.update(metadata)
   return samples
@@ -202,32 +183,30 @@ def Run(bm_spec: benchmark_spec.BenchmarkSpec) -> list[sample.Sample]:
 def ScaleUpPods(
     cluster: kubernetes_cluster.KubernetesCluster,
     num_new_pods: int,
-) -> tuple[list[sample.Sample], str]:
-  """Scales up pods on a kubernetes cluster. Returns samples & rollout name."""
+) -> list[sample.Sample]:
+  """Scales up pods on a kubernetes cluster. Returns samples."""
   samples = []
-  initial_pods = set(kubernetes_commands.GetPodNames())
+  initial_pods = kubernetes_commands.GetPodNames()
   logging.info('Initial pods: %s', initial_pods)
 
-  if virtual_machine.GPU_COUNT.value:
+  if cluster.gpu_count:
     # Use nvidia-smi to validate NVIDIA_GPU is available.
     command = ['sh', '-c', 'nvidia-smi && sleep 3600']
   else:
     command = ['sh', '-c', 'sleep infinity']
 
   # Request X new pods via YAML apply.
-  max_wait_time = _GetScaleTimeout()
+  max_wait_time = _GetScaleTimeout(cluster)
   resource_timeout = max_wait_time + 60 * 5  # 5 minutes after waiting to avoid
   # pod delete events from polluting data collection.
-
-  is_eks_karpenter_aws_gpu = _IsEksKarpenterAwsGpu(cluster)
 
   manifest_kwargs = dict(
       Name='kubernetes-scaleup',
       Replicas=num_new_pods,
       CpuRequest=CPUS_PER_POD.value,
       MemoryRequest=MEMORY_PER_POD.value,
-      NvidiaGpuRequest=virtual_machine.GPU_COUNT.value,
-      Image=_GetImage(),
+      NvidiaGpuRequest=cluster.gpu_count,
+      Image=_GetImage(cluster),
       Command=command,
       EphemeralStorageRequest='10Mi',
       RolloutTimeout=max_wait_time,
@@ -236,20 +215,32 @@ def ScaleUpPods(
       GpuTaintKey=None,
   )
 
-  # GpuTaintKey is still needed for tolerations in the yaml template
-  if is_eks_karpenter_aws_gpu:
-    manifest_kwargs['GpuTaintKey'] = 'nvidia.com/gpu'
-
   yaml_docs = kubernetes_commands.ConvertManifestToYamlDicts(
       MANIFEST_TEMPLATE,
       **manifest_kwargs,
   )
-
   # Use ModifyPodSpecPlacementYaml to add nodeSelectors via GetNodeSelectors()
+  if _SPECIFY_NODEPOOL.value:
+    if (
+        _SPECIFY_NODEPOOL.value != 'default'
+        and _SPECIFY_NODEPOOL.value not in cluster.nodepools
+    ):
+      raise errors.Benchmarks.RunError(
+          f'Scaling was limited to {_SPECIFY_NODEPOOL.value} but that nodepool'
+          ' was not found in the cluster. Only found:'
+          f' {list(cluster.nodepools.keys())}.'
+      )
+    yaml_docs[0]['spec']['template']['spec']['nodeSelector'][
+        'pkb_nodepool'
+    ] = _SPECIFY_NODEPOOL.value
+    nodepool = cluster.nodepools[_SPECIFY_NODEPOOL.value]
+  else:
+    nodepool = cluster.default_nodepool
   cluster.ModifyPodSpecPlacementYaml(
       yaml_docs,
       'kubernetes-scaleup',
-      cluster.default_nodepool.machine_type,
+      nodepool.machine_type
+      or (nodepool.machine_families and nodepool.machine_families[0]),
   )
   resource_names = kubernetes_commands.ApplyYaml(yaml_docs)
 
@@ -260,7 +251,7 @@ def ScaleUpPods(
     start_polling_time = time.monotonic()
     kubernetes_commands.WaitForRollout(rollout_name, timeout=max_wait_time)
 
-    all_new_pods = set(kubernetes_commands.GetPodNames()) - initial_pods
+    all_new_pods = kubernetes_commands.GetPodNames() - initial_pods
     end_polling_time = time.monotonic()
     logging.info(
         'In %d seconds, found all %s new pods',
@@ -274,7 +265,7 @@ def ScaleUpPods(
             'seconds',
         )
     )
-    return samples, rollout_name
+    return samples
   except (
       errors.VmUtil.IssueCommandError,
       errors.VmUtil.IssueCommandTimeoutError,
@@ -288,7 +279,104 @@ def ScaleUpPods(
         max_wait_time,
         e,
     )
-    return [], rollout_name
+    return []
+
+
+def _GetSampleByMetricName(
+    samples: list[sample.Sample], metric: str
+) -> sample.Sample | None:
+  """Returns the sample with the given metric name."""
+  return next((s for s in samples if s.metric == metric), None)
+
+
+def GetStartEndCountSamples(
+    initial_nodes: set[str], initial_pods: set[str]
+) -> list[sample.Sample]:
+  """Returns the number of nodes & pods before & after scale up as samples."""
+  final_nodes = kubernetes_commands.GetNodeNames()
+  if (
+      EXPECTED_NODES_CREATED.value
+      and len(final_nodes) != EXPECTED_NODES_CREATED.value + 1
+  ):
+    logging.warning(
+        'Expected to have %d nodes after scale up, but there are %d nodes. This'
+        ' is odd behavior, but not wholly unexpected for Autopilot clusters.',
+        EXPECTED_NODES_CREATED.value + 1,
+        len(final_nodes),
+    )
+  final_pods = kubernetes_commands.GetPodNames()
+  samples = []
+  samples.extend(_GetResourceCountSamples(initial_nodes, final_nodes, 'node'))
+  samples.extend(_GetResourceCountSamples(initial_pods, final_pods, 'pod'))
+  return samples
+
+
+def _GetResourceCountSamples(
+    initial_resources: set[str], final_resources: set[str], resource_type: str
+) -> list[sample.Sample]:
+  """Returns the number of resources before & after scale up as samples."""
+  if len(initial_resources) >= len(final_resources):
+    logging.warning(
+        'Started with %d %ss and ended with %d %ss after scale up. Expected to '
+        'add resources with scale up, but that did not happen. This is odd '
+        'behavior, but might not be wholly unexpected for Autopilot clusters.',
+        len(initial_resources),
+        resource_type,
+        len(final_resources),
+        resource_type,
+    )
+  samples = [
+      sample.Sample(
+          f'initial_{resource_type}_count',
+          len(initial_resources),
+          'count',
+      ),
+      sample.Sample(
+          f'final_{resource_type}_count',
+          len(final_resources),
+          'count',
+      ),
+  ]
+  return samples
+
+
+def ValidateNodesCreated(
+    node_samples: list[sample.Sample],
+):
+  """Fails the benchmark if the wrong number of nodes were created.
+
+  Args:
+    node_samples: The samples from node transition times which includes node
+      Ready count.
+
+  Raises:
+    RunError: If the number of node ready events is not as expected.
+  """
+  if EXPECTED_NODES_CREATED.value is None:
+    return
+  node_ready_count_sample = _GetSampleByMetricName(
+      node_samples, 'node_Ready_count'
+  )
+  if EXPECTED_NODES_CREATED.value == 0:
+    if node_ready_count_sample is not None:
+      raise errors.Benchmarks.RunError(
+          'No node ready events were expected, but found'
+          f' {node_ready_count_sample.value} node ready events.'
+      )
+    return
+  if node_ready_count_sample is None:
+    raise errors.Benchmarks.RunError(
+        'No node ready events were found & we attempted to scale up to'
+        f' {EXPECTED_NODES_CREATED.value} nodes.'
+    )
+  if node_ready_count_sample.value != EXPECTED_NODES_CREATED.value:
+    raise errors.Benchmarks.RunError(
+        'Expected %d nodes to be created, but saw %d node ready events.'
+        % (
+            EXPECTED_NODES_CREATED.value,
+            node_ready_count_sample.value,
+        )
+    )
 
 
 def CheckForFailures(
@@ -313,9 +401,7 @@ def CheckForFailures(
       str | None, list[kubernetes_events.KubernetesEvent]
   ] = cluster.event_poller.GetAndLogFailureEvents()
 
-  ready_count_sample = next(
-      (s for s in pod_samples if s.metric == 'pod_Ready_count'), None
-  )
+  ready_count_sample = _GetSampleByMetricName(pod_samples, 'pod_Ready_count')
   if ready_count_sample is not None and ready_count_sample.value >= num_pods:
     logging.info(
         'Benchmark successfully scaled up %d pods, which is equal to or more '
@@ -336,90 +422,6 @@ def CheckForFailures(
       ' created & ready. Check above "Kubernetes failed to wait for" logs for'
       ' exact failure location.' % (num_pods, ready_count_sample.value)
   )
-
-
-@dataclasses.dataclass
-class KubernetesResourceStatusCondition:
-  """Stores the information of a Kubernetes resource status condition."""
-
-  resource_type: str
-  resource_name: str
-  epoch_time: int
-  event: str
-
-  @classmethod
-  def FromJsonPathResult(
-      cls, resource_type: str, resource_name: str, condition: dict[str, Any]
-  ) -> 'KubernetesResourceStatusCondition':
-    """Parses the json result of kubectl get."""
-    str_time = condition['lastTransitionTime']
-    return cls(
-        resource_type,
-        resource_name,
-        epoch_time=ConvertToEpochTime(str_time),
-        event=condition['type'],
-    )
-
-
-# TODO: b/458122803 - refactor by moving to a common location (e.g.
-# resources/container_service modules)
-def GetStatusConditionsForResourceType(
-    resource_type: str,
-    resources_to_ignore: abc.Set[str] = frozenset(),
-) -> list[KubernetesResourceStatusCondition]:
-  """Returns the status conditions for a resource type.
-
-  Args:
-    resource_type: The type of the resource to get the status conditions for.
-    resources_to_ignore: A set of resource names to ignore.
-
-  Returns:
-    A list of status condition, where each condition is a dict with type &
-    lastTransitionTime.
-  """
-
-  jsonpath = (
-      r'{range .items[*]}'
-      # e.g. '"pod-name-1234": [<condition1>, ...],\n'
-      r'{"\""}{.metadata.name}{"\": "}{.status.conditions}{",\n"}'
-      r'{end}'
-  )
-  stdout, _, _ = kubectl.RunKubectlCommand(
-      [
-          'get',
-          resource_type,
-          '-o',
-          'jsonpath=' + jsonpath,
-      ],
-      timeout=60 * 2,  # 2 minutes; should be a pretty fast call.
-      # Output can be quite large, so we'll conditionally suppress it.
-      suppress_logging=NUM_PODS.value > 20,
-  )
-
-  # Convert output to valid json and parse it
-  stdout = stdout.rstrip('\t\n\r ,')
-  stdout = '{' + stdout + '}'
-  name_to_conditions = json.loads(stdout)
-
-  for key in resources_to_ignore:
-    name_to_conditions.pop(key, None)
-
-  results = []
-  for name in name_to_conditions.keys():
-    for conditions in name_to_conditions[name]:
-      results.append(
-          KubernetesResourceStatusCondition.FromJsonPathResult(
-              resource_type, name, conditions
-          )
-      )
-
-  return results
-
-
-def ConvertToEpochTime(timestamp: str) -> int:
-  """Converts a timestamp to epoch time."""
-  # Example: 2024-11-08T23:44:36Z
-  return int(parser.parse(timestamp).timestamp())
 
 
 def ParseStatusChanges(
@@ -443,10 +445,15 @@ def ParseStatusChanges(
     A list of samples, with various percentiles for each status condition.
   """
 
-  conditions = GetStatusConditionsForResourceType(
-      resource_type, resources_to_ignore
+  conditions: list[kubernetes_conditions.KubernetesStatusCondition] = (
+      kubernetes_conditions.GetStatusConditionsForResourceType(
+          resource_type,
+          resources_to_ignore,
+          suppress_logging=_ShouldSuppressLogging(),
+      )
   )
-
+  # Filter out conditions that are too early.
+  conditions = [c for c in conditions if c.epoch_time >= start_time]
   samples = []
   overall_times = collections.defaultdict(list)
   for condition in conditions:
@@ -463,7 +470,7 @@ def ParseStatusChanges(
     )
     if not REPORT_PERCENTILES.value:
       continue
-    summaries = _SummarizeTimestamps(timestamps)
+    summaries = SummarizeTimestamps(timestamps)
     for percentile, value in summaries.items():
       samples.append(
           sample.Sample(
@@ -477,7 +484,7 @@ def ParseStatusChanges(
     return samples
 
   for condition in conditions:
-    metadata = {
+    metadata = condition.metadata | {
         'k8s_resource_name': condition.resource_name,
     }
     samples.append(
@@ -491,7 +498,7 @@ def ParseStatusChanges(
   return samples
 
 
-def _SummarizeTimestamps(timestamps: list[float]) -> dict[str, float]:
+def SummarizeTimestamps(timestamps: list[float]) -> dict[str, float]:
   """Returns a few metrics about a list of timestamps."""
   percentiles = [0, 10, 50, 90, 95, 99.9, 100]
   summary = {
@@ -502,14 +509,16 @@ def _SummarizeTimestamps(timestamps: list[float]) -> dict[str, float]:
   return summary
 
 
-def Cleanup(_):
+def Cleanup(bm_spec: benchmark_spec.BenchmarkSpec):
   """Cleanups scale benchmark. Runs before teardown."""
+  cluster = bm_spec.container_cluster
   kubectl.RunKubectlCommand(['get', 'deployments'])
   kubectl.RunRetryableKubectlCommand(
       ['delete', 'deployment', 'kubernetes-scaleup'],
-      timeout=_GetScaleTimeout(),
+      timeout=_GetScaleTimeout(cluster),
       raise_on_failure=False,
   )
   kubectl.RunRetryableKubectlCommand(
-      ['delete', '--all', 'pods', '-n', 'default'], timeout=_GetScaleTimeout()
+      ['delete', '--all', 'pods', '-n', 'default'],
+      timeout=_GetScaleTimeout(cluster),
   )

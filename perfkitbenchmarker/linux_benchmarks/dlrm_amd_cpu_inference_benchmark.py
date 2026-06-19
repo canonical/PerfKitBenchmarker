@@ -15,14 +15,16 @@
 
 This benchmark measures the MLPerf inference performance of the AMD CPU.
 """
+
 import os
 from typing import Any
 from perfkitbenchmarker import benchmark_spec
 from perfkitbenchmarker import configs
 from perfkitbenchmarker import linux_packages
 from perfkitbenchmarker import sample
+from perfkitbenchmarker import virtual_machine
+from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.linux_packages import dlrm
-
 
 _DLRM_NAME = 'dlrmv2-mlperf'
 _ZIP = 'dlrmv2-mlperf-binary-updated.zip'
@@ -37,7 +39,7 @@ BENCHMARK_DATA = {
     ),
 }
 _SET_ENV = (
-    f'cd {_INSTALL_DIR}; source ~/miniconda3/bin/activate pace-env-py3.9; '
+    f'cd {_INSTALL_DIR} && source ~/miniconda3/bin/activate pace-env-py3.9 && '
 )
 
 BENCHMARK_NAME = 'dlrm_amd_cpu_inference'
@@ -98,28 +100,41 @@ def Prepare(bm_spec: benchmark_spec.BenchmarkSpec) -> None:
   # Install MiniConda3
   vm.InstallPackages('gcc-12 g++-12')
   vm.RemoteCommand(
-      f'sudo ln -s /home/{vm.user_name}/miniconda3/bin/conda /usr/bin/conda; '
-      f'sudo ln -s /home/{vm.user_name}/miniconda3/envs/pace-env-py3.9/'
-      'bin/python /usr/bin/python; '
-      'sudo ln -s /usr/bin/g++-12 /usr/bin/g++; '
-      'sudo ln -s /usr/bin/g++-12 /usr/bin/c++; '
-      'sudo ln -s /usr/bin/gcc-12 /usr/bin/gcc',
-      ignore_failure=True,
+      'sudo ln -sf /usr/bin/g++-12 /usr/bin/g++ && '
+      'sudo ln -sf /usr/bin/g++-12 /usr/bin/c++ && '
+      'sudo ln -sf /usr/bin/gcc-12 /usr/bin/gcc',
   )
   vm.RemoteCommand(
       'curl -O https://repo.anaconda.com/miniconda/'
-      'Miniconda3-latest-Linux-x86_64.sh; '
+      'Miniconda3-latest-Linux-x86_64.sh && '
       'bash Miniconda3-latest-Linux-x86_64.sh -b'
   )
   vm.RemoteCommand(
       './miniconda3/bin/conda tos accept --override-channels --channel'
-      ' https://repo.anaconda.com/pkgs/main; ./miniconda3/bin/conda tos accept'
-      ' --override-channels --channel https://repo.anaconda.com/pkgs/r;'
-      ' ./miniconda3/bin/conda create -n pace-env-py3.9 python=3.9 -y;'
+      ' https://repo.anaconda.com/pkgs/main && ./miniconda3/bin/conda tos'
+      ' accept --override-channels --channel https://repo.anaconda.com/pkgs/r'
+      ' && ./miniconda3/bin/conda create -n pace-env-py3.9 python=3.9 -y &&'
       ' ./miniconda3/bin/conda init'
   )
-  vm.RemoteCommand(f'{_SET_ENV} conda install -c conda-forge gcc=12.1.0 -y')
-  vm.RemoteCommand(f'{_SET_ENV} bash prepare_env.sh')
+  # This should not be needed given _SET_ENV.
+  vm.RemoteCommand(
+      f'sudo ln -sf /home/{vm.user_name}/miniconda3/bin/conda /usr/bin/conda &&'
+      f' sudo ln -sf /home/{vm.user_name}/miniconda3/envs/pace-env-py3.9/'
+      'bin/python /usr/bin/python',
+  )
+
+  # libmamba solver hits SQLite database error.
+  # Conda classic solver can hang so add timeout and retries.
+  @vm_util.Retry(max_retries=3)
+  def _InstallCondaEnv(vm: virtual_machine.VirtualMachine):
+    vm.RemoteCommand(f'{_SET_ENV} conda clean --all -y')
+    vm.RemoteCommand(
+        f'{_SET_ENV} conda install -c conda-forge gcc=12.1.0'
+        ' --solver=classic -y',
+        timeout=300,
+    )
+  _InstallCondaEnv(vm)
+  vm.RemoteCommand(f'{_SET_ENV} bash -ex prepare_env.sh', timeout=300)
 
 
 def Run(bm_spec: benchmark_spec.BenchmarkSpec) -> list[sample.Sample]:
@@ -151,10 +166,13 @@ def Run(bm_spec: benchmark_spec.BenchmarkSpec) -> list[sample.Sample]:
       'export CPUS_FOR_LOADGEN=1; '
       'export BATCH_SIZE=400; '
   )
-  dlrm.CheckAccuracy(vm.RemoteCommand(
-      f'{cmd_prefix}'
-      'bash run_main.sh offline accuracy int8', login_shell=True,
-  )[0], dlrm.TARGET.value)
+  dlrm.CheckAccuracy(
+      vm.RemoteCommand(
+          f'{cmd_prefix}bash run_main.sh offline accuracy int8',
+          login_shell=True,
+      )[0],
+      dlrm.TARGET.value,
+  )
   stdout, _ = vm.RemoteCommand(
       f'{cmd_prefix} '
       './run_main.sh offline int8; '

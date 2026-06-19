@@ -78,6 +78,7 @@ AZURE_NVME_TYPES = [
     r'(Standard_L[0-9]+a?s_v3)',
     r'(Standard_L[0-9]+a?s_v4)',
     r'(Standard_D[0-9]+[ap]?ds_v6)',
+    r'(Standard_D[0-9]+[ap]?ds_v7)',
 ]
 
 # https://docs.microsoft.com/en-us/azure/virtual-machines/azure-vms-no-temp-disk
@@ -415,23 +416,12 @@ class AzureDisk(disk.BaseDisk):
 
   def GetDevicePath(self):
     """Returns the path to the device inside the VM."""
-    if self.disk_type == disk.LOCAL:
-      if LocalDriveIsNvme(self.machine_type):
-        return '/dev/nvme%sn1' % str(self.lun)
-      # Temp disk naming isn't always /dev/sdb:
-      # https://github.com/MicrosoftDocs/azure-docs/issues/54055
-      return '/dev/disk/cloud/azure_resource'
-    else:
-      try:
-        start_index = 1  # the os drive is always at index 0; skip the OS drive.
-        if self.vm.SupportsNVMe():
-          # boot disk is nvme0n1. temp drive, if exists, uses scsi.
-          return '/dev/nvme0n%s' % str(1 + start_index + self.lun)
-        if HasTempDrive(self.machine_type):
-          start_index += 1
-        return f'/dev/disk/azure/scsi1/lun{self.lun}'
-      except IndexError:
-        raise TooManyAzureDisksError()
+    try:
+      if self.vm.SupportsNVMe():
+        return f'/dev/disk/azure/data/by-lun/{self.lun}'
+      return f'/dev/disk/azure/scsi1/lun{self.lun}'
+    except IndexError:
+      raise TooManyAzureDisksError()
 
   def IsNvme(self):
     if self.disk_type == disk.LOCAL:
@@ -449,6 +439,51 @@ class AzureDisk(disk.BaseDisk):
 
   def GetLastIncrementalSnapshotSize(self):
     return None
+
+
+class AzureLocalDisk(disk.BaseDisk):
+  """Object representing an Azure Disk."""
+
+  _lock = threading.Lock()
+
+  def __init__(
+      self,
+      disk_spec: disk.BaseDiskSpec,
+      vm,
+      serial_number: int,
+      is_image: bool = False,
+      num_detached_restore_disks: int = 0,
+  ) -> None:
+    super().__init__(disk_spec)
+    self.host_caching = FLAGS.azure_host_caching
+    self.vm = vm
+    self.vm_name = vm.name
+    self.name = self.vm_name + str(serial_number)
+    if self.spec.snapshot_name:
+      self.name = (
+          f'{self.spec.snapshot_name}-{serial_number}-restore'
+      )
+    self.zone = vm.zone
+    self.region = util.GetRegionFromZone(self.zone)
+    self.resource_group = azure_network.GetResourceGroup()
+    self.storage_account = vm.storage_account
+    self.serial_number = serial_number
+    self.is_image = is_image
+    self._deleted = False
+    self.machine_type = vm.machine_type
+    media = disk.SSD if LocalDiskIsSSD(self.machine_type) else disk.HDD
+    self.metadata.update({
+        disk.MEDIA: media,
+    })
+
+  def GetDevicePath(self):
+    """Returns the path to the device inside the VM."""
+    if self.IsNvme():
+      return f'/dev/disk/azure/local/by-serial/{self.serial_number}'
+    return '/dev/disk/cloud/azure_resource'
+
+  def IsNvme(self):
+    return LocalDriveIsNvme(self.machine_type)
 
 
 class AzureDiskSnapshot(disk.DiskSnapshot):

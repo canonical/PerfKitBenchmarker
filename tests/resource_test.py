@@ -4,6 +4,7 @@ import pickle
 import unittest
 
 from absl import flags
+from absl.testing import flagsaver
 from absl.testing import parameterized
 import mock
 from perfkitbenchmarker import errors
@@ -58,6 +59,8 @@ class GetResourceClassTest(pkb_common_test_case.PkbCommonTestCase):
 
 class NonFreezeRestoreResource(resource.BaseResource):
   """Dummy class that is missing _Freeze()/_Restore()/_UpdateTimeout()."""
+
+  RESOURCE_TYPE = 'NonFreezeRestoreResource'
 
   def _Create(self):
     pass
@@ -123,6 +126,33 @@ class ResourceTest(pkb_common_test_case.PkbCommonTestCase):
     test_resource.Create()
     mock_create.assert_not_called()
     mock_setup.assert_called_once()
+
+  def testCreateSetsTimestamps(self):
+    test_resource = NonFreezeRestoreResource()
+
+    test_resource.Create()
+
+    self.assertIsNotNone(test_resource.create_start_time)
+    self.assertIsNotNone(test_resource.create_end_time)
+    self.assertIsNotNone(test_resource.resource_ready_time)
+    self.assertTrue(test_resource.created)
+
+  def testGetSamples(self):
+    test_resource = NonFreezeRestoreResource()
+    test_resource.Create()
+    samples = test_resource.GetSamples()
+    self.assertLen(samples, 2)
+    self.assertEqual(samples[0].metric, 'Time to Create')
+    self.assertEqual(samples[1].metric, 'Time to Ready')
+
+    test_resource.Delete()
+    samples = test_resource.GetSamples()
+    self.assertLen(samples, 3)
+    self.assertEqual(samples[2].metric, 'Time to Delete')
+
+    for s in samples:
+      self.assertEqual(s.metadata['resource_class'], 'NonFreezeRestoreResource')
+      self.assertEqual(s.unit, 'seconds')
 
 
 class FreezeRestoreTest(pkb_common_test_case.PkbCommonTestCase):

@@ -14,7 +14,9 @@
 
 """Contains classes/functions related to Azure Kubernetes Service."""
 
+import base64
 import json
+import logging
 from typing import Any, List
 
 from absl import flags
@@ -134,6 +136,7 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
       vm_config: virtual_machine_spec.BaseVmSpec,
       nodepool_config: container.BaseNodePoolConfig,
   ):
+    super().InitializeNodePoolForCloud(vm_config, nodepool_config)
     nodepool_config.disk_type = vm_config.boot_disk_type
     nodepool_config.disk_size = vm_config.boot_disk_size
 
@@ -146,14 +149,17 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
     result = super().GetResourceMetadata()
     result['boot_disk_type'] = self.default_nodepool.disk_type
     result['boot_disk_size'] = self.default_nodepool.disk_size
+    if FLAGS.azure_aks_auto_node_provisioning:
+      result['auto_node_provisioning_mode'] = True
     return result
 
-  def _IsAutoscalerEnabled(self):
+  def _IsAutoscalerEnabled(self, nodepool_config: container.BaseNodePoolConfig):
     """Returns True if the cluster autoscaler is enabled."""
     return (
-        self.min_nodes != self.default_nodepool.num_nodes
-        or self.max_nodes != self.default_nodepool.num_nodes
-    )
+        nodepool_config.min_nodes
+        != nodepool_config.max_nodes
+        # Auto node provisioning mode is incompatible with cluster autoscaler.
+    ) and not FLAGS.azure_aks_auto_node_provisioning
 
   def _Create(self):
     """Creates the AKS cluster."""
@@ -173,32 +179,61 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
         '--nodepool-labels',
         f'pkb_nodepool={container_cluster.DEFAULT_NODEPOOL}',
     ] + self._GetNodeFlags(self.default_nodepool)
+    if self.max_total_nodes > 256:
+      cmd += [
+          '--network-plugin',
+          'azure',
+          '--network-plugin-mode',
+          'overlay',
+          # Default /16 supports ~250 nodes; /10 provides ~4M IPs for up to 16k.
+          '--pod-cidr',
+          '100.64.0.0/10',
+          # Free tier caps at 1k nodes; standard scales upto 5k nodes.
+          '--tier',
+          'standard',
+          # Standard LB exhausts SNAT ports at ~1k nodes; NAT Gateway required.
+          '--outbound-type',
+          'managedNATGateway',
+          # 4 IPs = ~256k SNAT ports (~50 ports/node at 5k nodes).
+          '--nat-gateway-managed-outbound-ip-count',
+          '4',
+          # Prevent connection drops during long bootstrap or idle keep-alives.
+          '--nat-gateway-idle-timeout',
+          '10',
+      ]
     if self.enable_vpa:
       cmd.append('--enable-vpa')
     if FLAGS.azure_aks_auto_node_provisioning:
       # For provision_node_pools benchmark, add auto provisioning mode
       cmd.append('--node-provisioning-mode=auto')
-    else:
-      if self._IsAutoscalerEnabled():
-        cmd += [
-            '--enable-cluster-autoscaler',
-            f'--min-count={self.min_nodes}',
-            f'--max-count={self.max_nodes}',
-        ]
 
-    # TODO(pclay): expose quota and capacity errors
-    # Creating an AKS cluster with a fresh service principal usually fails due
-    # to a race condition. Active Directory knows the service principal exists,
-    # but AKS does not. (https://github.com/Azure/azure-cli/issues/9585)
-    # Use 5 min timeout on service principle retry. cmd will fail fast.
-    vm_util.Retry(timeout=300)(vm_util.IssueCommand)(
-        cmd,
-        # Half hour timeout on creating the cluster.
-        timeout=1800,
-    )
+    self._RunCreateClusterCmd(cmd)
 
     for _, nodepool in self.nodepools.items():
       self._CreateNodePool(nodepool)
+
+  @vm_util.Retry(
+      timeout=3600,
+      retryable_exceptions=(errors.Resource.RetryableCreationError,),
+  )
+  def _RunCreateClusterCmd(self, cmd: list[str]):
+    """Runs the create cluster command, retrying on race condition errors."""
+    try:
+      _, err, retcode = vm_util.IssueCommand(
+          cmd,
+          # Half hour timeout on creating the cluster.
+          timeout=1800,
+          raise_on_failure=False,
+      )
+    except errors.VmUtil.IssueCommandTimeoutError as e:
+      retcode = 1
+      err = str(e)
+    if retcode:
+      if 'InvalidOutputTable' in err:
+        # This is a race condition where the logs analytics workspace hasn't
+        # finished being created. Retrying solves it.
+        raise errors.Resource.RetryableCreationError(err)
+      raise errors.Resource.CreationError(err)
 
   def _CreateNodePool(self, nodepool_config: container.BaseNodePoolConfig):
     """Creates a node pool."""
@@ -214,21 +249,40 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
         '--labels',
         f'pkb_nodepool={nodepool_config.name}',
     ] + self._GetNodeFlags(nodepool_config)
-    vm_util.IssueCommand(cmd, timeout=600)
+    _, stderr, retcode = vm_util.IssueCommand(
+        cmd, timeout=600, raise_on_failure=False
+    )
+    # Allocation failure could be due to capacity / quota / validity.
+    # Validity should be uncovered during development. Quota and capacity
+    # will trigger failures in other VM benchmarks.
+    if retcode:
+      if 'OverconstrainedZonalAllocationRequest' in stderr:
+        raise errors.Benchmarks.InsufficientCapacityCloudFailure(
+            'Creation failed. Kubernetes does not support specific failure'
+            ' modes so failure can be due to capacity, quota, or configuration'
+            ' validity. Please run another VM benchmark to validate root cause'
+            ' of failure.'
+        )
+      else:
+        raise errors.Resource.CreationError(stderr)
 
   def _GetNodeFlags(
       self, nodepool_config: container.BaseNodePoolConfig
   ) -> List[str]:
     """Common flags for create and nodepools add."""
-    args = [
-        '--node-vm-size',
-        nodepool_config.machine_type,
-    ] + self.resource_group.args
-    node_count = nodepool_config.num_nodes
-    if self._IsAutoscalerEnabled():
-      node_count = max(self.min_nodes, node_count)
-      node_count = min(self.max_nodes, node_count)
-    args += [f'--node-count={node_count}']
+    args = [] + self.resource_group.args
+    if nodepool_config.machine_type:
+      args += [
+          '--node-vm-size',
+          nodepool_config.machine_type,
+      ]
+    if self._IsAutoscalerEnabled(nodepool_config):
+      args += [
+          '--enable-cluster-autoscaler',
+          f'--min-count={nodepool_config.min_nodes}',
+          f'--max-count={nodepool_config.max_nodes}',
+      ]
+    args += [f'--node-count={nodepool_config.num_nodes}']
     if self.default_nodepool.zone and self.default_nodepool.zone != self.region:
       zones = ' '.join(
           zone[-1] for zone in self.default_nodepool.zone.split(',')
@@ -278,7 +332,7 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
     #
     # If it has not yet been deleted it will be deleted along with the resource
     # group.
-    if self.event_poller:
+    if self.cluster_spec.poll_for_events:
       self.event_poller.StopPolling()
     self._deleted = True
 
@@ -301,7 +355,6 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
 
   def _PostCreate(self):
     """Tags the cluster resource group."""
-    super()._PostCreate()
     self._GetCredentials(use_admin=True)
     self._WaitForDefaultServiceAccount()
     set_tags_cmd = [
@@ -324,6 +377,7 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
       kubernetes_commands.ApplyManifest(
           'container/azure/nvidia-device-plugin.yaml',
       )
+    super()._PostCreate()
 
   def _GetCredentials(self, use_admin: bool) -> None:
     """Helper method to get credentials and check service account readiness.
@@ -487,6 +541,38 @@ class AksCluster(kubernetes_cluster.KubernetesCluster):
         spot=FLAGS.azure_low_priority_vms,
     )
 
+  def ApplyFusePVC(self, pvc_name: str) -> None:
+    """Apply the Azure Blob Storage PV & PVC to the cluster."""
+    if not all([
+        FLAGS.k8s_inference_server_blobstorage_account,
+        FLAGS.k8s_inference_server_blobstorage_container,
+        FLAGS.k8s_inference_server_blobstorage_resource_group,
+        FLAGS.k8s_inference_server_blobstorage_key,
+    ]):
+      raise errors.Resource.CreationError(
+          'Azure Storage account, container, resource group and key are '
+          'required to apply BlobFuse PVC. Set '
+          '--k8s_inference_server_blobstorage_account, '
+          '--k8s_inference_server_blobstorage_container, '
+          '--k8s_inference_server_blobstorage_resource_group, and '
+          '--k8s_inference_server_blobstorage_key.'
+      )
+    storage_account = FLAGS.k8s_inference_server_blobstorage_account
+    kubernetes_commands.ApplyManifest(
+        'container/azure/blobfuse-pv-pvc.yaml.j2',
+        storage_account=storage_account,
+        blob_container=FLAGS.k8s_inference_server_blobstorage_container,
+        resource_group=FLAGS.k8s_inference_server_blobstorage_resource_group,
+        pvc_name=pvc_name,
+        encoded_account_name=base64.b64encode(
+            storage_account.encode('utf-8')
+        ).decode('utf-8'),
+        encoded_account_key=base64.b64encode(
+            FLAGS.k8s_inference_server_blobstorage_key.encode('utf-8')
+        ).decode('utf-8'),
+    )
+    logging.info('Successfully applied BlobFuse PVC.')
+
 
 class AksAutomaticCluster(AksCluster):
   """Class representing an AKS Automatic cluster, which has managed node pools.
@@ -522,13 +608,12 @@ class AksAutomaticCluster(AksCluster):
         self.resource_group.name,
         '--sku',
         'automatic',
+        # Enable the Azure Blob CSI driver at creation matching GKE Autopilot's
+        # default-on GCS Fuse support.
+        '--enable-blob-driver',
         '--tags',
     ] + tags_list
-    vm_util.IssueCommand(
-        cmd,
-        # Half hour timeout on creating the cluster.
-        timeout=1800,
-    )
+    self._RunCreateClusterCmd(cmd)
 
   def _CreateRoleAssignment(self):
     """Creates a role assignment for the current user."""
@@ -690,7 +775,6 @@ class AksAutomaticCluster(AksCluster):
     Needed as node_resource_group is pre-configured and fully managed in
     Automatic clusters & role assignment must be created before authenticating.
     """
-    super(kubernetes_cluster.KubernetesCluster, self)._PostCreate()
     user_type, _, _ = vm_util.IssueCommand([
         azure.AZURE_PATH,
         'account',
@@ -711,6 +795,7 @@ class AksAutomaticCluster(AksCluster):
     self._WaitForDefaultServiceAccount()
     self._AttachContainerRegistry()
     self._WaitForPolicyRelaxation()
+    super(kubernetes_cluster.KubernetesCluster, self)._PostCreate()
 
   def _ModifyPodSpecPlacementYaml(
       self,

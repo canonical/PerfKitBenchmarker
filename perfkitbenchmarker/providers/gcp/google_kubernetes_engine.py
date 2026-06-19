@@ -24,7 +24,6 @@ from typing import Any
 from absl import flags
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import provider_info
-from perfkitbenchmarker import virtual_machine
 from perfkitbenchmarker import virtual_machine_spec
 from perfkitbenchmarker.configs import container_spec as container_spec_lib
 from perfkitbenchmarker.providers.gcp import flags as gcp_flags
@@ -35,6 +34,7 @@ from perfkitbenchmarker.providers.gcp import util
 from perfkitbenchmarker.resources.container_service import container
 from perfkitbenchmarker.resources.container_service import container_cluster
 from perfkitbenchmarker.resources.container_service import container_registry
+from perfkitbenchmarker.resources.container_service import kubectl
 from perfkitbenchmarker.resources.container_service import kubernetes_cluster
 from perfkitbenchmarker.resources.container_service import kubernetes_commands
 
@@ -204,15 +204,14 @@ class BaseGkeCluster(kubernetes_cluster.KubernetesCluster):
       util.CheckGcloudResponseKnownFailures(stderr, retcode)
       raise errors.Resource.CreationError(stderr)
 
-  def _PostCreate(self):
-    """Acquires cluster authentication."""
+  def _GetKubeconfig(self):
+    """Returns the kubeconfig for the cluster."""
     cmd = self._GcloudCommand(
         'container', 'clusters', 'get-credentials', self.name
     )
     env = os.environ.copy()
     env['KUBECONFIG'] = FLAGS.kubeconfig
     cmd.IssueRetryable(env=env)
-    super()._PostCreate()
 
   def _IsDeleting(self):
     cmd = self._GcloudCommand('container', 'clusters', 'describe', self.name)
@@ -243,6 +242,18 @@ class BaseGkeCluster(kubernetes_cluster.KubernetesCluster):
     # PD-SSD
     return 'premium-rwo'
 
+  def HasLocalSsd(self, nodepool_name: str = 'default') -> bool:
+    """Returns true if the given nodepool has local SSDs."""
+    if nodepool_name == 'default':
+      nodepool = self.default_nodepool
+    elif nodepool_name not in self.nodepools:
+      raise errors.Config.InvalidValue(
+          f'Nodepool {nodepool_name} not found in cluster.'
+      )
+    else:
+      nodepool = self.nodepools[nodepool_name]
+    return nodepool.max_local_disks is not None and nodepool.max_local_disks > 0
+
   def GetNodePoolNames(self) -> list[str]:
     """Get node pool names for the cluster."""
     # Command `gcloud container node-pools list` does not work for Autopilot
@@ -252,6 +263,29 @@ class BaseGkeCluster(kubernetes_cluster.KubernetesCluster):
     cmd.flags['format'] = 'value(nodePools.name)'
     stdout, _, _ = cmd.Issue()
     return stdout.split()
+
+  def GetMachineTypeFromNodeName(self, node_name: str) -> str | None:
+    """Get the machine type from the node name."""
+    machine_type: str | None = super().GetMachineTypeFromNodeName(node_name)
+    if machine_type is not None:
+      return machine_type
+    out, _, _ = kubectl.RunKubectlCommand([
+        'get',
+        'node',
+        node_name,
+        '-o',
+        r'jsonpath={.metadata.labels.node\.kubernetes\.io/instance-type}',
+    ])
+    return out.strip() or None
+
+  def _UsesCustomComputeClass(
+      self, nodepool_config: container.BaseNodePoolConfig
+  ) -> bool:
+    """Returns True if the nodepool config uses a custom compute class."""
+    return bool(
+        (nodepool_config.machine_type is None and not nodepool_config.cpus)
+        or nodepool_config.machine_families
+    )
 
 
 class GkeCluster(BaseGkeCluster):
@@ -282,15 +316,12 @@ class GkeCluster(BaseGkeCluster):
       vm_config: virtual_machine_spec.BaseVmSpec,
       nodepool_config: container.BaseNodePoolConfig,
   ):
-    vm_config = typing.cast(
-        gce_virtual_machine.GceVmSpec, vm_config
-    )
+    super().InitializeNodePoolForCloud(vm_config, nodepool_config)
+    vm_config = typing.cast(gce_virtual_machine.GceVmSpec, vm_config)
     nodepool_config.disk_type = vm_config.boot_disk_type
     nodepool_config.disk_size = vm_config.boot_disk_size
     nodepool_config.max_local_disks = vm_config.max_local_disks
     nodepool_config.ssd_interface = vm_config.ssd_interface
-    nodepool_config.gpu_type = vm_config.gpu_type
-    nodepool_config.gpu_count = vm_config.gpu_count
     nodepool_config.threads_per_core = vm_config.threads_per_core
     nodepool_config.gce_tags = vm_config.gce_tags
     nodepool_config.min_cpu_platform = vm_config.min_cpu_platform
@@ -306,6 +337,13 @@ class GkeCluster(BaseGkeCluster):
       cmd.flags['region'] = self.region
     return cmd
 
+  def GetNodeSelectors(self, machine_type: str | None = None) -> dict[str, str]:
+    """Targets the default pool ComputeClass when custom classes are enabled."""
+    del machine_type
+    if self._UsesCustomComputeClass(self.default_nodepool):
+      return {'cloud.google.com/compute-class': self.default_nodepool.name}
+    return {}
+
   def GetResourceMetadata(self) -> dict[str, Any]:
     """Returns a dict containing metadata about the cluster.
 
@@ -319,9 +357,6 @@ class GkeCluster(BaseGkeCluster):
       result['gce_local_ssd_count'] = self.default_nodepool.max_local_disks
       result['gce_local_ssd_interface'] = self.default_nodepool.ssd_interface
     result['gke_nccl_fast_socket'] = self.enable_nccl_fast_socket
-    if 'nccl' in self.nodepools:
-      result['gpu_type'] = self.nodepools['nccl'].gpu_type
-      result['gpu_count'] = self.nodepools['nccl'].gpu_count
     if self.image_type:
       result['image_type'] = self.image_type
     if gcp_flags.MAX_CPU.value:
@@ -330,6 +365,10 @@ class GkeCluster(BaseGkeCluster):
       result['max-memory'] = gcp_flags.MAX_MEMORY.value
     if gcp_flags.MAX_ACCELERATOR.value:
       result['max-accelerator'] = gcp_flags.MAX_ACCELERATOR.value
+    if gcp_flags.GKE_AUTOSCALING_PROFILE.value:
+      result['gke_autoscaling_profile'] = (
+          gcp_flags.GKE_AUTOSCALING_PROFILE.value
+      )
 
     return result
 
@@ -351,6 +390,8 @@ class GkeCluster(BaseGkeCluster):
         self.default_nodepool,
         cmd,
     )
+    if self._UsesCustomComputeClass(self.default_nodepool):
+      cmd.args.append('--enable-default-compute-class')
     enable_autoprovisioning = False
     if gcp_flags.MAX_CPU.value:
       cmd.flags['max-cpu'] = gcp_flags.MAX_CPU.value
@@ -364,17 +405,21 @@ class GkeCluster(BaseGkeCluster):
     if enable_autoprovisioning:
       cmd.args.append('--enable-autoprovisioning')
 
-    if (
-        self.min_nodes != self.default_nodepool.num_nodes
-        or self.max_nodes != self.default_nodepool.num_nodes
-    ):
-      cmd.args.append('--enable-autoscaling')
-      cmd.flags['max-nodes'] = self.max_nodes
-      cmd.flags['min-nodes'] = self.min_nodes
-    cmd.flags['cluster-ipv4-cidr'] = f'/{_CalculateCidrSize(self.max_nodes)}'
+    if gcp_flags.GKE_AUTOSCALING_PROFILE.value:
+      cmd.flags['autoscaling-profile'] = gcp_flags.GKE_AUTOSCALING_PROFILE.value
+    cidr_size = (
+        gcp_flags.GKE_CLUSTER_IPV4_CIDR_SIZE.value
+        or _CalculateCidrSize(self.max_total_nodes)
+    )
+    cmd.flags['cluster-ipv4-cidr'] = f'/{cidr_size}'
     cmd.flags['metadata'] = util.MakeFormattedDefaultTags()
 
+    if self.enable_aam:
+      cmd.args.append('--auto-monitoring-scope=ALL')
+
     self._RunClusterCreateCommand(cmd)
+    self._GetKubeconfig()
+    self._CreateCustomComputeClass(self.default_nodepool)
     self._CreateNodePools()
 
   def _CreateNodePools(self):
@@ -388,6 +433,57 @@ class GkeCluster(BaseGkeCluster):
           cmd,
       )
       self._IssueResourceCreationCommand(cmd)
+      self._CreateCustomComputeClass(nodepool)
+
+  def _CreateCustomComputeClass(
+      self, nodepool_config: container.BaseNodePoolConfig
+  ):
+    """Creates a custom compute class for the nodepool."""
+    if not self._UsesCustomComputeClass(nodepool_config):
+      return
+    compute_manifest = {
+        'apiVersion': 'cloud.google.com/v1',
+        'kind': 'ComputeClass',
+        'metadata': {
+            'name': nodepool_config.name,
+        },
+    }
+    priorities = []
+    for machine_family in nodepool_config.machine_families:
+      priorities.append({
+          'machineFamily': machine_family,
+      })
+    is_default_class = (
+        nodepool_config.name == container_cluster.DEFAULT_NODEPOOL
+    )
+    compute_manifest['spec'] = {'priorities': priorities}
+    if is_default_class:
+      compute_manifest['spec']['nodePoolAutoCreation'] = {'enabled': True}
+    kubernetes_commands.ApplyYaml([compute_manifest])
+    if is_default_class:
+      return
+    cmd = self._GcloudCommand(
+        'container',
+        'node-pools',
+        'update',
+        nodepool_config.name,
+        '--cluster',
+        self.name,
+        '--node-labels',
+        f'cloud.google.com/compute-class={nodepool_config.name}',
+    )
+    cmd.Issue()
+    cmd = self._GcloudCommand(
+        'container',
+        'node-pools',
+        'update',
+        nodepool_config.name,
+        '--cluster',
+        self.name,
+        '--node-taints',
+        f'cloud.google.com/compute-class={nodepool_config.name}:NoSchedule',
+    )
+    cmd.Issue()
 
   def _AddNodeParamsToCmd(
       self,
@@ -448,16 +544,21 @@ class GkeCluster(BaseGkeCluster):
         cmd.flags['local-ssd-count'] = nodepool_config.max_local_disks
 
     cmd.flags['num-nodes'] = nodepool_config.num_nodes
-    # zone may be split a comma separated list
-    if nodepool_config.zone:
+    # zone may be split a comma separated list. For regional clusters, zone
+    # holds the region name; do not set node-locations so GKE uses default.
+    if nodepool_config.zone and not util.IsRegion(nodepool_config.zone):
       cmd.flags['node-locations'] = nodepool_config.zone
 
-    if nodepool_config.machine_type is None:
+    if nodepool_config.machine_type:
+      cmd.flags['machine-type'] = nodepool_config.machine_type
+    elif nodepool_config.cpus and nodepool_config.memory_mib:
       cmd.flags['machine-type'] = 'custom-{}-{}'.format(
           nodepool_config.cpus, nodepool_config.memory_mib
       )
     else:
-      cmd.flags['machine-type'] = nodepool_config.machine_type
+      assert (
+          nodepool_config.machine_families
+      ), 'No machine type nor custom type nor machine family specified.'
 
     if FLAGS.gke_enable_gvnic:
       cmd.args.append('--enable-gvnic')
@@ -479,6 +580,10 @@ class GkeCluster(BaseGkeCluster):
       cmd.flags['image-type'] = self.image_type
 
     cmd.flags['node-labels'] = f'pkb_nodepool={nodepool_config.name}'
+    if nodepool_config.min_nodes != nodepool_config.max_nodes:
+      cmd.args.append('--enable-autoscaling')
+      cmd.flags['min-nodes'] = nodepool_config.min_nodes
+      cmd.flags['max-nodes'] = nodepool_config.max_nodes
 
   def _PostCreate(self):
     """Waits for kube-dns to be available."""
@@ -530,7 +635,7 @@ class GkeAutopilotCluster(BaseGkeCluster):
   """Class representing an Autopilot GKE cluster, which has no nodepools."""
 
   CLOUD = provider_info.GCP
-  CLUSTER_TYPE = 'Autopilot'
+  CLUSTER_TYPE = 'Auto'
 
   def __init__(self, spec: container_spec_lib.ContainerClusterSpec):
     super().__init__(spec)
@@ -543,6 +648,9 @@ class GkeAutopilotCluster(BaseGkeCluster):
       vm_config: virtual_machine_spec.BaseVmSpec,
       nodepool_config: container.BaseNodePoolConfig,
   ):
+    kubernetes_cluster.KubernetesCluster.InitializeNodePoolForCloud(
+        self, vm_config, nodepool_config
+    )
     nodepool_config.network = gce_network.GceNetwork.GetNetwork(vm_config)
     return nodepool_config
 
@@ -567,7 +675,11 @@ class GkeAutopilotCluster(BaseGkeCluster):
       cmd.flags['network'] = self.default_nodepool.network.network_resource.name
     cmd.flags['labels'] = util.MakeFormattedDefaultTags()
 
+    if self.enable_aam:
+      cmd.args.append('--auto-monitoring-scope=ALL')
+
     self._RunClusterCreateCommand(cmd)
+    self._GetKubeconfig()
 
   def GetResourceMetadata(self) -> dict[str, Any]:
     metadata = super().GetResourceMetadata()
@@ -593,9 +705,9 @@ class GkeAutopilotCluster(BaseGkeCluster):
       # bigger nodes.
       compute_class = 'Performance'
     # https://cloud.google.com/kubernetes-engine/docs/how-to/autopilot-gpus#request-gpus
-    if virtual_machine.GPU_TYPE.value:
-      gpu_count = virtual_machine.GPU_COUNT.value or 1
-      gpu_type = virtual_machine.GPU_TYPE.value
+    if self.gpu_type:
+      gpu_count = self.gpu_count or 1
+      gpu_type = self.gpu_type
       suffix = ''
       if gpu_type in gce_virtual_machine.GPU_TYPE_TO_SUFFIX:
         suffix = gce_virtual_machine.GPU_TYPE_TO_SUFFIX[gpu_type]

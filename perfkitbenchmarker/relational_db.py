@@ -252,6 +252,20 @@ CAPTURE_IO_STATS_SQL = (
     'sys.dm_io_virtual_file_stats(NULL,NULL)'
 )
 
+CAPTURE_TRACE_STATUS_SQL = 'DBCC TRACESTATUS(-1)'
+CAPTURE_SERVER_EVENT_SESSIONS_SQL = 'SELECT * FROM sys.server_event_sessions'
+CAPTURE_PERFORMANCE_COUNTERS_SQL = (
+    'SELECT SYSDATETIME() AS CURRENTTIME,'
+    '[cntr_value] AS countervalue,counter_name '
+    'FROM sys.dm_os_performance_counters '
+    "WHERE [object_name] LIKE '%Manager%' "
+    "AND [counter_name] IN ('Page life expectancy',"
+    "'Buffer cache hit ratio','Buffer cache hit ratio base',"
+    "'Lazy writes/sec','Memory Grants Pending','Free list stalls/sec',"
+    "'Target Server Memory (KB)','Total Server Memory (KB)')"
+)
+SELECT_VERSION_SQL = 'SELECT @@VERSION'
+
 
 class RelationalDbPropertyNotSetError(Exception):
   pass
@@ -388,7 +402,9 @@ class BaseRelationalDb(resource.BaseResource):
     return [t for t in tools if t is not None]
 
   @property
-  def client_vm_query_tools_for_replica(self):
+  def client_vm_query_tools_for_replica(
+      self,
+  ) -> sql_engine_utils.ISQLQueryTools:
     """Query tools to make custom queries on replica."""
     if not self.replica_endpoint:
       raise ValueError('Database does not have replica.')
@@ -428,6 +444,64 @@ class BaseRelationalDb(resource.BaseResource):
       with open(data.ResourcePath('capture_wait_stats.sql'), 'r') as f:
         return self.client_vm_query_tools.IssueSqlCommand(f.read())
     return ('', '')
+
+  def QueryServerVersion(self) -> tuple[str, str]:
+    if self.engine_type != sql_engine_utils.SQLSERVER:
+      return ('', '')
+    logging.info('Querying server version')
+    return self.client_vm_query_tools.IssueSqlCommand(SELECT_VERSION_SQL)
+
+  def QueryDatabaseScopedConfigurations(self) -> tuple[str, str]:
+    if self.engine_type != sql_engine_utils.SQLSERVER:
+      return ('', '')
+    logging.info('Querying database scoped configurations')
+    with open(
+        data.ResourcePath('capture_db_scoped_configurations.sql'), 'r'
+    ) as f:
+      return self.client_vm_query_tools.IssueSqlCommand(f.read())
+
+  def QueryTraceStatus(self) -> tuple[str, str]:
+    if self.engine_type != sql_engine_utils.SQLSERVER:
+      return ('', '')
+    logging.info('Querying trace status')
+    return self.client_vm_query_tools.IssueSqlCommand(CAPTURE_TRACE_STATUS_SQL)
+
+  def QueryServerEventSessions(self) -> tuple[str, str]:
+    if self.engine_type != sql_engine_utils.SQLSERVER:
+      return ('', '')
+    logging.info('Querying server event sessions')
+    return self.client_vm_query_tools.IssueSqlCommand(
+        CAPTURE_SERVER_EVENT_SESSIONS_SQL
+    )
+
+  def LogDatabaseDebugInfo(self) -> None:
+    """Logs database debug information."""
+    queries = [
+        (self.QueryWaitStats, 'Wait Stats'),
+        (self.QueryIOStats, 'IO Stats'),
+        (self.QueryServerVersion, 'DB Version'),
+        (self.QueryDatabaseScopedConfigurations, 'DB Configuration'),
+        (self.QueryTraceStatus, 'Trace Status'),
+        (self.QueryServerEventSessions, 'Server Event Sessions'),
+    ]
+
+    for query_method, name in queries:
+      stdout, _ = query_method()
+      if stdout:
+        logging.info('%s:\n%s', name, stdout)
+
+  def QueryPerformanceCounters(self) -> tuple[str, str]:
+    """Queries and logs performance counters.
+
+    Returns:
+      A tuple of stdout and stderr from the command execution.
+    """
+    if self.engine_type != sql_engine_utils.SQLSERVER:
+      return ('', '')
+    logging.info('Querying performance counters')
+    return self.client_vm_query_tools.IssueSqlCommand(
+        CAPTURE_PERFORMANCE_COUNTERS_SQL
+    )
 
   @property
   def port(self):
@@ -539,8 +613,9 @@ class BaseRelationalDb(resource.BaseResource):
 
     return metadata
 
+  @staticmethod
   @abc.abstractmethod
-  def GetDefaultEngineVersion(self, engine):
+  def GetDefaultEngineVersion(engine: str) -> str:
     """Return the default version (for PKB) for the given database engine.
 
     Args:
@@ -548,6 +623,7 @@ class BaseRelationalDb(resource.BaseResource):
 
     Returns: default version as a string for the given engine.
     """
+    raise NotImplementedError('GetDefaultEngineVersion is not implemented.')
 
   def _SetEndpoint(self):
     """Set the DB endpoint for this instance during _PostCreate."""

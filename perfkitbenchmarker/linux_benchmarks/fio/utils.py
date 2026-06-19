@@ -192,7 +192,7 @@ def FillDevice(
     dir_or_filename_arg = 'filename'
   command = (
       f'sudo {exec_path} --{dir_or_filename_arg}={disk.GetDevicePath()} '
-      f'--ioengine={fio_flags.FIO_IOENGINE.value} --name={_FILENAME_PREFIX} '
+      f'--ioengine=libaio --name={_FILENAME_PREFIX} '
       f'--blocksize={fio_flags.FIO_FILL_BLOCK_SIZE.value} --iodepth=64 '
       f'--rw={fill_access_pattern} --direct=1 --size={fill_size} '
       f'--nrfiles={fio_flags.FIO_NR_FILES.value} --fallocate=none '
@@ -296,6 +296,16 @@ def MountDisk(vm):
         disk.mount_options,
         disk.fstab_options,
     )
+
+
+def GetFioTargetModeWithoutFillForWrite():
+  """Returns the fio target mode based on the operation type.
+
+  Always prefilling for read.
+  """
+  if fio_flags.FIO_OPERATION_TYPE.value == constants.OPERATION_WRITE:
+    return constants.AGAINST_DEVICE_WITHOUT_FILL_MODE
+  return constants.AGAINST_DEVICE_WITH_FILL_MODE
 
 
 def WriteJobFileToTempFile(vm, job_file_string):

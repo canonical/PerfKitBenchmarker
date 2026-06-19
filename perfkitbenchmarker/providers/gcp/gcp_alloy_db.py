@@ -28,23 +28,39 @@ _COLUMNAR_ENGINE = flags.DEFINE_bool(
 
 _COLUMNAR_ENGINE_SIZE = flags.DEFINE_integer(
     'alloydb_columnar_engine_size_mb',
-    1024,
-    'Columnar engine is set to 1GB by default.',
+    None,
+    'Columnar engine size in MB. If None, PKB will omit setting '
+    'google_columnar_engine.memory_size_in_mb, allowing the database '
+    'instance to natively allocate its default (30% of instance memory). '
+    'If specified, PKB sets it to the integer value.',
 )
 
-_ENABLE_AUTO_COLUMNARIZATION = flags.DEFINE_enum(
+_ENABLE_AUTO_COLUMNARIZATION = flags.DEFINE_bool(
     'alloydb_enable_auto_columnarization',
-    'on',
-    ['on', 'off'],
-    'Set alloydb_enable_auto_columnarization to On or off.',
+    None,
+    'Set google_columnar_engine.enable_auto_columnarization. '
+    'If None, PKB will omit setting this flag, allowing the database '
+    'instance to natively use its default (on). '
+    'If specified, PKB sets it to on/off based on the boolean value.',
 )
 
 _ENABLE_COLUMNAR_RECOMMENDATION = flags.DEFINE_bool(
     'alloydb_enable_columnar_recommendation',
-    False,
-    'Set alloydb_enable_columnar_recommendation to On if true.',
+    None,
+    'Set google_columnar_engine.enable_columnar_recommendation. '
+    'If None, PKB will omit setting this flag, allowing the database '
+    'instance to natively use its default (on). '
+    'If specified, PKB sets it to on/off based on the boolean value.',
 )
 
+_ENABLE_INDEX_CACHING = flags.DEFINE_bool(
+    'alloydb_enable_index_caching',
+    None,
+    'Set google_columnar_engine.enable_index_caching. '
+    'If None, PKB will omit setting this flag, allowing the database '
+    'instance to natively use its default (off). '
+    'If specified, PKB sets it to on/off based on the boolean value.',
+)
 
 _READ_POOL_NODE_COUNT = flags.DEFINE_integer(
     'alloydb_read_pool_node_count',
@@ -248,14 +264,14 @@ class GCPAlloyRelationalDb(relational_db.BaseRelationalDb):
   def _PostCreate(self) -> None:
     """Creates the PKB user and sets the password."""
     super()._PostCreate()
-    columnar_engine_size = None
-    if _COLUMNAR_ENGINE.value:
-      columnar_engine_size = _COLUMNAR_ENGINE_SIZE.value
-    self.UpdateAlloyDBFlags(
-        columnar_engine_size,
-        _ENABLE_COLUMNAR_RECOMMENDATION.value,
-        _ENABLE_AUTO_COLUMNARIZATION.value,
+    updated = self.UpdateAlloyDBFlags(
+        columnar_engine_size=_COLUMNAR_ENGINE_SIZE.value,
+        enable_columnar_recommendation=_ENABLE_COLUMNAR_RECOMMENDATION.value,
+        enable_auto_columnarization=_ENABLE_AUTO_COLUMNARIZATION.value,
+        enable_index_caching=_ENABLE_INDEX_CACHING.value,
     )
+    if updated:
+      self.RestartInstance()
     self._UpdateLabels(util.GetDefaultTags())
 
   def _DescribeCluster(self) -> Dict[str, Any]:
@@ -328,28 +344,57 @@ class GCPAlloyRelationalDb(relational_db.BaseRelationalDb):
   @vm_util.Retry(timeout=UPDATE_TIMEOUT)
   def UpdateAlloyDBFlags(
       self,
-      columnar_engine_size: int | None,
-      enable_columnar_recommendation: bool,
-      enable_auto_columnarization: str,
+      columnar_engine_size: int | None = None,
+      enable_columnar_recommendation: bool | None = None,
+      enable_auto_columnarization: bool | None = None,
+      enable_index_caching: bool | None = None,
       relation: str | None = None,
-  ):
+  ) -> bool:
+    """Update flags on an existing AlloyDB instance.
+
+    See https://docs.cloud.google.com/alloydb/docs/reference/database-flags for
+    information on individual flags.
+
+    Args:
+      columnar_engine_size: Set google_columnar_engine.memory_size_in_mb.
+      enable_columnar_recommendation: Set
+        google_columnar_engine.enable_columnar_recommendation.
+      enable_auto_columnarization: Set
+        google_columnar_engine.enable_auto_columnarization.
+      enable_index_caching: Set google_columnar_engine.enable_index_caching.
+      relation: Set google_columnar_engine.relations.
+
+    Returns:
+      True if flags were updated, False otherwise.
+    """
+
     database_flags = []
+    flags_updated = False
     if FLAGS.db_flags:
       database_flags += [':'.join(FLAGS.db_flags)]
 
-    if columnar_engine_size:
+    if self.enable_columnar_engine:
       database_flags += [
           'google_columnar_engine.enabled=on',
-          f'google_columnar_engine.memory_size_in_mb={columnar_engine_size}',
-          (
-              'google_columnar_engine.enable_auto_columnarization='
-              f'{enable_auto_columnarization}'
-          ),
       ]
-
-      if enable_columnar_recommendation:
+      if enable_auto_columnarization is not None:
         database_flags += [
-            'google_columnar_engine.enable_columnar_recommendation=on',
+            'google_columnar_engine.enable_auto_columnarization='
+            f'{"on" if enable_auto_columnarization else "off"}'
+        ]
+      if columnar_engine_size is not None:
+        database_flags += [
+            f'google_columnar_engine.memory_size_in_mb={columnar_engine_size}',
+        ]
+      if enable_columnar_recommendation is not None:
+        database_flags += [
+            'google_columnar_engine.enable_columnar_recommendation='
+            f'{"on" if enable_columnar_recommendation else "off"}'
+        ]
+      if enable_index_caching is not None:
+        database_flags += [
+            'google_columnar_engine.enable_index_caching='
+            f'{"on" if enable_index_caching else "off"}'
         ]
       if relation:
         database_flags += [f'google_columnar_engine.relations={relation}']
@@ -365,6 +410,19 @@ class GCPAlloyRelationalDb(relational_db.BaseRelationalDb):
       ]
       cmd = self._GetAlloyDbCommand(cmd_string)
       cmd.Issue(timeout=CREATION_TIMEOUT)
+      flags_updated = True
+    return flags_updated
+
+  def RestartInstance(self):
+    cmd_string = [
+        'instances',
+        'restart',
+        self.instance_id,
+        f'--cluster={self.cluster_id}',
+        '--no-async',
+    ]
+    cmd = self._GetAlloyDbCommand(cmd_string)
+    cmd.Issue(timeout=CREATION_TIMEOUT)
 
   def GetColumnarEngineRecommendation(
       self, database_name: str

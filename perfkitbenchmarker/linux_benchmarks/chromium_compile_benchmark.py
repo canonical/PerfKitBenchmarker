@@ -23,12 +23,15 @@ chromium_compile:
         GCP:
           machine_type: n1-standard-8
           zone: us-central1-c
+          boot_disk_size: 100
         AWS:
           machine_type: c4.2xlarge
           zone: us-east-1a
+          boot_disk_size: 100
         Azure:
           machine_type: Standard_F8
           zone: eastus
+          boot_disk_size: 100
         OpenStack:
           machine_type: m1.small
           zone: eastus

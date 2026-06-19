@@ -126,6 +126,7 @@ _MACHINE_TYPE_PREFIX_TO_ARM_ARCH = {
     'c8g': 'graviton4',
     'r8g': 'graviton4',
     'i8g': 'graviton4',
+    'm9g': 'graviton5',
     't4g': 'graviton2',
     'im4g': 'graviton2',
     'is4ge': 'graviton2',
@@ -793,9 +794,13 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
     describe_cmd = util.AWS_PREFIX + [
         'ec2',
         'describe-instances',
-        '--region=%s' % self.region,
-        '--filter=Name=client-token,Values=%s' % self.client_token,
-    ]
+        '--region=%s' % self.region,]
+    if self.client_token:
+      describe_cmd.append(
+          f'--filter=Name=client-token,Values={self.client_token}'
+      )
+    else:
+      describe_cmd.append(f'--instance-ids={self.id}')
     stdout, _ = util.IssueRetryableCommand(describe_cmd)
     return json.loads(stdout)
 
@@ -997,6 +1002,12 @@ class AwsVirtualMachine(virtual_machine.BaseVirtualMachine):
         + reservation_args
         + bandwidth_weighting_args
     )
+
+    if aws_flags.AWS_METADATA_HTTP_TOKENS.value:
+      create_cmd.append(
+          '--metadata-options=HttpEndpoint=enabled,HttpTokens=%s'
+          % aws_flags.AWS_METADATA_HTTP_TOKENS.value
+      )
 
     if FLAGS.aws_vm_hibernate:
       create_cmd.extend([
@@ -1848,6 +1859,13 @@ class Ubuntu2404BasedAwsVirtualMachine(
   DEFAULT_ROOT_DISK_TYPE = 'gp3'
 
 
+class Ubuntu2604BasedAwsVirtualMachine(
+    UbuntuBasedAwsVirtualMachine, linux_virtual_machine.Ubuntu2604Mixin
+):
+  IMAGE_NAME_FILTER_PATTERN = 'ubuntu/images/*/ubuntu-resolute-26.04-{alternate_architecture}-server-20*'
+  DEFAULT_ROOT_DISK_TYPE = 'gp3'
+
+
 class AmazonLinux2BasedAwsVirtualMachine(
     AwsVirtualMachine, linux_virtual_machine.AmazonLinux2Mixin
 ):
@@ -2241,6 +2259,13 @@ class Windows2025DesktopSQLServer2022EnterpriseAwsVirtualMachine(
     windows_virtual_machine.Windows2025SQLServer2022Enterprise,
 ):
   IMAGE_SSM_PATTERN = '/aws/service/ami-windows-latest/Windows_Server-2025-English-Full-SQL_2022_Enterprise'
+
+
+class Windows2025DesktopSQLServer2025EnterpriseAwsVirtualMachine(
+    BaseWindowsAwsVirtualMachine,
+    windows_virtual_machine.Windows2025SQLServer2025Enterprise,
+):
+  IMAGE_SSM_PATTERN = '/aws/service/ami-windows-latest/Windows_Server-2025-English-Full-SQL_2025_Enterprise'
 
 
 def GenerateDownloadPreprovisionedDataCommand(

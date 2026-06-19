@@ -1,7 +1,8 @@
-"""Tests for google3.third_party.py.perfkitbenchmarker.providers.gcp.gcp_spanner."""
-
 import datetime
 import inspect
+import json
+import time
+from typing import Type, cast
 import unittest
 
 from absl import flags
@@ -10,12 +11,14 @@ from absl.testing import parameterized
 from google.cloud import monitoring_v3
 from google.cloud.monitoring_v3 import types
 import mock
+from perfkitbenchmarker import errors
 from perfkitbenchmarker import relational_db
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.providers.gcp import gcp_spanner
 from perfkitbenchmarker.providers.gcp import util
 from tests import pkb_common_test_case
 import requests
+
 
 FLAGS = flags.FLAGS
 
@@ -26,8 +29,11 @@ def GetTestSpannerInstance(engine='spanner-googlesql'):
       'test_component', flag_values=FLAGS, **spec_args
   )
   spanner_spec.spanner_database_name = 'test_database'
-  spanner_class = relational_db.GetRelationalDbClass(
-      cloud='GCP', is_managed_db=True, engine=engine
+  spanner_class = cast(
+      Type[gcp_spanner.GcpSpannerInstance],
+      relational_db.GetRelationalDbClass(
+          cloud='GCP', is_managed_db=True, engine=engine
+      ),
   )
   return spanner_class(spanner_spec)
 
@@ -272,7 +278,7 @@ class SpannerTest(pkb_common_test_case.PkbCommonTestCase):
             ],
         }]
     )
-    mock_client = mock.MagicMock()
+    mock_client = mock.Mock()
     mock_client.list_time_series.return_value = mock_response.time_series
 
     self.enter_context(
@@ -297,6 +303,7 @@ class SpannerTest(pkb_common_test_case.PkbCommonTestCase):
     self.assertEqual(size_max.value, 4)
 
   def testRunDDLQuery_WithTimeout(self):
+    # Arrange
     test_instance = GetTestSpannerInstance()
     test_instance.instance_id = 'pkb-instance-test_uri'
     test_instance.database = 'pkb-database-test_uri'
@@ -305,13 +312,17 @@ class SpannerTest(pkb_common_test_case.PkbCommonTestCase):
     with mock.patch.object(
         util.GcloudCommand, 'Issue', return_value=('', '', 0), autospec=True
     ) as issue:
+      # Act
       test_instance.RunDDLQuery(ddl, timeout=timeout)
+
+      # Assert
       gcloud_cmd = issue.call_args[0][0]
       self.assertEqual(gcloud_cmd.flags['instance'], test_instance.instance_id)
       self.assertEqual(gcloud_cmd.flags['ddl'], ddl)
       self.assertEqual(issue.call_args[1]['timeout'], timeout)
 
   def testRunDDLQuery_WithoutTimeout(self):
+    # Arrange
     test_instance = GetTestSpannerInstance()
     test_instance.instance_id = 'pkb-instance-test_uri'
     test_instance.database = 'pkb-database-test_uri'
@@ -319,11 +330,141 @@ class SpannerTest(pkb_common_test_case.PkbCommonTestCase):
     with mock.patch.object(
         util.GcloudCommand, 'Issue', return_value=('', '', 0), autospec=True
     ) as issue:
+      # Act
       test_instance.RunDDLQuery(ddl)
+
+      # Assert
       gcloud_cmd = issue.call_args[0][0]
       self.assertEqual(gcloud_cmd.flags['instance'], test_instance.instance_id)
       self.assertEqual(gcloud_cmd.flags['ddl'], ddl)
       self.assertEqual(issue.call_args[1]['timeout'], vm_util.DEFAULT_TIMEOUT)
+
+  def testRunDDLQuery_Async(self):
+    # Arrange
+    test_instance = GetTestSpannerInstance()
+    test_instance.instance_id = 'pkb-instance-test_uri'
+    test_instance.database = 'pkb-database-test_uri'
+    ddl = 'ALTER TABLE t ADD COLUMN c INT64'
+    op_name = 'projects/p/instances/i/databases/d/operations/op1'
+    with mock.patch.object(
+        test_instance, '_WaitForSpannerAsyncOperation'
+    ) as mock_wait:
+      with mock.patch.object(
+          util.GcloudCommand,
+          'Issue',
+          return_value=('[]', f'Operation name={op_name}', 0),
+          autospec=True,
+      ) as issue:
+        # Act
+        test_instance.RunDDLQuery(ddl, async_proc=True)
+
+        # Assert
+        with self.subTest('TestInitialDDLCommand'):
+          issue.assert_called_once()
+          (gcloud_cmd,), _ = issue.call_args
+          self.assertEqual(
+              gcloud_cmd.flags['instance'], test_instance.instance_id
+          )
+          self.assertEqual(gcloud_cmd.flags['ddl'], ddl)
+          self.assertTrue(gcloud_cmd.flags['async'])
+
+        with self.subTest('TestCallsWaitForOperation'):
+          mock_wait.assert_called_once_with(
+              op_name, timeout=vm_util.DEFAULT_TIMEOUT
+          )
+
+  def testRunDDLQuery_AsyncFailure(self):
+    # Arrange
+    test_instance = GetTestSpannerInstance()
+    test_instance.instance_id = 'pkb-instance-test_uri'
+    test_instance.database = 'pkb-database-test_uri'
+    ddl = 'ALTER TABLE t ADD COLUMN c INT64'
+    op_name = 'projects/p/instances/i/databases/d/operations/op1'
+    with mock.patch.object(
+        test_instance,
+        '_WaitForSpannerAsyncOperation',
+        side_effect=errors.Benchmarks.RunError('failed'),
+    ):
+      with mock.patch.object(
+          util.GcloudCommand,
+          'Issue',
+          return_value=('[]', f'Operation name={op_name}', 0),
+          autospec=True,
+      ):
+        # Act & Assert
+        with self.assertRaisesRegex(errors.Benchmarks.RunError, 'failed'):
+          test_instance.RunDDLQuery(ddl, async_proc=True)
+
+  def testWaitForSpannerAsyncOperation_Success(self):
+    # Arrange
+    test_instance = GetTestSpannerInstance()
+    test_instance.instance_id = 'pkb-instance-test_uri'
+    test_instance.database = 'pkb-database-test_uri'
+    op_name = 'projects/p/instances/i/databases/d/operations/op1'
+    timeout = 60
+
+    with mock.patch.object(
+        util.GcloudCommand,
+        'Issue',
+        return_value=('{"done": true}', '', 0),
+        autospec=True,
+    ) as issue:
+      # Act
+      test_instance._WaitForSpannerAsyncOperation(op_name, timeout)
+
+      # Assert
+      issue.assert_called_once()
+      (poll_cmd,), _ = issue.call_args
+      self.assertIn('operations', poll_cmd.args)
+      self.assertIn('describe', poll_cmd.args)
+      self.assertIn(op_name, poll_cmd.args)
+      self.assertEqual(poll_cmd.flags['instance'], test_instance.instance_id)
+      self.assertEqual(poll_cmd.flags['database'], test_instance.database)
+
+  def testWaitForSpannerAsyncOperation_RetryThenSuccess(self):
+    # Arrange
+    test_instance = GetTestSpannerInstance()
+    test_instance.instance_id = 'pkb-instance-test_uri'
+    test_instance.database = 'pkb-database-test_uri'
+    op_name = 'projects/p/instances/i/databases/d/operations/op1'
+    timeout = 60
+
+    self.enter_context(mock.patch.object(vm_util.time, 'sleep'))
+
+    with mock.patch.object(
+        util.GcloudCommand,
+        'Issue',
+        side_effect=[
+            ('{"done": false}', '', 0),
+            ('{"done": true}', '', 0),
+        ],
+        autospec=True,
+    ) as issue:
+      # Act
+      test_instance._WaitForSpannerAsyncOperation(op_name, timeout)
+
+      # Assert
+      self.assertEqual(issue.call_count, 2)
+
+  def testWaitForSpannerAsyncOperation_Failure(self):
+    # Arrange
+    test_instance = GetTestSpannerInstance()
+    test_instance.instance_id = 'pkb-instance-test_uri'
+    test_instance.database = 'pkb-database-test_uri'
+    op_name = 'projects/p/instances/i/databases/d/operations/op1'
+    timeout = 60
+
+    with mock.patch.object(
+        util.GcloudCommand,
+        'Issue',
+        return_value=('{"done": true, "error": {"message": "failed"}}', '', 0),
+        autospec=True,
+    ):
+      # Act & Assert
+      with self.assertRaisesRegex(
+          gcp_spanner.errors.Benchmarks.RunError, 'failed'
+      ):
+        test_instance._WaitForSpannerAsyncOperation(op_name, timeout)
 
 
 class CreateTest(pkb_common_test_case.PkbCommonTestCase):
@@ -359,7 +500,7 @@ class CreateTest(pkb_common_test_case.PkbCommonTestCase):
     self.assertFalse(self.test_instance.created)
     self.enter_context(
         mock.patch.object(
-            self.test_instance, '_Exists', side_effect=[False, True]
+            self.test_instance, '_Exists', side_effect=[False, True, True]
         )
     )
     self.enter_context(
@@ -370,6 +511,129 @@ class CreateTest(pkb_common_test_case.PkbCommonTestCase):
 
     self.assertTrue(self.test_instance.created)
     self.assertFalse(self.test_instance.user_managed)
+
+
+class RestoreTest(pkb_common_test_case.PkbCommonTestCase):
+
+  @flagsaver.flagsaver(
+      run_uri='test_uri',
+      cloud_spanner_source_instance_id='source_instance',
+      cloud_spanner_source_database_id='source_db',
+  )
+  def setUp(self):
+    super().setUp()
+    self.instance = GetTestSpannerInstance()
+    self.instance.instance_id = 'target_instance'
+    self.instance.database = 'target_db'
+
+  def testRestoreDatabase(self):
+    self.enter_context(
+        mock.patch.object(
+            self.instance,
+            '_GetLatestBackup',
+            return_value='backup_123',
+            autospec=True,
+        )
+    )
+    mock_cmd = mock.Mock()
+    mock_cmd.flags = {}
+    mock_cmd.Issue.side_effect = [
+        ('', 'Restore database in progress. Operation name=operation_123', 0),
+        (json.dumps({'done': True}), '', 0),
+        (json.dumps({'state': 'READY', 'nodeCount': 1}), '', 0),
+        (json.dumps({'state': 'READY'}), '', 0),
+    ]
+    mock_gcloud = self.enter_context(
+        mock.patch.object(
+            util, 'GcloudCommand', return_value=mock_cmd, autospec=True
+        )
+    )
+    self.enter_context(mock.patch.object(time, 'sleep', autospec=True))
+    self.enter_context(
+        mock.patch.object(
+            time, 'time', side_effect=range(0, 1000, 30), autospec=True
+        )
+    )
+
+    self.instance.RestoreDatabase('target_db')
+
+    with self.subTest('TestInstanceRestored'):
+      self.assertTrue(self.instance.spanner_restored)
+
+    with self.subTest('TestRestoreCommand'):
+      mock_gcloud.assert_any_call(
+          self.instance, 'spanner', 'databases', 'restore'
+      )
+      self.assertTrue(mock_cmd.flags['async'])
+
+    with self.subTest('TestDescribeOperationCommand'):
+      mock_gcloud.assert_any_call(
+          self.instance, 'spanner', 'operations', 'describe', 'operation_123'
+      )
+
+  def testGetLatestBackup(self):
+    mock_backups_list = [
+        {
+            'name': 'projects/p/instances/i/backups/backup_2023_10_26',
+            'create_time': '2023-10-26T10:00:00Z',
+        },
+    ]
+    mock_cmd = mock.Mock()
+    mock_cmd.flags = {}
+    mock_cmd.Issue.return_value = (json.dumps(mock_backups_list), '', 0)
+    mock_gcloud = self.enter_context(
+        mock.patch.object(
+            util, 'GcloudCommand', return_value=mock_cmd, autospec=True
+        )
+    )
+
+    backup_id = self.instance._GetLatestBackup()
+
+    self.assertEqual(backup_id, 'backup_2023_10_26')
+    mock_gcloud.assert_called_with(self.instance, 'spanner', 'backups', 'list')
+    self.assertEqual(mock_cmd.flags['instance'], 'source_instance')
+    self.assertIn('database:source_db', mock_cmd.flags['filter'])
+
+
+class FlagValidationTest(pkb_common_test_case.PkbCommonTestCase):
+
+  @flagsaver.flagsaver(run_uri='test_uri')
+  def setUp(self):
+    super().setUp()
+
+  def testInvalidFlagCombination_OnlyInstance(self):
+    with self.assertRaises(flags.IllegalFlagValueError):
+      with flagsaver.flagsaver(
+          cloud_spanner_source_instance_id='source_instance',
+          cloud_spanner_source_database_id=None,
+      ):
+        GetTestSpannerInstance()
+
+  def testInvalidFlagCombination_OnlyDatabase(self):
+    with self.assertRaises(flags.IllegalFlagValueError):
+      with flagsaver.flagsaver(
+          cloud_spanner_source_instance_id=None,
+          cloud_spanner_source_database_id='source_db',
+      ):
+        GetTestSpannerInstance()
+
+  @flagsaver.flagsaver(
+      cloud_spanner_source_instance_id='source_instance',
+      cloud_spanner_source_database_id='source_db',
+  )
+  def testValidFlagCombination_Both(self):
+    instance = GetTestSpannerInstance()
+    self.assertEqual(instance.source_instance_id, 'source_instance')
+    self.assertEqual(instance.source_database_id, 'source_db')
+
+  @flagsaver.flagsaver(
+      cloud_spanner_source_instance_id=None,
+      cloud_spanner_source_database_id=None,
+  )
+  def testValidFlagCombination_None(self):
+    instance = GetTestSpannerInstance()
+    self.assertIsNone(instance.source_instance_id)
+    self.assertIsNone(instance.source_database_id)
 
 
 if __name__ == '__main__':

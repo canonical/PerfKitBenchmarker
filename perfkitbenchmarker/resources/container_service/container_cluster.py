@@ -5,13 +5,13 @@ import itertools
 from typing import Callable, Iterable
 
 from absl import flags
+from perfkitbenchmarker import errors
 from perfkitbenchmarker import resource
 from perfkitbenchmarker import sample
 from perfkitbenchmarker import virtual_machine_spec
 from perfkitbenchmarker.configs import container_spec as container_spec_lib
 from perfkitbenchmarker.resources.container_service import container
 from perfkitbenchmarker.resources.container_service import container_registry
-
 
 DEFAULT_NODEPOOL = container_spec_lib.DEFAULT_NODEPOOL
 
@@ -28,9 +28,16 @@ class BaseContainerCluster(resource.BaseResource):
 
   def __init__(self, cluster_spec: container_spec_lib.ContainerClusterSpec):
     super().__init__(user_managed=bool(cluster_spec.static_cluster))
-    self.name: str = (
-        cluster_spec.static_cluster or 'pkb-' + FLAGS.run_uri
-    )
+    self.name: str = cluster_spec.static_cluster or 'pkb-' + FLAGS.run_uri
+    self.machine_families: list[str] = cluster_spec.machine_families or []
+    # Set min_nodes via ifs to allow setting it to 0.
+    if cluster_spec.min_vm_count is None:
+      self.min_nodes: int = cluster_spec.vm_count
+    else:
+      self.min_nodes: int = cluster_spec.min_vm_count
+    self.max_nodes: int = cluster_spec.max_vm_count or cluster_spec.vm_count
+    self.gpu_type: str | None = None
+    self.gpu_count: int | None = None
     self.default_nodepool = self._InitializeDefaultNodePool(
         cluster_spec, cluster_spec.vm_spec
     )
@@ -40,12 +47,6 @@ class BaseContainerCluster(resource.BaseResource):
           name, nodepool_spec, nodepool_spec.vm_spec
       )
       self.nodepools[nodepool.name] = nodepool
-    self.min_nodes: int = (
-        cluster_spec.min_vm_count or self.default_nodepool.num_nodes
-    )
-    self.max_nodes: int = (
-        cluster_spec.max_vm_count or self.default_nodepool.num_nodes
-    )
     self.containers: dict[str, list[container.BaseContainer]] = (
         collections.defaultdict(list)
     )
@@ -55,14 +56,28 @@ class BaseContainerCluster(resource.BaseResource):
         None
     )
     self.enable_vpa: bool = cluster_spec.enable_vpa
+    self.enable_aam: bool = cluster_spec.enable_aam
 
   @property
   def num_nodes(self) -> int:
     return self.default_nodepool.num_nodes
 
   @property
+  def max_total_nodes(self) -> int:
+    """Returns the maximum possible number of nodes in the cluster."""
+    total = self.max_nodes
+    for nodepool in self.nodepools.values():
+      total += nodepool.max_nodes
+    return total
+
+  @property
   def zone(self) -> str:
     return self.default_nodepool.zone
+
+  @property
+  def num_nodepools(self) -> int:
+    """Returns number of nodepools, with +1 from the default nodepool."""
+    return len(self.nodepools) + 1
 
   def SetContainerRegistry(self, registry):
     """Sets the container registry for the cluster."""
@@ -76,8 +91,11 @@ class BaseContainerCluster(resource.BaseResource):
     nodepool_config = container.BaseNodePoolConfig(
         vm_config,
         DEFAULT_NODEPOOL,
+        self.machine_families,
     )
     nodepool_config.num_nodes = cluster_spec.vm_count
+    nodepool_config.min_nodes = self.min_nodes
+    nodepool_config.max_nodes = self.max_nodes
     self.InitializeNodePoolForCloud(vm_config, nodepool_config)
     return nodepool_config
 
@@ -95,10 +113,18 @@ class BaseContainerCluster(resource.BaseResource):
     nodepool_config = container.BaseNodePoolConfig(
         vm_config,
         name,
+        nodepool_spec.machine_families,
     )
     nodepool_config.sandbox_config = nodepool_spec.sandbox_config
     nodepool_config.zone = zone
     nodepool_config.num_nodes = nodepool_spec.vm_count
+    if nodepool_spec.min_vm_count is None:
+      nodepool_config.min_nodes = nodepool_spec.vm_count
+    else:
+      nodepool_config.min_nodes = nodepool_spec.min_vm_count
+    nodepool_config.max_nodes = (
+        nodepool_spec.max_vm_count or nodepool_spec.vm_count
+    )
     self.InitializeNodePoolForCloud(vm_config, nodepool_config)
     return nodepool_config
 
@@ -108,7 +134,30 @@ class BaseContainerCluster(resource.BaseResource):
       nodepool_config: container.BaseNodePoolConfig,
   ):
     """Override to initialize cloud specific configs."""
-    pass
+    del vm_config
+    if nodepool_config.gpu_count and nodepool_config.gpu_type:
+      if self.gpu_type and self.gpu_type != nodepool_config.gpu_type:
+        raise errors.Config.InvalidValue(
+            f'Attempted to set gpu type to {nodepool_config.gpu_type}, but it'
+            f' was already set to {self.gpu_type}. Multiple nodepools with'
+            ' different GPU types are not currently supported.'
+        )
+      if self.gpu_count and self.gpu_count != nodepool_config.gpu_count:
+        raise errors.Config.InvalidValue(
+            f'Attempted to set gpu count to {nodepool_config.gpu_count}, but it'
+            f' was already set to {self.gpu_count}. Multiple nodepools with'
+            ' different GPU counts are not currently supported.'
+        )
+      self.gpu_type = nodepool_config.gpu_type
+      self.gpu_count = nodepool_config.gpu_count
+    if nodepool_config.max_nodes == 0:
+      raise errors.Config.InvalidValue('max_nodes must be greater than 0.')
+    if nodepool_config.min_nodes != nodepool_config.max_nodes:
+      # If min_nodes/max_nodes are set, clamp num_nodes to be within the range.
+      nodepool_config.num_nodes = min(
+          nodepool_config.max_nodes,
+          max(nodepool_config.min_nodes, nodepool_config.num_nodes),
+      )
 
   def GetNodePoolFromNodeName(
       self, node_name: str
@@ -167,10 +216,20 @@ class BaseContainerCluster(resource.BaseResource):
           'machine_type': nodepool.machine_type,
           'name': name,
       }
+      if nodepool.gpu_type and nodepool.gpu_count:
+        nodepool_metadata.update({
+            'gpu_type': nodepool.gpu_type,
+            'gpu_count': nodepool.gpu_count,
+        })
       if nodepool.sandbox_config is not None:
         nodepool_metadata['sandbox_config'] = {
             'type': nodepool.sandbox_config.type,
         }
+      if nodepool.min_nodes != nodepool.max_nodes:
+        nodepool_metadata.update({
+            'max_size': nodepool.max_nodes,
+            'min_size': nodepool.min_nodes,
+        })
       nodepools_metadata[name] = nodepool_metadata
 
     metadata = {
@@ -180,12 +239,16 @@ class BaseContainerCluster(resource.BaseResource):
         'size': self.default_nodepool.num_nodes,
         'machine_type': self.default_nodepool.machine_type,
         'nodepools': nodepools_metadata,
+        'num_nodepools': self.num_nodepools,
     }
 
-    if (
-        self.min_nodes != self.default_nodepool.num_nodes
-        or self.max_nodes != self.default_nodepool.num_nodes
-    ):
+    if self.gpu_type and self.gpu_count:
+      metadata.update({
+          'gpu_type': self.gpu_type,
+          'gpu_count': self.gpu_count,
+      })
+
+    if self.min_nodes != self.max_nodes:
       metadata.update({
           'max_size': self.max_nodes,
           'min_size': self.min_nodes,
@@ -259,6 +322,10 @@ class BaseContainerCluster(resource.BaseResource):
   def GetNodePoolNames(self) -> list[str]:
     """Get node pool names for the cluster."""
     raise NotImplementedError
+
+  def ApplyFusePVC(self, pvc_name: str) -> None:
+    """Apply a cloud-specific fuse (e.g. blobfuse, gcsfuse) PV & PVC."""
+    pass
 
 
 def GetContainerClusterClass(

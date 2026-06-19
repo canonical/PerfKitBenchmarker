@@ -219,7 +219,7 @@ MEMTIER_DISTRIBUTION_BINARY_SEARCH = flags.DEFINE_bool(
     (
         'If true, uses a binary search to measure the optimal client and thread'
         ' count needed for max throughput under latency cap. Else, uses'
-        ' --memtier_clients, --memtier_threads, and --memtier_pipelines for the'
+        ' --memtier_clients, --memtier_threads, and --memtier_pipeline for the'
         ' iterations.'
     ),
 )
@@ -393,7 +393,7 @@ def BuildMemtierCommand(
     json_out_file: pathlib.PosixPath | None = None,
     command: str | None = None,
     key_prefix: str | None = None,
-) -> str:
+) -> list[str]:
   """Returns command arguments used to run memtier."""
   # Arguments passed with a parameter
   args = {
@@ -451,7 +451,7 @@ def BuildMemtierCommand(
   for no_param_arg, value in no_param_args.items():
     if value:
       cmd.append(f'--{no_param_arg}')
-  return ' '.join(cmd)
+  return cmd
 
 
 @dataclasses.dataclass(frozen=True)
@@ -485,12 +485,12 @@ def _LoadSingleVM(
       tls=MEMTIER_TLS.value,
       expiry_range=MEMTIER_EXPIRY_RANGE.value,
   )
-  load_vm.RemoteCommand(cmd)
+  _IssueRetryableCommand(load_vm, ' '.join(cmd))
 
 
 def Load(
     vms: list[virtual_machine.VirtualMachine],
-    server_ip: str,
+    server_ips: list[str],
     server_port: int,
     server_password: str | None = None,
 ) -> None:
@@ -509,7 +509,7 @@ def Load(
             key_minimum=max(i * load_records_per_vm, 1),
             key_maximum=(i + 1) * load_records_per_vm,
             server_port=server_port,
-            server_ip=server_ip,
+            server_ip=server_ips[i % len(server_ips)],
             server_password=server_password,
         ),
     ))
@@ -521,7 +521,7 @@ def Load(
 
 def RunOverAllClientVMs(
     client_vms,
-    server_ip: str,
+    server_ips: list[str],
     ports: List[int],
     pipeline,
     threads,
@@ -534,7 +534,7 @@ def RunOverAllClientVMs(
 
   Args:
     client_vms: A list of client vms.
-    server_ip: Ip address of the server.
+    server_ips: List of IP addresses of the server.
     ports: List of ports to run against the server.
     pipeline: Number of pipeline to use in memtier.
     threads: Number of threads to use in memtier.
@@ -556,13 +556,14 @@ def RunOverAllClientVMs(
     vm = client_vms[client_index]
     return _Run(
         vm=vm,
-        server_ip=server_ip,
+        server_ip=server_ips[client_index % len(server_ips)],
         server_port=port,
         threads=threads,
         pipeline=pipeline,
         clients=clients,
         password=password,
         unique_id=str(port_index),
+        retry_on_failure=len(client_vms) <= 1,
     )
 
   results = background_tasks.RunThreaded(
@@ -574,7 +575,7 @@ def RunOverAllClientVMs(
 
 def RunOverAllThreadsPipelinesAndClients(
     client_vms,
-    server_ip: str,
+    server_ips: list[str],
     server_ports: List[int],
     password: str | None = None,
 ) -> List[sample.Sample]:
@@ -585,7 +586,7 @@ def RunOverAllThreadsPipelinesAndClients(
       for clients in FLAGS.memtier_clients:
         results = RunOverAllClientVMs(
             client_vms=client_vms,
-            server_ip=server_ip,
+            server_ips=server_ips,
             ports=server_ports,
             threads=threads,
             pipeline=pipeline,
@@ -645,6 +646,8 @@ def _RunParallelConnections(
   connections_by_vm = collections.defaultdict(list)
   for conn in connections:
     connections_by_vm[conn.client_vm].append(conn)
+
+  base_args['retry_on_failure'] = len(connections_by_vm) <= 1
 
   # Currently more than one client VM will cause shards to be distributed
   # evenly between them. This behavior could be customized later with a flag.
@@ -1151,6 +1154,7 @@ def _Run(
     password: str | None = None,
     unique_id: str | None = None,
     shard_addresses: str | None = None,
+    retry_on_failure: bool = True,
 ) -> 'MemtierResult':
   """Runs the memtier benchmark on the vm."""
   logging.info(
@@ -1220,10 +1224,14 @@ def _Run(
       command=MEMTIER_COMMAND.value,
       key_prefix=MEMTIER_KEY_PREFIX.value,
   )
+  cmd = ' '.join(cmd)
   logging.info('Memtier command: %s', cmd)
   # Add a buffer to the timeout to account for command overhead.
   timeout = test_time + 100 if test_time else None
-  _IssueRetryableCommand(vm, cmd, timeout=timeout)
+  if retry_on_failure:
+    _IssueRetryableCommand(vm, cmd, timeout=timeout)
+  else:
+    vm.RobustRemoteCommand(cmd, timeout=timeout)
 
   output_path = os.path.join(vm_util.GetTempDir(), memtier_results_file_name)
   vm_util.IssueCommand(['rm', '-f', output_path])
@@ -1293,6 +1301,15 @@ def GetMetadata(clients: int, threads: int, pipeline: int) -> Dict[str, Any]:
   if MEMTIER_LOAD_KEY_MAXIMUM.value:
     meta['memtier_load_key_maximum'] = MEMTIER_LOAD_KEY_MAXIMUM.value
   return meta
+
+
+def GetMetadataFromFlags() -> Dict[str, Any]:
+  """Metadata for memtier test."""
+  return GetMetadata(
+      clients=FLAGS.memtier_clients,
+      threads=FLAGS.memtier_threads,
+      pipeline=FLAGS.memtier_pipeline,
+  )
 
 
 @dataclasses.dataclass

@@ -1,8 +1,12 @@
 """Methods to run kubectl commands against a cluster."""
 
+import logging
+
 from absl import flags
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import vm_util
+from perfkitbenchmarker.resources.container_service import kubernetes_events
+
 
 RETRYABLE_KUBECTL_ERRORS = [
     (
@@ -18,6 +22,10 @@ RETRYABLE_KUBECTL_ERRORS = [
     'error sending request:',
     '(abnormal closure): unexpected EOF',
     'deadline exceeded',
+    # kubectl wait/delete timeouts and connection errors
+    # (retried in EKS cleanup)
+    'timed out',
+    'unable to connect to the server',
 ]
 
 
@@ -38,8 +46,9 @@ def RunKubectlCommand(command: list[str], **kwargs) -> tuple[str, str, int]:
     # Check for kubectl timeout. If found, treat it the same as a regular
     # timeout.
     if retcode != 0:
+      stderr_lower = stderr.lower()
       for error_substring in RETRYABLE_KUBECTL_ERRORS:
-        if error_substring in stderr:
+        if error_substring.lower() in stderr_lower:
           # Raise timeout error regardless of raise_on_failure - as the intended
           # semantics is to ignore expected errors caused by invoking the
           # command not errors from PKB infrastructure.
@@ -49,6 +58,22 @@ def RunKubectlCommand(command: list[str], **kwargs) -> tuple[str, str, int]:
               else True
           )
           if raise_on_timeout:
+            cmd_str = ' '.join(command)
+            if (
+                kubernetes_events.K8S_EVENT_POLLER
+                and 'get events' not in cmd_str
+            ):  # Avoid infinite loop if get events times out.
+              try:
+                events = (
+                    kubernetes_events.K8S_EVENT_POLLER.GetAndLogFailureEvents()
+                )
+                kubernetes_events.K8S_EVENT_POLLER.CheckForQuotaFailure(events)
+              except vm_util.RetryError:
+                logging.warning(
+                    'Failed to get events from K8s event poller. Proceeding'
+                    ' with original timeout error.'
+                )
+                pass
             raise errors.VmUtil.IssueCommandTimeoutError(stderr)
     # Else, revert to user supplied kwargs values.
     if orig_suppress_failure is not None:

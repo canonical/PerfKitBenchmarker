@@ -118,12 +118,6 @@ class ContainerRegistrySpec(spec.BaseSpec):
     self.project: str | None = registry_spec.get('project')
     self.zone: str | None = registry_spec.get('zone')
     self.name: str | None = registry_spec.get('name')
-    self.cpus: float
-    self.memory: int
-    self.command: list[str]
-    self.image: str
-    self.container_port: int
-    self.cloud: str
 
   @classmethod
   def _ApplyFlags(
@@ -227,9 +221,13 @@ class ContainerSpecsDecoder(option_decoders.TypeVerifier):
 
 
 class NodepoolSpec(spec.BaseSpec):
-  """Configurable options of a Nodepool."""
+  """Configurable options of a Nodepool.
 
-  vm_spec: spec.PerCloudConfigSpec
+  Attributes:
+    vm_spec: The vm spec which defines the nodepool.
+  """
+
+  vm_spec: virtual_machine_spec.BaseVmSpec
 
   def __init__(
       self, component_full_name, group_name, flag_values=None, **kwargs
@@ -240,7 +238,10 @@ class NodepoolSpec(spec.BaseSpec):
         **kwargs,
     )
     self.vm_count: int
-    self.vm_spec: spec.PerCloudConfigSpec
+    self.min_vm_count: int | None
+    self.max_vm_count: int | None
+    self.vm_spec: virtual_machine_spec.BaseVmSpec
+    self.machine_families: list[str] | None
     self.sandbox_config: SandboxSpec | None
 
   @classmethod
@@ -254,9 +255,21 @@ class NodepoolSpec(spec.BaseSpec):
     """
     result = super()._GetOptionDecoderConstructions()
     result.update({
+        'machine_families': (
+            option_decoders.ListDecoder,
+            {'item_decoder': option_decoders.StringDecoder(), 'default': None},
+        ),
         'vm_count': (
             option_decoders.IntDecoder,
             {'default': _DEFAULT_VM_COUNT, 'min': 0},
+        ),
+        'min_vm_count': (
+            option_decoders.IntDecoder,
+            {'default': None, 'none_ok': True, 'min': 0},
+        ),
+        'max_vm_count': (
+            option_decoders.IntDecoder,
+            {'default': None, 'none_ok': True, 'min': 0},
         ),
         'vm_spec': (spec.PerCloudConfigDecoder, {}),
         'sandbox_config': (_SandboxDecoder, {'default': None}),
@@ -278,6 +291,8 @@ class NodepoolSpec(spec.BaseSpec):
     super()._ApplyFlags(config_values, flag_values)
     if flag_values['container_cluster_num_vms'].present:
       config_values['vm_count'] = flag_values.container_cluster_num_vms
+    if flag_values['k8s_machine_families'].present:
+      config_values['machine_families'] = flag_values.k8s_machine_families
 
     # Need to apply the first zone in the zones flag, if specified,
     # to the spec. _NodepoolSpec does not currently support
@@ -379,14 +394,39 @@ class _SandboxDecoder(option_decoders.TypeVerifier):
 
 
 class ContainerClusterSpec(spec.BaseSpec):
-  """Spec containing info needed to create a container cluster."""
+  """Spec containing info needed to create a container cluster.
+
+  Attributes:
+    cloud: The cloud to create the container cluster in.
+    enable_vpa: Whether to enable vertical pod autoscaler.
+    nodepools: A dictionary of nodepool names to nodepool/vm_specs.
+    inference_server: If specified, spins up an AI/inference server.
+    poll_for_events: Whether to background poll for k8s events.
+    static_cluster: The name of the static cluster to use for the container
+      cluster.
+    type: Mostly Standard or Auto.
+    vm_spec: The vm spec to use for the default nodepool.
+    vm_count: The number of nodes to create for the default nodepool.
+    min_vm_count: The minimum number of nodes for autoscaling.
+    max_vm_count: The maximum number of nodes for autoscaling.
+    enable_aam: Whether to enable automatic application monitoring.
+  """
 
   cloud: str
-  vm_spec: spec.PerCloudConfigSpec
+  enable_vpa: bool
   nodepools: dict[str, NodepoolSpec]
   inference_server: (
       kubernetes_inference_server_spec.BaseInferenceServerConfigSpec | None
   )
+  poll_for_events: bool
+  static_cluster: str | None
+  type: str
+  vm_spec: virtual_machine_spec.BaseVmSpec
+  machine_families: list[str] | None
+  vm_count: int
+  min_vm_count: int | None
+  max_vm_count: int | None
+  enable_aam: bool
 
   def __init__(self, component_full_name, flag_values=None, **kwargs):
     super().__init__(component_full_name, flag_values=flag_values, **kwargs)
@@ -476,6 +516,11 @@ class ContainerClusterSpec(spec.BaseSpec):
         ),
         # vm_spec is used to define the machine type for the default nodepool
         'vm_spec': (spec.PerCloudConfigDecoder, {}),
+        # Also used for the default nodepool.
+        'machine_families': (
+            option_decoders.ListDecoder,
+            {'item_decoder': option_decoders.StringDecoder(), 'default': None},
+        ),
         # nodepools specifies a list of additional nodepools to create alongside
         # the default nodepool (nodepool created on cluster creation).
         'nodepools': (_NodepoolsDecoder, {'default': {}, 'none_ok': True}),
@@ -484,6 +529,10 @@ class ContainerClusterSpec(spec.BaseSpec):
             {'default': None, 'none_ok': True},
         ),
         'enable_vpa': (
+            option_decoders.BooleanDecoder,
+            {'default': False},
+        ),
+        'enable_aam': (
             option_decoders.BooleanDecoder,
             {'default': False},
         ),
@@ -499,6 +548,8 @@ class ContainerClusterSpec(spec.BaseSpec):
       config_values['type'] = flag_values.container_cluster_type
     if flag_values['container_cluster_num_vms'].present:
       config_values['vm_count'] = flag_values.container_cluster_num_vms
+    if flag_values['k8s_machine_families'].present:
+      config_values['machine_families'] = flag_values.k8s_machine_families
 
     # Need to apply the first zone in the zones flag, if specified,
     # to the spec. ContainerClusters do not currently support
