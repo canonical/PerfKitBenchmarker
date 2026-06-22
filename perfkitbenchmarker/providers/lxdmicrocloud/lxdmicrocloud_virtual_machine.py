@@ -19,17 +19,18 @@ MicroCloud cluster (see `microcloud init` / `microcloud join`). It supports
 both system containers (`--lxd_instance_type=container`, the default) and full
 virtual machines (`--lxd_instance_type=virtual-machine`).
 
+Commands and file transfers are driven through the LXD API via `lxc exec`
+and `lxc file` (not SSH), so the PKB host does not need IP reachability to the
+OVN-managed instances -- only a working `lxc` client pointed at the cluster.
+
 Preconditions on the PKB host:
   * The `lxc` binary is on $PATH (or pointed at via --lxd_cli_path).
-  * `lxc cluster list` succeeds, i.e. the user has bootstrapped MicroCloud.
-  * The PKB host can route to the OVN-managed instance IPs (typically true
-    when PKB runs on a MicroCloud cluster member).
+  * `lxc cluster list` succeeds, i.e. the user has bootstrapped MicroCloud and
+    the default `lxc` remote targets the cluster.
 """
 
 import logging
 import os
-import subprocess
-import tempfile
 import time
 from typing import Any
 
@@ -51,7 +52,6 @@ from perfkitbenchmarker.providers.lxdmicrocloud import (
 
 FLAGS = flags.FLAGS
 
-_CONTAINER = 'container'
 _VIRTUAL_MACHINE = 'virtual-machine'
 
 
@@ -71,119 +71,41 @@ class LxdMicrocloudVirtualMachine(virtual_machine.BaseVirtualMachine):
     self.storage_pool = lxd_flags.LXD_STORAGE_POOL.value
     self.network_name = lxd_flags.LXD_NETWORK.value
     self.target_member = lxd_flags.LXD_TARGET_MEMBER.value or self.zone
-    self._cloud_init_path: str | None = None
 
   def _CreateDependencies(self) -> None:
     self.firewall = lxdmicrocloud_network.LxdMicrocloudFirewall.GetFirewall()
-    self._cloud_init_path = self._WriteCloudInitFile()
-
-  def _DeleteDependencies(self) -> None:
-    if self._cloud_init_path and os.path.exists(self._cloud_init_path):
-      try:
-        os.unlink(self._cloud_init_path)
-      except OSError as e:
-        logging.warning(
-            'Failed to remove cloud-init file %s: %s',
-            self._cloud_init_path,
-            e,
-        )
-      self._cloud_init_path = None
 
   def _Create(self) -> None:
-    image_ref = self._ResolveImageRef()
-    cmd = [lxd_flags.LXD_CLI_PATH.value, 'launch', image_ref, self.name]
+    cmd = lxd_util.LxcCommand('launch', self._ResolveImageRef(), self.name)
     if self.instance_type == _VIRTUAL_MACHINE:
-      cmd.append('--vm')
-    if lxd_flags.LXD_PROJECT.value:
-      cmd.extend(['--project', lxd_flags.LXD_PROJECT.value])
+      cmd.flags['vm'] = True
     if self.storage_pool:
-      cmd.extend(['-s', self.storage_pool])
+      cmd.flags['s'] = self.storage_pool
     if self.network_name:
-      cmd.extend(['-n', self.network_name])
+      cmd.flags['n'] = self.network_name
     if self.target_member:
-      cmd.extend(['--target', self.target_member])
+      cmd.flags['target'] = self.target_member
 
+    config: list[str] = []
     cpu_count = self._GetRequestedCpuCount()
     if cpu_count:
-      cmd.extend(['-c', f'limits.cpu={cpu_count}'])
+      config.append(f'limits.cpu={cpu_count}')
     memory_gib = self._GetRequestedMemoryGiB()
     if memory_gib:
-      cmd.extend(['-c', f'limits.memory={memory_gib}GiB'])
-
-    for extra in lxd_flags.LXD_EXTRA_CONFIG.value:
-      cmd.extend(['-c', extra])
+      config.append(f'limits.memory={memory_gib}GiB')
+    config.extend(lxd_flags.LXD_EXTRA_CONFIG.value)
+    if config:
+      cmd.flags['c'] = config
 
     if self.boot_disk_size:
-      cmd.extend(['-d', f'root,size={self.boot_disk_size}GiB'])
+      cmd.flags['d'] = f'root,size={self.boot_disk_size}GiB'
 
-    stdin = self._BuildLaunchStdin()
-    if stdin is not None:
-      cmd.append('--')
-    stdout, stderr, retcode = self._IssueLaunch(cmd, stdin)
+    _, stderr, retcode = cmd.Issue(timeout=lxd_flags.LXD_LAUNCH_TIMEOUT.value)
     if retcode != 0:
       raise errors.Resource.CreationError(
-          f'`lxc launch` failed for {self.name}: {stderr or stdout}'
+          f'`lxc launch` failed for {self.name}: {stderr}'
       )
     self.id = self.name
-
-  def _IssueLaunch(
-      self, cmd: list[str], stdin: str | None
-  ) -> tuple[str, str, int]:
-    """Runs `lxc launch`, piping cloud-init YAML on stdin when present.
-
-    vm_util.IssueCommand has no `input=` parameter, so when stdin is needed
-    (for cloud-init) we shell out via subprocess directly. The no-stdin path
-    still goes through vm_util.IssueCommand for consistent logging.
-    """
-    if stdin is None:
-      return vm_util.IssueCommand(
-          cmd,
-          timeout=lxd_flags.LXD_LAUNCH_TIMEOUT.value,
-          raise_on_failure=False,
-      )
-    logging.info('Running: %s (with stdin cloud-init)', ' '.join(cmd))
-    proc = subprocess.run(
-        cmd,
-        input=stdin,
-        text=True,
-        capture_output=True,
-        timeout=lxd_flags.LXD_LAUNCH_TIMEOUT.value,
-        check=False,
-    )
-    if proc.stdout:
-      logging.info('STDOUT: %s', proc.stdout)
-    if proc.stderr:
-      logging.info('STDERR: %s', proc.stderr)
-    return proc.stdout, proc.stderr, proc.returncode
-
-  def _BuildLaunchStdin(self) -> str | None:
-    """Returns cloud-init YAML to pipe on stdin, or None.
-
-    `lxc launch` reads YAML config from stdin when it is a TTY-less pipe; we
-    embed a small profile-style override that sets cloud-init.user-data so the
-    SSH user is created on first boot.
-    """
-    if not self._cloud_init_path:
-      return None
-    with open(self._cloud_init_path) as f:
-      user_data = f.read()
-    indented = '\n'.join('    ' + line for line in user_data.splitlines())
-    return (
-        'config:\n'
-        '  cloud-init.user-data: |\n'
-        f'{indented}\n'
-    )
-
-  def _WriteCloudInitFile(self) -> str:
-    """Renders the cloud-init #cloud-config to a host-side temp file."""
-    ssh_public_key = lxd_util.ReadSshPublicKey(self.ssh_public_key)
-    user_data = lxd_util.BuildCloudInitUserData(self.user_name, ssh_public_key)
-    fd, path = tempfile.mkstemp(
-        prefix=f'pkb-lxd-{self.name}-', suffix='.cloud-init.yml'
-    )
-    with os.fdopen(fd, 'w') as f:
-      f.write(user_data)
-    return path
 
   def _ResolveImageRef(self) -> str:
     """Returns the fully-qualified `<remote>:<alias>` image reference."""
@@ -252,6 +174,98 @@ class LxdMicrocloudVirtualMachine(virtual_machine.BaseVirtualMachine):
     _, stderr, retcode = cmd.Issue()
     if retcode != 0:
       raise errors.Error(f'Failed to stop LXD instance {self.name}: {stderr}')
+
+  # --- Command/file transport ---------------------------------------------
+  # MicroCloud instances sit on an OVN network whose IPs are not routable from
+  # the PKB host, so SSH is unusable. We drive the instance through the LXD API
+  # via `lxc exec` / `lxc file` instead, mirroring how the Kubernetes provider
+  # uses `kubectl exec`. Commands run as root inside the instance.
+
+  def RemoteHostCommandWithReturnCode(
+      self,
+      command: str,
+      retries: int | None = None,
+      ignore_failure: bool = False,
+      login_shell: bool = False,
+      disable_tty_lock: bool = False,
+      timeout: float | None = None,
+      ip_address: str | None = None,
+      should_pre_log: bool = True,
+      stack_level: int = 1,
+      suppress_logging: bool = False,
+  ) -> tuple[str, str, int]:
+    """Runs a command in the instance via `lxc exec` (no SSH)."""
+    del retries, disable_tty_lock, ip_address  # No SSH connection to retry/aim.
+    stack_level += 1
+    if should_pre_log:
+      logging.info(
+          'Running on %s via lxc exec: %s',
+          self.name,
+          command,
+          stacklevel=stack_level,
+      )
+    stdout, stderr, retcode = lxd_util.ExecInInstance(
+        self.name,
+        command,
+        login_shell=login_shell,
+        timeout=timeout,
+        suppress_logging=suppress_logging,
+    )
+    if retcode and not ignore_failure:
+      raise errors.VirtualMachine.RemoteCommandError(
+          f'Got non-zero return code ({retcode}) executing {command}\n'
+          f'STDOUT: {stdout}STDERR: {stderr}'
+      )
+    return stdout, stderr, retcode
+
+  def RemoteHostCopy(
+      self, file_path: str, remote_path: str = '', copy_to: bool = True
+  ) -> None:
+    """Copies a file to/from the instance via `lxc file push`/`pull`."""
+    if copy_to:
+      dest = remote_path or '/root/'
+      _, stderr, retcode = lxd_util.PushFile(
+          self.name, file_path, dest, recursive=os.path.isdir(file_path)
+      )
+      description = f'push {file_path} -> {self.name}{dest}'
+    else:
+      _, stderr, retcode = lxd_util.PullFile(self.name, remote_path, file_path)
+      description = f'pull {self.name}{remote_path} -> {file_path}'
+    if retcode:
+      raise errors.VirtualMachine.RemoteCommandError(
+          f'`lxc file` {description} failed: {stderr}'
+      )
+
+  def WaitForBootCompletion(self) -> None:
+    """Waits until the instance is ready to accept `lxc exec` commands."""
+    self._WaitForExecReady()
+    if self.bootable_time is None:
+      self.bootable_time = time.time()
+
+  @vm_util.Retry(
+      poll_interval=2,
+      max_retries=-1,
+      timeout=600,
+      log_errors=False,
+      retryable_exceptions=(errors.VirtualMachine.RemoteCommandError,),
+  )
+  def _WaitForExecReady(self) -> None:
+    """Blocks until `lxc exec` works and first-boot config has settled."""
+    stdout, _ = self.RemoteHostCommand('hostname', should_pre_log=False)
+    if self.hostname is None:
+      self.hostname = stdout.strip()
+    # Let cloud-init finish so package installs during Prepare don't race it.
+    self.RemoteHostCommand(
+        'command -v cloud-init >/dev/null 2>&1 && '
+        'cloud-init status --wait >/dev/null 2>&1 || true',
+        should_pre_log=False,
+        ignore_failure=True,
+        timeout=300,
+    )
+
+  def AuthenticateVm(self) -> None:
+    """No-op: the exec transport needs no SSH key sharing between hosts."""
+    self.has_private_key = True
 
   def CreateScratchDisk(self, disk_spec_id, disk_spec) -> None:
     """Creates and attaches scratch volumes for one disk_spec.

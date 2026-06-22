@@ -1,0 +1,12 @@
+# Python package requirements for the LXD MicroCloud provider.
+#
+# This provider drives the `lxc` CLI (LXD client) via subprocess rather than a
+# Python SDK, so it needs no third-party Python packages beyond what PKB core
+# already provides (absl is a core PKB dependency). The list below is therefore
+# intentionally empty.
+#
+# External (non-pip) runtime requirements instead:
+#   * The `lxc` binary on $PATH (or via --lxd_cli_path), e.g. `snap install lxd`.
+#   * A configured/default `lxc` remote pointing at the MicroCloud cluster.
+#   * Network reachability from the PKB host to the LXD API and to the
+#     OVN-assigned instance IPs (for SSH).
