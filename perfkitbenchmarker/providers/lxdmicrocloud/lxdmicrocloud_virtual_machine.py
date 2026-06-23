@@ -73,6 +73,7 @@ class LxdMicrocloudVirtualMachine(virtual_machine.BaseVirtualMachine):
     self.storage_pool = lxd_flags.LXD_STORAGE_POOL.value
     self.network_name = lxd_flags.LXD_NETWORK.value
     self.target_member = lxd_flags.LXD_TARGET_MEMBER.value or self.zone
+    self._guest_proxy_url: str | None = None
 
   def _CreateDependencies(self) -> None:
     self.firewall = lxdmicrocloud_network.LxdMicrocloudFirewall.GetFirewall()
@@ -95,6 +96,7 @@ class LxdMicrocloudVirtualMachine(virtual_machine.BaseVirtualMachine):
     memory_gib = self._GetRequestedMemoryGiB()
     if memory_gib:
       config.append(f'limits.memory={memory_gib}GiB')
+    config.extend(self._DefaultVmConfig())
     config.extend(lxd_flags.LXD_EXTRA_CONFIG.value)
     if config:
       cmd.flags['c'] = config
@@ -108,6 +110,29 @@ class LxdMicrocloudVirtualMachine(virtual_machine.BaseVirtualMachine):
           f'`lxc launch` failed for {self.name}: {stderr}'
       )
     self.id = self.name
+
+  def _DefaultVmConfig(self) -> list[str]:
+    """Returns provider default `-c key=value` config for VM instances.
+
+    MicroCloud's typical scratch-disk pool is the replicated MicroCeph
+    (`remote`) pool, which is a *shared* filesystem. LXD refuses to attach a
+    shared-filesystem custom volume to a VM that has `migration.stateful=true`
+    ('Shared filesystem are incompatible with migration.stateful=true'), so a
+    VM benchmark with a scratch disk (e.g. pgbench) fails at disk-attach time.
+    Default `migration.stateful=false` for VMs so that path works out of the
+    box. This is scoped to VMs (the key is VM-only and would break container
+    launches) and is only a default: it is emitted before --lxd_extra_config,
+    so a user who explicitly sets `migration.stateful` there still wins, and it
+    does not override an operator's deliberate choice for any other instance.
+    """
+    if self.instance_type != _VIRTUAL_MACHINE:
+      return []
+    if any(
+        extra.split('=', 1)[0].strip() == 'migration.stateful'
+        for extra in lxd_flags.LXD_EXTRA_CONFIG.value
+    ):
+      return []
+    return ['migration.stateful=false']
 
   def _ResolveImageRef(self) -> str:
     """Returns the fully-qualified `<remote>:<alias>` image reference."""
@@ -201,7 +226,12 @@ class LxdMicrocloudVirtualMachine(virtual_machine.BaseVirtualMachine):
             f'Failed to set {key} on {self.name}: {stderr}'
         )
 
-    self._WriteAptProxyConfig(guest_proxy_url)
+    # The apt proxy drop-in is written via `lxc exec` (see _WriteAptProxyConfig),
+    # which needs the instance's exec channel to be ready. For VMs that means
+    # the lxd-agent, which is not up yet in _PostCreate, so defer the write to
+    # WaitForBootCompletion. The host-side setup above (proxy device and
+    # environment.* keys) needs no agent and stays here.
+    self._guest_proxy_url = guest_proxy_url
 
   def _WriteAptProxyConfig(self, guest_proxy_url: str) -> None:
     """Writes an apt proxy drop-in so `sudo apt-get` uses the egress proxy.
@@ -332,6 +362,10 @@ class LxdMicrocloudVirtualMachine(virtual_machine.BaseVirtualMachine):
   def WaitForBootCompletion(self) -> None:
     """Waits until the instance is ready to accept `lxc exec` commands."""
     self._WaitForExecReady()
+    if self._guest_proxy_url:
+      # Now that the exec channel (lxd-agent on VMs) is ready, write the apt
+      # proxy drop-in. Host-side proxy setup already happened in _PostCreate.
+      self._WriteAptProxyConfig(self._guest_proxy_url)
     if self.bootable_time is None:
       self.bootable_time = time.time()
 
