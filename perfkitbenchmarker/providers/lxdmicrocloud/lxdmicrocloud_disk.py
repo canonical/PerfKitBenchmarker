@@ -85,7 +85,7 @@ class LxdMicrocloudDisk(disk.BaseDisk):
         'storage', 'volume', 'create', self.storage_pool, self.name
     )
     if self.disk_size:
-      cmd.flags['config'] = f'size={self.disk_size}GiB'
+      cmd.additional_flags = [f'size={self.disk_size}GiB']
     _, stderr, retcode = cmd.Issue()
     if retcode != 0:
       raise errors.Resource.CreationError(

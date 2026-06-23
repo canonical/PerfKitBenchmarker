@@ -31,7 +31,7 @@ Preconditions on the PKB host:
 
 import logging
 import os
-import tempfile
+import shlex
 import time
 from typing import Any
 
@@ -141,33 +141,56 @@ class LxdMicrocloudVirtualMachine(virtual_machine.BaseVirtualMachine):
   def _SetupEgressProxy(self) -> None:
     """Routes instance HTTP(S) egress through the site proxy, if configured.
 
-    MicroCloud OVN instances are isolated and cannot reach the egress proxy
-    directly, but the LXD hosts can. We add an LXD `proxy` device that listens
-    on a loopback port inside the instance and forwards to the proxy from the
-    host side (traffic is then sourced from the host management IP), then point
-    the instance's egress at that loopback listener two ways:
-      * LXD `environment.*` keys, which LXD injects into every `lxc exec` (so
-        bare wget/curl/pip pick up the proxy); and
-      * an apt proxy config file, because PKB installs packages with `sudo
-        apt-get`, and sudo strips the inherited http_proxy environment.
+    Many MicroCloud OVN networks isolate instances from external networks. To
+    give instances HTTP(S) egress we point their http(s)_proxy at the site
+    proxy two ways: LXD `environment.*` keys (injected into every `lxc exec`,
+    so wget/curl/pip pick them up) and an apt proxy drop-in (PKB installs
+    packages with `sudo apt-get`, and sudo strips the inherited environment).
+
+    How the instance reaches the proxy depends on its type:
+      * Containers share the host network namespace, so we add an LXD `proxy`
+        device that listens on a loopback port inside the container and
+        forwards to the proxy from the host side (sourced from the host
+        management IP). The guest proxy URL is that loopback listener.
+      * Virtual machines are fully isolated; the LXD proxy device only supports
+        forwarding into a VM, not out of it. We therefore point the guest at
+        the proxy address directly, which works when the VM has native network
+        egress to the proxy. On fully air-gapped OVN networks a VM cannot reach
+        the proxy without network-level egress (outside this provider's scope).
     """
     if not lxd_flags.LXD_HTTP_PROXY.value:
       return
     host, port = self._ParseProxyHostPort(lxd_flags.LXD_HTTP_PROXY.value)
-    guest_proxy_url = f'http://127.0.0.1:{port}'
 
-    device = lxd_util.LxcCommand(
-        'config', 'device', 'add', self.name, _EGRESS_PROXY_DEVICE, 'proxy'
-    )
-    device.additional_flags = [
-        f'listen=tcp:127.0.0.1:{port}',
-        f'connect=tcp:{host}:{port}',
-        'bind=instance',
-    ]
-    _, stderr, retcode = device.Issue()
-    if retcode != 0:
-      raise errors.Resource.CreationError(
-          f'Failed to add egress proxy device to {self.name}: {stderr}'
+    if self.instance_type == _VIRTUAL_MACHINE:
+      guest_proxy_url = f'http://{host}:{port}'
+      logging.info(
+          'Instance %s (VM) egress proxy set to %s (direct; requires native '
+          'VM network egress to the proxy)',
+          self.name,
+          guest_proxy_url,
+      )
+    else:
+      guest_proxy_url = f'http://127.0.0.1:{port}'
+      device = lxd_util.LxcCommand(
+          'config', 'device', 'add', self.name, _EGRESS_PROXY_DEVICE, 'proxy'
+      )
+      device.additional_flags = [
+          f'listen=tcp:127.0.0.1:{port}',
+          f'connect=tcp:{host}:{port}',
+          'bind=instance',
+      ]
+      _, stderr, retcode = device.Issue()
+      if retcode != 0:
+        raise errors.Resource.CreationError(
+            f'Failed to add egress proxy device to {self.name}: {stderr}'
+        )
+      logging.info(
+          'Instance %s (container) egress proxied via %s -> %s:%s',
+          self.name,
+          guest_proxy_url,
+          host,
+          port,
       )
 
     for key in ('environment.http_proxy', 'environment.https_proxy'):
@@ -179,34 +202,22 @@ class LxdMicrocloudVirtualMachine(virtual_machine.BaseVirtualMachine):
         )
 
     self._WriteAptProxyConfig(guest_proxy_url)
-    logging.info(
-        'Instance %s egress proxied via %s -> %s:%s',
-        self.name,
-        guest_proxy_url,
-        host,
-        port,
-    )
 
   def _WriteAptProxyConfig(self, guest_proxy_url: str) -> None:
-    """Writes an apt proxy drop-in so `sudo apt-get` uses the egress proxy."""
+    """Writes an apt proxy drop-in so `sudo apt-get` uses the egress proxy.
+
+    Written via RemoteCommand (the provider's `lxc exec` transport) rather than
+    a raw file copy, matching how the Docker/Kubernetes providers configure
+    proxies, and because `sudo apt-get` ignores the inherited http_proxy env.
+    """
     apt_conf = (
         f'Acquire::http::Proxy "{guest_proxy_url}";\n'
         f'Acquire::https::Proxy "{guest_proxy_url}";\n'
     )
-    fd, host_path = tempfile.mkstemp(prefix=f'pkb-aptproxy-{self.name}-')
-    try:
-      with os.fdopen(fd, 'w') as f:
-        f.write(apt_conf)
-      _, stderr, retcode = lxd_util.PushFile(
-          self.name, host_path, '/etc/apt/apt.conf.d/00pkb-proxy'
-      )
-      if retcode != 0:
-        raise errors.Resource.CreationError(
-            f'Failed to write apt proxy config on {self.name}: {stderr}'
-        )
-    finally:
-      if os.path.exists(host_path):
-        os.unlink(host_path)
+    self.RemoteCommand(
+        f'printf %s {shlex.quote(apt_conf)} | '
+        'sudo tee /etc/apt/apt.conf.d/00pkb-proxy > /dev/null'
+    )
 
   @staticmethod
   def _ParseProxyHostPort(proxy: str) -> tuple[str, int]:
