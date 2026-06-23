@@ -106,3 +106,19 @@ LXD_WAIT_FOR_IP_TIMEOUT = flags.DEFINE_integer(
     300,
     'Timeout (seconds) to wait for the instance to acquire an IPv4 address.',
 )
+
+LXD_HTTP_PROXY = flags.DEFINE_string(
+    'lxd_http_proxy',
+    None,
+    'If set, give each instance HTTP(S) egress through this proxy. MicroCloud '
+    'OVN instances are typically isolated and cannot reach external networks '
+    'directly, while the LXD hosts can reach the site egress proxy. The '
+    'provider adds an LXD `proxy` device that listens on a loopback port '
+    'inside the instance and forwards to this address from the host side (so '
+    'traffic is sourced from the host management IP), then points the '
+    "instance's http(s)_proxy at that loopback listener. Provide the proxy "
+    'address reachable from the LXD host as `host:port`, e.g. '
+    '`10.151.41.7:3128`; an `http://` prefix is accepted and ignored. An IP '
+    'is recommended because the LXD proxy device does not resolve hostnames.',
+)
+

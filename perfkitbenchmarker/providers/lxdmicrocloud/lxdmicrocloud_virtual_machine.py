@@ -31,6 +31,7 @@ Preconditions on the PKB host:
 
 import logging
 import os
+import tempfile
 import time
 from typing import Any
 
@@ -53,6 +54,7 @@ from perfkitbenchmarker.providers.lxdmicrocloud import (
 FLAGS = flags.FLAGS
 
 _VIRTUAL_MACHINE = 'virtual-machine'
+_EGRESS_PROXY_DEVICE = 'pkb-egress-proxy'
 
 
 class LxdMicrocloudVirtualMachine(virtual_machine.BaseVirtualMachine):
@@ -134,6 +136,86 @@ class LxdMicrocloudVirtualMachine(virtual_machine.BaseVirtualMachine):
   @vm_util.Retry(max_retries=4, poll_interval=5)
   def _PostCreate(self) -> None:
     self._WaitForIp()
+    self._SetupEgressProxy()
+
+  def _SetupEgressProxy(self) -> None:
+    """Routes instance HTTP(S) egress through the site proxy, if configured.
+
+    MicroCloud OVN instances are isolated and cannot reach the egress proxy
+    directly, but the LXD hosts can. We add an LXD `proxy` device that listens
+    on a loopback port inside the instance and forwards to the proxy from the
+    host side (traffic is then sourced from the host management IP), then point
+    the instance's egress at that loopback listener two ways:
+      * LXD `environment.*` keys, which LXD injects into every `lxc exec` (so
+        bare wget/curl/pip pick up the proxy); and
+      * an apt proxy config file, because PKB installs packages with `sudo
+        apt-get`, and sudo strips the inherited http_proxy environment.
+    """
+    if not lxd_flags.LXD_HTTP_PROXY.value:
+      return
+    host, port = self._ParseProxyHostPort(lxd_flags.LXD_HTTP_PROXY.value)
+    guest_proxy_url = f'http://127.0.0.1:{port}'
+
+    device = lxd_util.LxcCommand(
+        'config', 'device', 'add', self.name, _EGRESS_PROXY_DEVICE, 'proxy'
+    )
+    device.additional_flags = [
+        f'listen=tcp:127.0.0.1:{port}',
+        f'connect=tcp:{host}:{port}',
+        'bind=instance',
+    ]
+    _, stderr, retcode = device.Issue()
+    if retcode != 0:
+      raise errors.Resource.CreationError(
+          f'Failed to add egress proxy device to {self.name}: {stderr}'
+      )
+
+    for key in ('environment.http_proxy', 'environment.https_proxy'):
+      cmd = lxd_util.LxcCommand('config', 'set', self.name, key, guest_proxy_url)
+      _, stderr, retcode = cmd.Issue()
+      if retcode != 0:
+        raise errors.Resource.CreationError(
+            f'Failed to set {key} on {self.name}: {stderr}'
+        )
+
+    self._WriteAptProxyConfig(guest_proxy_url)
+    logging.info(
+        'Instance %s egress proxied via %s -> %s:%s',
+        self.name,
+        guest_proxy_url,
+        host,
+        port,
+    )
+
+  def _WriteAptProxyConfig(self, guest_proxy_url: str) -> None:
+    """Writes an apt proxy drop-in so `sudo apt-get` uses the egress proxy."""
+    apt_conf = (
+        f'Acquire::http::Proxy "{guest_proxy_url}";\n'
+        f'Acquire::https::Proxy "{guest_proxy_url}";\n'
+    )
+    fd, host_path = tempfile.mkstemp(prefix=f'pkb-aptproxy-{self.name}-')
+    try:
+      with os.fdopen(fd, 'w') as f:
+        f.write(apt_conf)
+      _, stderr, retcode = lxd_util.PushFile(
+          self.name, host_path, '/etc/apt/apt.conf.d/00pkb-proxy'
+      )
+      if retcode != 0:
+        raise errors.Resource.CreationError(
+            f'Failed to write apt proxy config on {self.name}: {stderr}'
+        )
+    finally:
+      if os.path.exists(host_path):
+        os.unlink(host_path)
+
+  @staticmethod
+  def _ParseProxyHostPort(proxy: str) -> tuple[str, int]:
+    """Parses `[scheme://]host:port` into (host, port); port defaults to 3128."""
+    value = proxy.split('://', 1)[-1].strip('/')
+    if ':' in value:
+      host, port_str = value.rsplit(':', 1)
+      return host, int(port_str)
+    return value, 3128
 
   def _WaitForIp(self) -> None:
     timeout = lxd_flags.LXD_WAIT_FOR_IP_TIMEOUT.value
