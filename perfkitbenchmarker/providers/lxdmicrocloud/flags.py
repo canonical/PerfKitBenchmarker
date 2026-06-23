@@ -22,6 +22,8 @@ invoking PKB.
 
 from absl import flags
 
+from perfkitbenchmarker import errors
+
 LXD_CLI_PATH = flags.DEFINE_string(
     'lxd_cli_path',
     'lxc',
@@ -93,6 +95,59 @@ LXD_EXTRA_CONFIG = flags.DEFINE_list(
     'Additional `-c key=value` pairs to pass to every `lxc launch`. Example: '
     '`--lxd_extra_config=security.nesting=true,limits.kernel.memlock=unlimited`.',
 )
+
+# Built-in instance flavors. LXD/MicroCloud has no server-side flavor objects
+# (unlike OpenStack), so these are client-side presets that map a name to LXD
+# resource limits applied at `lxc launch` time. They work identically for
+# containers and virtual machines. Memory uses LXD's unit suffixes (GiB/MiB).
+# Select one with --machine_type=<name>; extend or override with --lxd_flavors.
+DEFAULT_FLAVORS = {
+    'small': {'cpus': 1, 'memory': '2GiB'},
+    'medium': {'cpus': 2, 'memory': '4GiB'},
+    'large': {'cpus': 4, 'memory': '8GiB'},
+    'xlarge': {'cpus': 8, 'memory': '16GiB'},
+}
+
+LXD_FLAVORS = flags.DEFINE_list(
+    'lxd_flavors',
+    [],
+    'Add or override named instance flavors selectable via --machine_type. '
+    'Each entry is `name=cpus:memory`, where memory carries an LXD unit suffix, '
+    'e.g. `--lxd_flavors=huge=16:32GiB,tiny=1:512MiB`. Entries override built-in '
+    'flavors of the same name. Built-ins: small (1/2GiB), medium (2/4GiB), '
+    'large (4/8GiB), xlarge (8/16GiB).',
+)
+
+
+def GetFlavors() -> dict[str, dict[str, object]]:
+  """Returns built-in flavors merged with any --lxd_flavors overrides.
+
+  Returns:
+    Mapping of flavor name to a {'cpus': int, 'memory': str} dict, where memory
+    is an LXD-formatted size string (e.g. '4GiB').
+
+  Raises:
+    errors.Config.InvalidValue: if an --lxd_flavors entry is malformed.
+  """
+  flavors = {name: dict(spec) for name, spec in DEFAULT_FLAVORS.items()}
+  for entry in LXD_FLAVORS.value:
+    name, sep, body = entry.partition('=')
+    name = name.strip()
+    cpus_str, mem_sep, memory = body.partition(':')
+    if not name or not sep or not mem_sep:
+      raise errors.Config.InvalidValue(
+          f'Invalid --lxd_flavors entry "{entry}". Expected `name=cpus:memory`, '
+          'e.g. `huge=16:32GiB`.'
+      )
+    try:
+      cpus = int(cpus_str)
+    except ValueError as e:
+      raise errors.Config.InvalidValue(
+          f'Invalid cpus in --lxd_flavors entry "{entry}": "{cpus_str}" is not '
+          'an integer.'
+      ) from e
+    flavors[name] = {'cpus': cpus, 'memory': memory.strip()}
+  return flavors
 
 LXD_LAUNCH_TIMEOUT = flags.DEFINE_integer(
     'lxd_launch_timeout',

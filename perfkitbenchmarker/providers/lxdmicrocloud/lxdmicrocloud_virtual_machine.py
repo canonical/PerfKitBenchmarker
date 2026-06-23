@@ -90,12 +90,11 @@ class LxdMicrocloudVirtualMachine(virtual_machine.BaseVirtualMachine):
       cmd.flags['target'] = self.target_member
 
     config: list[str] = []
-    cpu_count = self._GetRequestedCpuCount()
+    cpu_count, memory = self._ResolveMachineType()
     if cpu_count:
       config.append(f'limits.cpu={cpu_count}')
-    memory_gib = self._GetRequestedMemoryGiB()
-    if memory_gib:
-      config.append(f'limits.memory={memory_gib}GiB')
+    if memory:
+      config.append(f'limits.memory={memory}')
     config.extend(self._DefaultVmConfig())
     config.extend(lxd_flags.LXD_EXTRA_CONFIG.value)
     if config:
@@ -145,18 +144,44 @@ class LxdMicrocloudVirtualMachine(virtual_machine.BaseVirtualMachine):
       return self.image
     return f'{self.image_remote}:{self.image}'
 
-  def _GetRequestedCpuCount(self) -> int | None:
-    """Parses a CPU count from machine_type if it looks like an int."""
-    if not self.machine_type:
-      return None
-    try:
-      return int(self.machine_type)
-    except (TypeError, ValueError):
-      return None
+  def _ResolveMachineType(self) -> tuple[int | None, str | None]:
+    """Resolves (cpu_count, memory) limits from `machine_type`.
 
-  def _GetRequestedMemoryGiB(self) -> int | None:
-    """LXD limits.memory is set via --lxd_extra_config; default is no limit."""
-    return None
+    `machine_type` is treated like a flavor selector (mirroring how OpenStack
+    and the major clouds use it). LXD has no server-side flavor objects, so the
+    name resolves against the provider's client-side flavor table
+    (`lxd_flags.GetFlavors()`, i.e. the built-ins plus any --lxd_flavors
+    overrides). It may be:
+      * a named flavor -> that flavor's cpus + memory;
+      * a bare integer string -> that many vCPUs, memory left unset (still
+        settable via --lxd_extra_config=limits.memory=...), preserving the
+        provider's original behaviour;
+      * unset -> no limits.
+
+    Returns:
+      A (cpu_count, memory) tuple. `cpu_count` is an int or None; `memory` is an
+      LXD-formatted size string (e.g. '4GiB') or None.
+
+    Raises:
+      errors.Config.InvalidValue: if machine_type is a non-integer name that is
+        not a known flavor (likely a typo or an undefined flavor).
+    """
+    machine_type = self.machine_type
+    if not machine_type:
+      return None, None
+    try:
+      return int(machine_type), None
+    except (TypeError, ValueError):
+      pass
+    flavors = lxd_flags.GetFlavors()
+    flavor = flavors.get(machine_type)
+    if flavor is None:
+      raise errors.Config.InvalidValue(
+          f'Unknown machine_type / flavor "{machine_type}" for {self.name}. '
+          f'Known flavors: {sorted(flavors)}. Pass a flavor name, an integer '
+          'vCPU count, or define a flavor with --lxd_flavors.'
+      )
+    return flavor.get('cpus'), flavor.get('memory')
 
   @vm_util.Retry(max_retries=4, poll_interval=5)
   def _PostCreate(self) -> None:
@@ -445,6 +470,11 @@ class LxdMicrocloudVirtualMachine(virtual_machine.BaseVirtualMachine):
     result = super().GetResourceMetadata()
     result['instance_type'] = self.instance_type
     result['image_remote'] = self.image_remote
+    cpu_count, memory = self._ResolveMachineType()
+    if cpu_count:
+      result['limits.cpu'] = cpu_count
+    if memory:
+      result['limits.memory'] = memory
     if self.storage_pool:
       result['storage_pool'] = self.storage_pool
     if self.network_name:
