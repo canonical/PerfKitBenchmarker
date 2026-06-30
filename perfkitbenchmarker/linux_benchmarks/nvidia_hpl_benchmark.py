@@ -31,6 +31,8 @@ nvidia_hpl:
           machine_type: m7i.16xlarge
           zone: us-east-2a
           boot_disk_size: 2000
+        LxdMicrocloud:
+          machine_type: medium
       vm_count: 1
     workers:
       vm_count: null
@@ -42,6 +44,8 @@ nvidia_hpl:
         AWS:
           machine_type: p6.48xlarge
           zone: us-east-2a
+        LxdMicrocloud:
+          machine_type: medium
   flags:
     placement_group_style: closest_supported
     preprovision_ignore_checksum: True

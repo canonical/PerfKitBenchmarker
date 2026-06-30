@@ -36,6 +36,8 @@ esrally:
         GCP:
           machine_type: n2-standard-8
           zone: us-central1-b
+        LxdMicrocloud:
+          machine_type: medium
       disk_spec:
         # Standardize with 700 MB/s bandwidth to minimize I/O impact.
         AWS:
@@ -56,6 +58,10 @@ esrally:
           provisioned_iops: 12000
           provisioned_throughput: 700
           mount_point: /scratch
+        LxdMicrocloud:
+          storage_pool: remote
+          disk_size: 500
+          mount_point: /scratch
       # For single node, specify --track-param=number_of_replicas:0
       vm_count: 3
     clients:
@@ -69,6 +75,8 @@ esrally:
         GCP:
           machine_type: n2-standard-16
           zone: us-central1-b
+        LxdMicrocloud:
+          machine_type: medium
       disk_spec: *default_50_gb
       vm_count: 1
   flags:

@@ -27,6 +27,8 @@ dgxc:
           machine_type: m7i.16xlarge
           zone: us-east-2b
           boot_disk_size: 2000
+        LxdMicrocloud:
+          machine_type: medium
       vm_count: 1
     workers:
       vm_spec:
@@ -40,6 +42,8 @@ dgxc:
           machine_type: p5.48xlarge
           zone: us-east-1
           boot_disk_size: 1000
+        LxdMicrocloud:
+          machine_type: medium
       disk_spec: *default_500_gb
       vm_count: null
   flags:

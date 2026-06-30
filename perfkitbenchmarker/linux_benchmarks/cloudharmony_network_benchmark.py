@@ -38,11 +38,15 @@ cloudharmony_network:
       vm_spec:
         GCP:
           machine_type: n1-standard-2
+        LxdMicrocloud:
+          machine_type: medium
     client:
       vm_spec:
         GCP:
           machine_type: n1-standard-2
           boot_disk_type: pd-ssd
+        LxdMicrocloud:
+          machine_type: medium
 """
 # network test service types
 COMPUTE = 'compute'

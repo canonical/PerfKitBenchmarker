@@ -11,6 +11,10 @@ default_disk_spec: &default_disk_spec
   Azure:
     disk_size: 200
     disk_type: PremiumV2_LRS
+  LxdMicrocloud:
+    storage_pool: remote
+    disk_size: 200
+    mount_point: /scratch
 
 dpdk_pktgen_small_pkt_loss:
   name: dpdk_pktgen

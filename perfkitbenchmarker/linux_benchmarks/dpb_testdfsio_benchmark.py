@@ -50,6 +50,8 @@ dpb_testdfsio_benchmark:
           machine_type: n1-standard-4
         AWS:
           machine_type: m4.xlarge
+        LxdMicrocloud:
+          machine_type: medium
       disk_spec:
         GCP:
           disk_size: 1500
@@ -58,6 +60,10 @@ dpb_testdfsio_benchmark:
         AWS:
           disk_size: 1500
           disk_type: gp2
+          mount_point: /scratch
+        LxdMicrocloud:
+          storage_pool: remote
+          disk_size: 1500
           mount_point: /scratch
     worker_count: 2
 """

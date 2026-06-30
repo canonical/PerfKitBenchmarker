@@ -63,6 +63,8 @@ provision_disk:
         AWS:
           machine_type: m5.large
           zone: us-east-1c
+        LxdMicrocloud:
+          machine_type: medium
       disk_spec:
         GCP:
           disk_type: pd-ssd
@@ -73,6 +75,10 @@ provision_disk:
         AWS:
           disk_type: gp2
           disk_size: 10
+        LxdMicrocloud:
+          storage_pool: remote
+          disk_size: 10
+          mount_point: /scratch
     secondary:
       vm_spec:
         GCP:
@@ -84,6 +90,8 @@ provision_disk:
         AWS:
           machine_type: m5.large
           zone: us-east-1c
+        LxdMicrocloud:
+          machine_type: medium
 """
 
 

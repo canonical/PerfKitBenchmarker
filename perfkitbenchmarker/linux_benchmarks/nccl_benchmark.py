@@ -102,6 +102,8 @@ nccl:
           zone: eastus
           image: microsoft-dsvm:ubuntu-hpc:2004:latest
           boot_disk_size: 130
+        LxdMicrocloud:
+          machine_type: medium
   flags:
     placement_group_style: closest_supported
 """

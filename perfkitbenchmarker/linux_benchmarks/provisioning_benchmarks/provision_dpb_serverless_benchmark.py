@@ -41,6 +41,8 @@ provision_dpb_serverless:
           machine_type: n1-standard-4
         AWS:
           machine_type: m5.xlarge
+        LxdMicrocloud:
+          machine_type: medium
       disk_spec:
         GCP:
           disk_size: 1000
@@ -48,6 +50,10 @@ provision_dpb_serverless:
         AWS:
           disk_size: 1000
           disk_type: gp2
+        LxdMicrocloud:
+          storage_pool: remote
+          disk_size: 1000
+          mount_point: /scratch
     worker_count: 2
 """
 

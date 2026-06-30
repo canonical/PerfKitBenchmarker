@@ -53,6 +53,8 @@ resnet:
         Azure:
           machine_type: Standard_NC6
           zone: eastus
+        LxdMicrocloud:
+          machine_type: medium
 """
 
 flags.DEFINE_enum(

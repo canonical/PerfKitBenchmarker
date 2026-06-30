@@ -53,6 +53,8 @@ messaging_service:
         GCP:
           machine_type: n2-standard-8
           zone: us-central1-a
+        LxdMicrocloud:
+          machine_type: medium
   messaging_service:
     delivery: pull
 """

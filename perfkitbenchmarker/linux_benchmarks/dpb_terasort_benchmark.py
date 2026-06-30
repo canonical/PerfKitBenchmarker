@@ -53,6 +53,8 @@ dpb_terasort_benchmark:
           machine_type: m5.xlarge
         Azure:
           machine_type: Standard_F4s_v2
+        LxdMicrocloud:
+          machine_type: medium
       disk_spec:
         GCP:
           disk_size: 500
@@ -65,6 +67,10 @@ dpb_terasort_benchmark:
         Azure:
           disk_size: 500
           disk_type: Standard_LRS
+          mount_point: /scratch_ts
+        LxdMicrocloud:
+          storage_pool: remote
+          disk_size: 500
           mount_point: /scratch_ts
     worker_count: 2
 """

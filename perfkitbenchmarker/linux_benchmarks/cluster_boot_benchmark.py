@@ -113,6 +113,8 @@ cluster_boot:
         OpenStack:
           machine_type: t1.small
           zone: nova
+        LxdMicrocloud:
+          machine_type: medium
       vm_count: null
   flags:
     # We don't want boot time samples to be affected from retrying, so don't

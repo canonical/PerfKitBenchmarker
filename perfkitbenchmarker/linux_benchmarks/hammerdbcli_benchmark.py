@@ -59,6 +59,8 @@ hammerdbcli:
           tier: Premium
           compute_units: 500
         zone: eastus
+      LxdMicrocloud:
+        machine_type: medium
     db_disk_spec:
       GCP:
         disk_size: 1000
@@ -68,6 +70,10 @@ hammerdbcli:
         disk_type: gp2
       Azure:
         disk_size: 128
+      LxdMicrocloud:
+        storage_pool: remote
+        disk_size: 1000
+        mount_point: /scratch
     vm_groups:
       servers:
         vm_spec:
@@ -81,6 +87,8 @@ hammerdbcli:
           Azure:
             machine_type: Standard_B4ms
             zone: westus
+          LxdMicrocloud:
+            machine_type: medium
         disk_spec: *default_500_gb
       replications:
         vm_spec:
@@ -93,6 +101,8 @@ hammerdbcli:
           Azure:
             machine_type: Standard_B4ms
             zone: eastus
+          LxdMicrocloud:
+            machine_type: medium
         disk_spec: *default_500_gb
       clients:
         os_type: debian11
@@ -106,6 +116,8 @@ hammerdbcli:
           Azure:
             machine_type: Standard_D4_v3
             zone: eastus
+          LxdMicrocloud:
+            machine_type: medium
         disk_spec:
           GCP:
             disk_size: 500
@@ -116,6 +128,10 @@ hammerdbcli:
           Azure:
             disk_size: 500
             disk_type: StandardSSD_LRS
+          LxdMicrocloud:
+            storage_pool: remote
+            disk_size: 500
+            mount_point: /scratch
 """
 
 

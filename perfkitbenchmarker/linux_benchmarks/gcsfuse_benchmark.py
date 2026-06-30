@@ -26,12 +26,18 @@ gcsfuse:
         GCP:
           disk_type: object_storage
           mount_point: /gcs
+        LxdMicrocloud:
+          storage_pool: remote
+          disk_size: 500
+          mount_point: /gcs
       vm_spec:
         GCP:
           machine_type: n1-standard-96
           zone: us-central1-c
           image_family: tf-latest-gpu
           image_project: deeplearning-platform-release
+        LxdMicrocloud:
+          machine_type: medium
 """
 
 _DLVM_PYTHON = '/opt/conda/bin/python'

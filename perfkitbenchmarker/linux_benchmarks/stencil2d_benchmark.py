@@ -67,6 +67,8 @@ stencil2d:
           image: Canonical:UbuntuServer:16.04.0-LTS:latest
           machine_type: Standard_NC6
           zone: eastus
+        LxdMicrocloud:
+          machine_type: medium
       vm_count: null
 """
 

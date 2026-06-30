@@ -58,6 +58,8 @@ kubernetes_hpa:
         machine_type: n4-standard-2
         zone: us-central1-a,us-central1-b,us-central1-c
         image: null
+      LxdMicrocloud:
+        machine_type: medium
   flags:
     locust_path: locust/rampup.py
 """

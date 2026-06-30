@@ -79,6 +79,8 @@ unmanaged_mysql_sysbench:
         Azure:
           machine_type: Standard_E20s_v5
           zone: eastus
+        LxdMicrocloud:
+          machine_type: medium
       disk_spec:
         GCP:
           disk_size: 500
@@ -98,6 +100,10 @@ unmanaged_mysql_sysbench:
           provisioned_iops: 40000
           provisioned_throughput: 800
           num_striped_disks: 2
+        LxdMicrocloud:
+          storage_pool: remote
+          disk_size: 500
+          mount_point: /scratch
     client:
       vm_spec:
         GCP:
@@ -109,6 +115,8 @@ unmanaged_mysql_sysbench:
         Azure:
           machine_type: Standard_D16s_v5
           zone: eastus
+        LxdMicrocloud:
+          machine_type: medium
   flags:
     sysbench_version: df89d34c410a2277e19f77e47e535d0890b2029b
     disk_fs_type: xfs

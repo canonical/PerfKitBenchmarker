@@ -65,11 +65,15 @@ kubernetes_redis_memtier:
         vm_spec:
           GCP:
             machine_type: c4-standard-4
+          LxdMicrocloud:
+            machine_type: medium
         vm_count: 1
       clients:
         vm_spec:
           GCP:
             machine_type: c4-standard-32
+          LxdMicrocloud:
+            machine_type: medium
         vm_count: 1
 """
 

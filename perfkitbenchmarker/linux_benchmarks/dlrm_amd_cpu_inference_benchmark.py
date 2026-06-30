@@ -61,6 +61,8 @@ dlrm_amd_cpu_inference:
           machine_type: Standard_F64ams_v6
           zone: eastus
           boot_disk_size: 3000
+        LxdMicrocloud:
+          machine_type: medium
   flags:
     disable_smt: True
     sar: True

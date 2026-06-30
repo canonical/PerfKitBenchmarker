@@ -52,6 +52,8 @@ mlperf:
           zone: westus2
           boot_disk_size: 200
           image: microsoft-dsvm:ubuntu-hpc:1804:latest
+        LxdMicrocloud:
+          machine_type: medium
 """
 
 DGXSYSTEM = 'DGXA100_singlenode'

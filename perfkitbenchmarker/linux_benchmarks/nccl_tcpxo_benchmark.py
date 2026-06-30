@@ -28,6 +28,8 @@ nccl_tcpxo:
           # https://github.com/GoogleCloudPlatform/cluster-toolkit/blob/main/examples/machine-learning/a3-megagpu-8g/slurm-a3mega-image.yaml
           image_family: slurm-a3mega
           boot_disk_size: 500
+        LxdMicrocloud:
+          machine_type: medium
   flags:
     placement_group_style: closest_supported
     gcloud_scopes: cloud-platform

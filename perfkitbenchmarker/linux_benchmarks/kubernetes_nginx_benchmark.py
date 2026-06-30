@@ -71,6 +71,8 @@ kubernetes_nginx:
             machine_type: m6i.xlarge
           Azure:
             machine_type: Standard_D4s_v5
+          LxdMicrocloud:
+            machine_type: medium
       upstream:
         vm_count: 2
         vm_spec:
@@ -80,6 +82,8 @@ kubernetes_nginx:
             machine_type: m6i.xlarge
           Azure:
             machine_type: Standard_D4s_v5
+          LxdMicrocloud:
+            machine_type: medium
   vm_groups:
     clients:
       vm_spec: *default_dual_core

@@ -45,6 +45,8 @@ tensor2tensor:
         Azure:
           machine_type: Standard_NC6
           zone: eastus
+        LxdMicrocloud:
+          machine_type: medium
 """
 
 flags.DEFINE_string('t2t_model', None, 'Tensor2Tensor model to run')

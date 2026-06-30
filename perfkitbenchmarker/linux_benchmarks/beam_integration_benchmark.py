@@ -45,12 +45,18 @@ beam_integration_benchmark:
           boot_disk_size: 500
         AWS:
           machine_type: m3.medium
+        LxdMicrocloud:
+          machine_type: medium
       disk_spec:
         GCP:
           disk_type: nodisk
         AWS:
           disk_size: 500
           disk_type: gp2
+        LxdMicrocloud:
+          storage_pool: remote
+          disk_size: 500
+          mount_point: /scratch
     worker_count: 2
 """
 

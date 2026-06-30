@@ -44,9 +44,15 @@ dpb_dataflow_template_benchmark:
       vm_spec:
         GCP:
           machine_type: n1-standard-4
+        LxdMicrocloud:
+          machine_type: medium
       disk_spec:
         GCP:
           disk_size: 300
+        LxdMicrocloud:
+          storage_pool: remote
+          disk_size: 300
+          mount_point: /scratch
     worker_count: 1
 """
 

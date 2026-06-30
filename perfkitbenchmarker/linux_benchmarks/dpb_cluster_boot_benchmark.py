@@ -34,12 +34,18 @@ dpb_cluster_boot_benchmark:
           boot_disk_size: 50
         AWS:
           machine_type: m5.large
+        LxdMicrocloud:
+          machine_type: medium
       disk_spec:
         GCP:
           disk_type: pd-standard
         AWS:
           disk_size: 1500
           disk_type: gp2
+        LxdMicrocloud:
+          storage_pool: remote
+          disk_size: 1500
+          mount_point: /scratch
     worker_count: 2
 """
 

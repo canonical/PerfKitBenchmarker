@@ -67,6 +67,8 @@ redis_enterprise:
         AWS:
           machine_type: c5.9xlarge
           zone: us-east-1d
+        LxdMicrocloud:
+          machine_type: medium
       vm_count: 1
     clients:
       vm_spec:
@@ -76,6 +78,8 @@ redis_enterprise:
         AWS:
           machine_type: c5.9xlarge
           zone: us-east-1d
+        LxdMicrocloud:
+          machine_type: medium
       vm_count: 2
 """
 

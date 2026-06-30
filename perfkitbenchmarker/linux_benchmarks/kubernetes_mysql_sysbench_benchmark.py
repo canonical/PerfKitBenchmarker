@@ -87,6 +87,8 @@ kubernetes_mysql_sysbench:
         machine_type: m6i.large
       Azure:
         machine_type: Standard_D2s_v5
+      LxdMicrocloud:
+        machine_type: medium
     nodepools:
       servers:
         vm_spec:
@@ -99,6 +101,8 @@ kubernetes_mysql_sysbench:
           Azure:
             machine_type: Standard_D16s_v5
             boot_disk_type: Premium_LRS
+          LxdMicrocloud:
+            machine_type: medium
         vm_count: 1
       clients:
         vm_spec:
@@ -108,6 +112,8 @@ kubernetes_mysql_sysbench:
             machine_type: c6i.8xlarge
           Azure:
             machine_type: Standard_D32s_v5
+          LxdMicrocloud:
+            machine_type: medium
         vm_count: 1
 """
 

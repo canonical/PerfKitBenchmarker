@@ -46,6 +46,8 @@ dino:
           machine_type: Standard_ND96amsr_A100_v4
           zone: eastus
           boot_disk_size: 130
+        LxdMicrocloud:
+          machine_type: medium
 """
 _IMAGENET = 'ILSVRC2012_img_train.tar'
 

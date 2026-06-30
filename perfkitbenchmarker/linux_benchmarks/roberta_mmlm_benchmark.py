@@ -52,6 +52,8 @@ robertammlm:
           machine_type: Standard_ND40s_v2
           zone: eastus
           boot_disk_size: 105
+        LxdMicrocloud:
+          machine_type: medium
 """
 NVPROF = 'nvprof'
 TFPROF = 'tfprof'

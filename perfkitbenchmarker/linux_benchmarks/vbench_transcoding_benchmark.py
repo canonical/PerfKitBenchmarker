@@ -117,6 +117,8 @@ vbench_transcoding:
         Azure:
           machine_type: Standard_D8s_v6
           boot_disk_size: 200
+        LxdMicrocloud:
+          machine_type: medium
       disk_spec:
         # Standardize with 500 MB/s bandwidth.
         # The largest video file is ~300 MB; we want to minimize I/O impact.
@@ -137,6 +139,10 @@ vbench_transcoding:
           disk_type: PremiumV2_LRS
           provisioned_iops: 3000
           provisioned_throughput: 500
+          mount_point: /scratch
+        LxdMicrocloud:
+          storage_pool: remote
+          disk_size: 500
           mount_point: /scratch
 """
 

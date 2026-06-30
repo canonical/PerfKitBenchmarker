@@ -91,6 +91,8 @@ mongodb_ycsb:
           machine_type: m7i.large
           zone: us-east-1a
           boot_disk_size: 100
+        LxdMicrocloud:
+          machine_type: medium
       disk_spec:
         GCP:
           disk_size: 500
@@ -103,6 +105,10 @@ mongodb_ycsb:
         Azure:
           disk_size: 500
           disk_type: Premium_LRS
+          mount_point: /scratch
+        LxdMicrocloud:
+          storage_pool: remote
+          disk_size: 500
           mount_point: /scratch
       vm_count: 1
     secondary:
@@ -119,6 +125,8 @@ mongodb_ycsb:
           machine_type: m7i.large
           zone: us-east-1a
           boot_disk_size: 100
+        LxdMicrocloud:
+          machine_type: medium
       disk_spec:
         GCP:
           disk_size: 500
@@ -131,6 +139,10 @@ mongodb_ycsb:
         Azure:
           disk_size: 500
           disk_type: Premium_LRS
+          mount_point: /scratch
+        LxdMicrocloud:
+          storage_pool: remote
+          disk_size: 500
           mount_point: /scratch
       vm_count: 1
     secondary_2:
@@ -147,6 +159,8 @@ mongodb_ycsb:
           machine_type: m7i.large
           zone: us-east-1a
           boot_disk_size: 100
+        LxdMicrocloud:
+          machine_type: medium
       disk_spec:
         GCP:
           disk_size: 500
@@ -159,6 +173,10 @@ mongodb_ycsb:
         Azure:
           disk_size: 500
           disk_type: Premium_LRS
+          mount_point: /scratch
+        LxdMicrocloud:
+          storage_pool: remote
+          disk_size: 500
           mount_point: /scratch
       vm_count: 0
     arbiter:

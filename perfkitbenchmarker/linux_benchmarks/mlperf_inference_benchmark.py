@@ -56,6 +56,8 @@ mlperf_inference:
           machine_type: Standard_ND96asr_v4
           zone: westus2
           boot_disk_size: 200
+        LxdMicrocloud:
+          machine_type: medium
 """
 SERVER = 'Server'
 OFFLINE = 'Offline'

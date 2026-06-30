@@ -80,6 +80,8 @@ gpu_pcie_bandwidth:
         Azure:
           machine_type: Standard_NC6
           zone: eastus
+        LxdMicrocloud:
+          machine_type: medium
 """
 BENCHMARK_METRICS = [
     'Host to device bandwidth',

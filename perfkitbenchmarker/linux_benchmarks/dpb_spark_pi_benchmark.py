@@ -47,6 +47,8 @@ dpb_spark_pi_benchmark:
           machine_type: Standard_F2s_v2
         GCP:
           machine_type: n1-standard-2
+        LxdMicrocloud:
+          machine_type: medium
       disk_spec:
         AWS:
           disk_type: st1
@@ -62,6 +64,10 @@ dpb_spark_pi_benchmark:
           disk_type: pd-standard
           disk_size: 500
           # Only used by unmanaged
+          mount_point: /scratch
+        LxdMicrocloud:
+          storage_pool: remote
+          disk_size: 500
           mount_point: /scratch
     worker_count: 2
 """

@@ -40,6 +40,8 @@ nvidia_hpc:
           machine_type: Standard_NC6
           zone: eastus
           boot_disk_size: 1000
+        LxdMicrocloud:
+          machine_type: medium
       disk_spec: *default_500_gb
       vm_count: null
   flags:

@@ -196,6 +196,8 @@ sysbench:
       Azure:
         machine_type: GP_Gen5_2
         zone: westus
+      LxdMicrocloud:
+        machine_type: medium
     db_disk_spec:
       GCP:
         disk_size: 100
@@ -208,6 +210,10 @@ sysbench:
         #Valid storage sizes range from minimum of 128000 MB and additional
         #increments of 128000 MB up to maximum of 1024000 MB.
         disk_size: 128
+      LxdMicrocloud:
+        storage_pool: remote
+        disk_size: 100
+        mount_point: /scratch
     vm_groups:
       servers:
         vm_spec:
@@ -220,6 +226,8 @@ sysbench:
           Azure:
             machine_type: Standard_B4ms
             zone: westus
+          LxdMicrocloud:
+            machine_type: medium
         disk_spec: *default_500_gb
       replications:
         vm_spec:
@@ -232,6 +240,8 @@ sysbench:
           Azure:
             machine_type: Standard_B4ms
             zone: eastus
+          LxdMicrocloud:
+            machine_type: medium
         disk_spec: *default_500_gb
       clients:
         vm_spec:
@@ -244,6 +254,8 @@ sysbench:
           Azure:
             machine_type: Standard_B4ms
             zone: westus
+          LxdMicrocloud:
+            machine_type: medium
         disk_spec:
           GCP:
             disk_size: 500
@@ -254,6 +266,10 @@ sysbench:
           Azure:
             disk_size: 500
             disk_type: Premium_LRS
+          LxdMicrocloud:
+            storage_pool: remote
+            disk_size: 500
+            mount_point: /scratch
 """
 
 # Constants defined for Sysbench tests.

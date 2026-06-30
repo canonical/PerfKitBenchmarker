@@ -44,10 +44,16 @@ dpb_spark_io_benchmark:
       vm_spec:
         GCP:
           machine_type: n1-standard-1
+        LxdMicrocloud:
+          machine_type: medium
       disk_spec:
         GCP:
           disk_type: pd-standard
           disk_size: 500
+        LxdMicrocloud:
+          storage_pool: remote
+          disk_size: 500
+          mount_point: /scratch
     worker_count: 2
 """
 

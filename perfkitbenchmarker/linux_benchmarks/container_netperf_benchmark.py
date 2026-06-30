@@ -57,6 +57,8 @@ container_netperf:
       GCP:
         machine_type: n1-standard-4
         zone: us-west1-a
+      LxdMicrocloud:
+        machine_type: medium
 
 """
 

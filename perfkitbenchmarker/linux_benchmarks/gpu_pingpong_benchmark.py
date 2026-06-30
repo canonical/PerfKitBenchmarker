@@ -54,6 +54,8 @@ gpu_pingpong:
           machine_type: Standard_ND40rs_v2
           zone: eastus
           image: microsoft-dsvm:ubuntu-1804:1804-gen2:21.01.21
+        LxdMicrocloud:
+          machine_type: medium
 """
 _TEST_SCRIPT = 'gpu_pingpong_test.py'
 _SERVER_SCRIPT = 'gpu_pingpong_server.py'

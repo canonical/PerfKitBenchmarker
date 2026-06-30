@@ -80,6 +80,8 @@ dpb_sparksql_benchmark:
           num_local_ssds: 0
         AWS:
           machine_type: m5.xlarge
+        LxdMicrocloud:
+          machine_type: medium
       disk_spec:
         GCP:
           disk_size: 1000
@@ -95,6 +97,10 @@ dpb_sparksql_benchmark:
           disk_size: 1000
           disk_type: Standard_LRS
           # Only used by unmanaged
+          mount_point: /scratch
+        LxdMicrocloud:
+          storage_pool: remote
+          disk_size: 1000
           mount_point: /scratch
     worker_count: 2
 """

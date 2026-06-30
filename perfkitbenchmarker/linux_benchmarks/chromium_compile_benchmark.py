@@ -35,6 +35,9 @@ chromium_compile:
         OpenStack:
           machine_type: m1.small
           zone: eastus
+        LxdMicrocloud:
+          machine_type: xlarge
+          boot_disk_size: 100
       disk_spec:
         # Standardize with 720 MB/s bandwidth to minimize I/O impact.
         GCP:
@@ -57,6 +60,10 @@ chromium_compile:
           mount_point: /scratch
         OpenStack:
           disk_type: standard
+          disk_size: 500
+          mount_point: /scratch
+        LxdMicrocloud:
+          storage_pool: remote
           disk_size: 500
           mount_point: /scratch
       vm_count: 1

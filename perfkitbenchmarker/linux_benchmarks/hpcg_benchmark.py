@@ -59,6 +59,8 @@ hpcg:
           machine_type: Standard_NC6
           zone: eastus
           boot_disk_size: 200
+        LxdMicrocloud:
+          machine_type: medium
       vm_count: null
 """
 

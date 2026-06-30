@@ -116,6 +116,8 @@ pgbench:
       OpenStack:
         machine_type: m1.xlarge
         zone: nova
+      LxdMicrocloud:
+        machine_type: xlarge
     db_disk_spec:
       GCP:
         disk_size: 1000
@@ -129,6 +131,10 @@ pgbench:
       OpenStack:
         disk_size: 1000
         disk_type: standard
+      LxdMicrocloud:
+        storage_pool: remote
+        disk_size: 1000
+        mount_point: /scratch
     vm_groups:
       servers:
         vm_spec:
@@ -144,6 +150,8 @@ pgbench:
           OpenStack:
             machine_type: m1.xlarge
             zone: nova
+          LxdMicrocloud:
+            machine_type: xlarge
         disk_spec: *default_500_gb
       clients:
         vm_spec:
@@ -159,6 +167,8 @@ pgbench:
           OpenStack:
             machine_type: m1.xlarge
             zone: nova
+          LxdMicrocloud:
+            machine_type: xlarge
         disk_spec: *default_500_gb
 """
 

@@ -57,6 +57,10 @@ disk_snapshot:
           provisioned_iops: 16000
           provisioned_throughput: 800
           mount_point: /var/lib/mysql
+        LxdMicrocloud:
+          storage_pool: remote
+          disk_size: 200
+          mount_point: /var/lib/mysql
   flags:
     sysbench_table_size: 50000000
     sysbench_tables: 8

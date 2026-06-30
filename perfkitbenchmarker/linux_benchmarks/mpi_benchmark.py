@@ -216,6 +216,8 @@ mpi:
         Azure:
           machine_type: Standard_B2s
           zone: eastus
+        LxdMicrocloud:
+          machine_type: medium
 """
 
 # these columns in the MPI output data are surfaces as sample.Sample.metrics

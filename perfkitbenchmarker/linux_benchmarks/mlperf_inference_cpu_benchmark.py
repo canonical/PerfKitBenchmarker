@@ -50,6 +50,8 @@ mlperf_inference_cpu:
           machine_type: Standard_ND96asr_v4
           zone: westus2
           boot_disk_size: 200
+        LxdMicrocloud:
+          machine_type: medium
 """
 _BACKEND = flags.DEFINE_enum(
     'mlperf_inference_cpu_backend',

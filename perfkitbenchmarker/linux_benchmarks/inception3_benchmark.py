@@ -51,6 +51,8 @@ inception3:
         Azure:
           machine_type: Standard_NC6
           zone: eastus
+        LxdMicrocloud:
+          machine_type: medium
 """
 
 flags.DEFINE_float('inception3_learning_rate', 0.165, 'Learning rate.')

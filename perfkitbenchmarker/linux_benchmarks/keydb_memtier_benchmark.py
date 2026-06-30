@@ -62,6 +62,8 @@ keydb_memtier:
         Azure:
           machine_type: Standard_D8as_v5
           zone: eastus2
+        LxdMicrocloud:
+          machine_type: medium
       vm_count: 1
     clients:
       vm_spec:
@@ -74,6 +76,8 @@ keydb_memtier:
         Azure:
           machine_type: Standard_D32as_v5
           zone: eastus2
+        LxdMicrocloud:
+          machine_type: medium
       vm_count: 1
 """
 

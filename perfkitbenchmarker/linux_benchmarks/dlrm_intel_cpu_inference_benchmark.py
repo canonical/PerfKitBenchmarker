@@ -63,6 +63,8 @@ dlrm_intel_cpu_inference:
           machine_type: Standard_E96s_v3
           zone: eastus
           boot_disk_size: 3000
+        LxdMicrocloud:
+          machine_type: medium
   flags:
     disable_smt: True
     sar: True

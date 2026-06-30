@@ -34,6 +34,9 @@ default_dual_core: &default_dual_core
     machine_type: m1.large
     zone: nova
     image: null
+  LxdMicrocloud:
+    machine_type: medium
+    image: null
 # TODO(user): update the disk types below as more providers are
 # updated for the disk types refactor.
 default_500_gb: &default_500_gb
@@ -87,6 +90,10 @@ default_500_gb: &default_500_gb
     mount_point: /scratch
   IBMCloud:
     disk_type: standard
+    disk_size: 500
+    mount_point: /scratch
+  LxdMicrocloud:
+    storage_pool: remote
     disk_size: 500
     mount_point: /scratch
 
@@ -144,5 +151,9 @@ default_50_gb: &default_50_gb
     mount_point: /scratch
   IBMCloud:
     disk_type: standard
+    disk_size: 50
+    mount_point: /scratch
+  LxdMicrocloud:
+    storage_pool: remote
     disk_size: 50
     mount_point: /scratch

@@ -37,6 +37,8 @@ huggingface_bert_pretraining:
           machine_type: trn1.2xlarge
           zone: us-west-2d
           boot_disk_size: 200
+        LxdMicrocloud:
+          machine_type: medium
 """
 
 

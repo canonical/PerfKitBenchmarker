@@ -45,6 +45,8 @@ mnist:
         Azure:
           machine_type: Standard_NC6
           zone: eastus
+        LxdMicrocloud:
+          machine_type: medium
 """
 GCP_ENV = 'PATH=/tmp/pkb/google-cloud-sdk/bin:$PATH'
 

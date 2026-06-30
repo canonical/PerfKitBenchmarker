@@ -63,6 +63,8 @@ bigquery_tf_connector:
           zone: us-central1-f
           image_family: tf2-ent-2-3-cpu
           image_project: deeplearning-platform-release
+        LxdMicrocloud:
+          machine_type: medium
 """
 
 DLVM_PYTHON = '/opt/conda/bin/python'

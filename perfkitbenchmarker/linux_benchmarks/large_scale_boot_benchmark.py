@@ -69,6 +69,8 @@ large_scale_boot:
           machine_type: Standard_D2_v3
           zone: eastus
           boot_disk_type: StandardSSD_LRS
+        LxdMicrocloud:
+          machine_type: medium
       vm_count: 1
       os_type: debian11
     clients:
@@ -81,6 +83,8 @@ large_scale_boot:
         Azure:
           machine_type: Standard_D2_v3
           boot_disk_type: StandardSSD_LRS
+        LxdMicrocloud:
+          machine_type: medium
       os_type: debian11
       vm_count: 1
 """

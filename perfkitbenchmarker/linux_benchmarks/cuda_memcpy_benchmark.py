@@ -80,6 +80,8 @@ cuda_memcpy:
           zone: eastus
           image: microsoft-dsvm:ubuntu-hpc:1804:latest
           boot_disk_size: 200
+        LxdMicrocloud:
+          machine_type: medium
 """
 
 

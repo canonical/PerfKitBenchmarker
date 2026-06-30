@@ -47,6 +47,8 @@ xgboost:
           zone: eastus
           image: microsoft-dsvm:ubuntu-hpc:2004:latest
           boot_disk_size: 200
+        LxdMicrocloud:
+          machine_type: medium
 """
 
 _USE_GPU = flags.DEFINE_boolean(

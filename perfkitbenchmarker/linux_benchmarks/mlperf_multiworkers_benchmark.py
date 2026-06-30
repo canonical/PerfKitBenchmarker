@@ -61,6 +61,8 @@ mlperf_multiworkers:
           zone: westus2
           boot_disk_size: 200
           image: microsoft-dsvm:ubuntu-hpc:1804:latest
+        LxdMicrocloud:
+          machine_type: medium
       vm_count: null
 """
 

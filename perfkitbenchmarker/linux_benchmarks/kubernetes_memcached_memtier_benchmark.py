@@ -65,6 +65,8 @@ kubernetes_memcached_memtier:
             machine_type: m6i.xlarge
           Azure:
             machine_type: Standard_D4s_v5
+          LxdMicrocloud:
+            machine_type: medium
         vm_count: 1
   vm_groups:
     clients:

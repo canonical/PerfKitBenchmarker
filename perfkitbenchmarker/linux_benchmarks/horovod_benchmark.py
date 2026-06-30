@@ -53,6 +53,8 @@ horovod:
           image: microsoft-dsvm:aml-workstation:ubuntu:19.11.13
           zone: eastus
           boot_disk_size: 300
+        LxdMicrocloud:
+          machine_type: medium
       vm_count: null
 """
 

@@ -300,6 +300,8 @@ cassandra_stress:
         AWS:
           machine_type: m6i.xlarge
           zone: us-east-1
+        LxdMicrocloud:
+          machine_type: medium
       disk_spec: *default_500_gb
     client:
       vm_spec:
@@ -312,6 +314,8 @@ cassandra_stress:
         AWS:
           machine_type: m6i.xlarge
           zone: us-east-1
+        LxdMicrocloud:
+          machine_type: medium
   flags:
     cassandra_stress_run_duration: 30m
     is_row_cache_enabled: false

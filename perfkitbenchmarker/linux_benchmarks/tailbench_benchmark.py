@@ -40,6 +40,8 @@ tailbench:
           machine_type: n1-standard-2
           zone: us-central1-a
           boot_disk_type: pd-ssd
+        LxdMicrocloud:
+          machine_type: medium
       disk_spec:
         GCP:
           disk_size: 2000
@@ -52,6 +54,10 @@ tailbench:
         Azure:
           disk_size: 2000
           disk_type: StandardSSD_LRS
+          mount_point: /scratch_ts
+        LxdMicrocloud:
+          storage_pool: remote
+          disk_size: 2000
           mount_point: /scratch_ts
   flags:
     openjdk_version: 8

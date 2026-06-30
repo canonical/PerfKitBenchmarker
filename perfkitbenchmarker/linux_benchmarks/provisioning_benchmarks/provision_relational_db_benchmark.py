@@ -39,6 +39,8 @@ provision_relational_db:
       Azure:
         machine_type: GP_Gen5_2
         zone: westus
+      LxdMicrocloud:
+        machine_type: medium
     db_disk_spec:
       GCP:
         disk_size: 128
@@ -48,6 +50,10 @@ provision_relational_db:
         disk_type: gp2
       Azure:
         disk_size: 128
+      LxdMicrocloud:
+        storage_pool: remote
+        disk_size: 128
+        mount_point: /scratch
     vm_groups:
       clients:
         vm_spec: *default_dual_core
