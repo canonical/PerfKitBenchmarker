@@ -100,8 +100,9 @@ class LxdMicrocloudVirtualMachine(virtual_machine.BaseVirtualMachine):
     if config:
       cmd.flags['c'] = config
 
-    if self.boot_disk_size:
-      cmd.flags['d'] = f'root,size={self.boot_disk_size}GiB'
+    root_disk_size = self._ResolveRootDiskSizeGiB()
+    if root_disk_size:
+      cmd.flags['d'] = f'root,size={root_disk_size}GiB'
 
     _, stderr, retcode = cmd.Issue(timeout=lxd_flags.LXD_LAUNCH_TIMEOUT.value)
     if retcode != 0:
@@ -132,6 +133,29 @@ class LxdMicrocloudVirtualMachine(virtual_machine.BaseVirtualMachine):
     ):
       return []
     return ['migration.stateful=false']
+
+  def _ResolveRootDiskSizeGiB(self) -> int | None:
+    """Returns the validated root-disk size in GiB, or None for the pool default.
+
+    The size comes from the standard PKB `vm_spec.boot_disk_size` surface (also
+    settable via the global --boot_disk_size flag, which overrides the spec).
+    When unset, the launch omits `-d root,size=...` and the instance inherits
+    the storage pool's default root volume size. The size is applied identically
+    to containers and virtual machines via `lxc launch -d root,size=<N>GiB`.
+
+    Raises:
+      errors.Config.InvalidValue: if boot_disk_size is set to anything other
+        than a positive integer number of GiB.
+    """
+    size = self.boot_disk_size
+    if size is None:
+      return None
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+      raise errors.Config.InvalidValue(
+          f'boot_disk_size for {self.name} must be a positive integer number '
+          f'of GiB; got {size!r}.'
+      )
+    return size
 
   def _ResolveImageRef(self) -> str:
     """Returns the fully-qualified `<remote>:<alias>` image reference."""
