@@ -47,5 +47,5 @@ def YumInstall(vm):
 
 
 def AptInstall(vm):
-  """Installs the iperf package on the VM."""
-  _Install(vm)
+  """Installs the iperf package on the VM via apt (avoids SourceForge download)."""
+  vm.RemoteCommand('sudo apt-get install -y iperf')
