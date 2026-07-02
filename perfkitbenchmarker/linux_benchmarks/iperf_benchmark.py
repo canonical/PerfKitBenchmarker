@@ -390,7 +390,7 @@ def _RunIperf(
             r = re.compile(
                 r"\d+ Mbits\/sec\s+"
                 r" \d+\/\d+\s+\d+\s+(?P<cwnd>-*\d+)(?P<cwnd_unit>\w+)\/(?P<rtt>\d+)"
-                r"\s+(?P<rtt_unit>\w+)\s+(?P<netpwr>\d+\.?\d*)"
+                r"(?:\(\d+\))?\s+(?P<rtt_unit>\w+)\s+(?P<netpwr>\d+\.?\d*)"
             )
             match = [m.groupdict() for m in r.finditer(stdout)]
 
